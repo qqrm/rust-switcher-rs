@@ -52,23 +52,7 @@ jobs:
 
           should_auto_merge() {
             local head_ref="$1"
-            local title="$2"
-
-            if [[ "$head_ref" == dependabot/cargo/* ]]; then
-              return 0
-            fi
-
-            if [[ "$head_ref" != dependabot/github_actions/* ]]; then
-              return 1
-            fi
-
-            if [[ "$title" =~ from[[:space:]]v?([0-9]+)(\.[^[:space:]]*)?[[:space:]]to[[:space:]]v?([0-9]+)(\.[^[:space:]]*)?$ ]]; then
-              if [[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[3]}" ]]; then
-                return 1
-              fi
-            fi
-
-            return 0
+            [[ "$head_ref" == dependabot/* ]]
           }
 
           collect_prs() {
