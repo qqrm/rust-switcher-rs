@@ -2,7 +2,7 @@
 repository = "https://github.com/qqrm/rust-switcher"
 description = "Core library for rust-switcher (Windows keyboard layout/typing conversion)."
 name = "rust-switcher-core"
-version = "1.0.17"
+version = "1.0.18"
 edition = "2024"
 license = "MIT"
 readme = "../../README.md"
