@@ -154,86 +154,6 @@ impl HotkeySequenceValues {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{config::Config, input::hotkeys::HotkeyAction};
-
-    #[test]
-    fn disabled_autoconvert_feature_removes_pause_from_runtime_sequences() {
-        let cfg = Config {
-            autoconvert_feature_enabled: false,
-            ..Default::default()
-        };
-
-        assert!(HotkeySequenceValues::from_config(&cfg).pause.is_none());
-        assert!(HotkeySequenceValues::from_config_all(&cfg).pause.is_some());
-    }
-
-    #[test]
-    fn disabling_autoconvert_removes_every_pending_pause_entry_point() {
-        let cfg = Config::default();
-        let pause_sequence = cfg.hotkey_pause_sequence.expect("default pause sequence");
-        let last_word_sequence = cfg
-            .hotkey_convert_last_word_sequence
-            .expect("default last-word sequence");
-        let mut state = AppState {
-            autoconvert_enabled: true,
-            autoconvert_feature_enabled: true,
-            active_hotkey_sequences: HotkeySequenceValues {
-                last_word: Some(last_word_sequence),
-                pause: Some(pause_sequence),
-                ..Default::default()
-            },
-            active_pause_hotkey: cfg.hotkey_pause,
-            active_pause_hotkey_sequence: Some(pause_sequence),
-            hotkey_sequence_progress: HotkeySequenceProgress {
-                pause: SequenceProgress {
-                    waiting_second: true,
-                    first_tick_ms: 42,
-                    matched_chords: 1,
-                },
-                ..Default::default()
-            },
-            deferred_sequence_hotkey: Some(DeferredSequenceHotkey {
-                slot: HotkeySlot::Pause,
-            }),
-            pending_runtime_commands: [
-                RuntimeCommand::AutoconvertLastWord,
-                RuntimeCommand::Hotkey(HotkeyAction::PauseToggle),
-                RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord),
-            ]
-            .into(),
-            ..Default::default()
-        };
-
-        assert!(state.set_autoconvert_feature_enabled(false));
-        assert!(!state.autoconvert_feature_enabled);
-        assert!(!state.autoconvert_enabled);
-        assert!(state.active_hotkey_sequences.pause.is_none());
-        assert_eq!(
-            state.active_hotkey_sequences.last_word,
-            Some(last_word_sequence),
-            "disabling AutoConvert must not disable unrelated hotkeys"
-        );
-        assert_eq!(state.hotkey_sequence_progress.pause.matched_chords, 0);
-        assert!(state.deferred_sequence_hotkey.is_none());
-        assert_eq!(
-            state
-                .pending_runtime_commands
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord)]
-        );
-
-        assert!(!state.set_autoconvert_feature_enabled(true));
-        assert!(state.autoconvert_feature_enabled);
-        assert!(!state.autoconvert_enabled);
-        assert_eq!(state.active_hotkey_sequences.pause, Some(pause_sequence));
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct HotkeyCaptureUi {
     pub active: bool,
@@ -489,5 +409,85 @@ impl ControlId {
 
         let id = self as u16;
         HMENU(usize::from(id) as *mut c_void)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, input::hotkeys::HotkeyAction};
+
+    #[test]
+    fn disabled_autoconvert_feature_removes_pause_from_runtime_sequences() {
+        let cfg = Config {
+            autoconvert_feature_enabled: false,
+            ..Default::default()
+        };
+
+        assert!(HotkeySequenceValues::from_config(&cfg).pause.is_none());
+        assert!(HotkeySequenceValues::from_config_all(&cfg).pause.is_some());
+    }
+
+    #[test]
+    fn disabling_autoconvert_removes_every_pending_pause_entry_point() {
+        let cfg = Config::default();
+        let pause_sequence = cfg.hotkey_pause_sequence.expect("default pause sequence");
+        let last_word_sequence = cfg
+            .hotkey_convert_last_word_sequence
+            .expect("default last-word sequence");
+        let mut state = AppState {
+            autoconvert_enabled: true,
+            autoconvert_feature_enabled: true,
+            active_hotkey_sequences: HotkeySequenceValues {
+                last_word: Some(last_word_sequence),
+                pause: Some(pause_sequence),
+                ..Default::default()
+            },
+            active_pause_hotkey: cfg.hotkey_pause,
+            active_pause_hotkey_sequence: Some(pause_sequence),
+            hotkey_sequence_progress: HotkeySequenceProgress {
+                pause: SequenceProgress {
+                    waiting_second: true,
+                    first_tick_ms: 42,
+                    matched_chords: 1,
+                },
+                ..Default::default()
+            },
+            deferred_sequence_hotkey: Some(DeferredSequenceHotkey {
+                slot: HotkeySlot::Pause,
+            }),
+            pending_runtime_commands: [
+                RuntimeCommand::AutoconvertLastWord,
+                RuntimeCommand::Hotkey(HotkeyAction::PauseToggle),
+                RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        assert!(state.set_autoconvert_feature_enabled(false));
+        assert!(!state.autoconvert_feature_enabled);
+        assert!(!state.autoconvert_enabled);
+        assert!(state.active_hotkey_sequences.pause.is_none());
+        assert_eq!(
+            state.active_hotkey_sequences.last_word,
+            Some(last_word_sequence),
+            "disabling AutoConvert must not disable unrelated hotkeys"
+        );
+        assert_eq!(state.hotkey_sequence_progress.pause.matched_chords, 0);
+        assert!(state.deferred_sequence_hotkey.is_none());
+        assert_eq!(
+            state
+                .pending_runtime_commands
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord)]
+        );
+
+        assert!(!state.set_autoconvert_feature_enabled(true));
+        assert!(state.autoconvert_feature_enabled);
+        assert!(!state.autoconvert_enabled);
+        assert_eq!(state.active_hotkey_sequences.pause, Some(pause_sequence));
     }
 }
