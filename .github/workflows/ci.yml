@@ -23,7 +23,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly
           components: rustfmt
@@ -41,7 +41,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly
           components: clippy
@@ -59,7 +59,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly
       - name: Rust cache
@@ -81,7 +81,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly
           components: rustfmt, clippy
@@ -123,3 +123,23 @@ jobs:
         run: cargo deny check advisories bans sources
       - name: Check unused dependencies
         run: cargo machete
+
+  ci-gate:
+    if: always()
+    needs: [fmt, clippy-lib-tests, test-lib-tests, windows-full, dependency-security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every build and test job to succeed
+        env:
+          RESULT_0: ${{ needs.fmt.result }}
+          RESULT_1: ${{ needs.clippy-lib-tests.result }}
+          RESULT_2: ${{ needs.test-lib-tests.result }}
+          RESULT_3: ${{ needs.windows-full.result }}
+          RESULT_4: ${{ needs.dependency-security.result }}
+        run: |
+          test "$RESULT_0" = success
+          test "$RESULT_1" = success
+          test "$RESULT_2" = success
+          test "$RESULT_3" = success
+          test "$RESULT_4" = success
