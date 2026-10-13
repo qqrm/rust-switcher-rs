@@ -1,0 +1,54 @@
+name: Dependabot Automerge
+
+# workflow_run is intentional: no checkout, artifacts, or PR-controlled execution.
+# The native gates and --match-head-commit bind the write to the checked commit.
+on: # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows: [CI, Workflow Security]
+    types: [completed]
+
+# Metadata only: never check out PR code or consume its artifacts here.
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: dependabot-automerge-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  automerge:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enable native auto-merge for the checked Dependabot commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CHECKED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          pr="$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")"
+          if [[ ! "$pr" =~ ^[0-9]+$ ]]; then
+            echo 'No associated pull request; nothing to merge.'
+            exit 0
+          fi
+          info="$(gh pr view "$pr" --repo "$REPO" --json author,isCrossRepository,headRefOid,baseRefName,isDraft,state,statusCheckRollup)"
+          if ! jq -e --arg sha "$CHECKED_SHA" '
+            (.author.login == "app/dependabot" or .author.login == "dependabot[bot]") and
+            .isCrossRepository == false and .baseRefName == "dev" and
+            .state == "OPEN" and .isDraft == false and .headRefOid == $sha and
+            (["ci-gate", "workflow-security-gate"] -
+              [.statusCheckRollup[] | select(.status == "COMPLETED" and .conclusion == "SUCCESS") | .name] | length == 0)
+          ' <<< "$info" >/dev/null; then
+            echo 'The current Dependabot commit has not passed both required gates.'
+            exit 0
+          fi
+          # Native protection enforces checks and an up-to-date branch, without reviews.
+          gh pr merge "$pr" --repo "$REPO" --auto --squash \
+            --match-head-commit "$CHECKED_SHA"
