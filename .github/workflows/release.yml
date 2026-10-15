@@ -6,6 +6,10 @@ on:
       - dev
   workflow_dispatch:
     inputs:
+      expected_sha:
+        description: Exact merged commit requested by the dependency controller
+        required: false
+        type: string
       version:
         description: Optional explicit release version (defaults to the next patch version)
         required: false
@@ -22,21 +26,32 @@ concurrency:
 
 jobs:
   release:
+    if: github.ref == 'refs/heads/dev'
     runs-on: windows-latest
     timeout-minutes: 90
     environment: release
     env:
       CARGO_TERM_PROGRESS_WHEN: never
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
     steps:
+      - name: Verify publication commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ACTUAL_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EXPECTED_SHA" ]; then
+            [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+          fi
       - name: Checkout dev
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: dev
+          ref: ${{ github.sha }}
 
       - name: Detect release-worthy dependency merge
         id: release_context
@@ -70,10 +85,23 @@ jobs:
               !pr.merged ||
               pr.base.ref !== 'dev' ||
               pr.user.login !== 'dependabot[bot]' ||
-              !pr.head.ref.startsWith('dependabot/cargo/')
+              pr.merge_commit_sha !== context.sha
             ) {
               core.setOutput('should_release', 'false');
               core.setOutput('reason', 'no-matching-pr');
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+            if (!files.some(({ filename }) => filename === 'Cargo.lock' ||
+                filename === 'Cargo.toml' || filename.endsWith('/Cargo.toml'))) {
+              core.setOutput('should_release', 'false');
+              core.setOutput('reason', 'actions-only-batch');
               return;
             }
 
@@ -92,18 +120,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${RELEASE_PUSH_TOKEN}" ]]; then
-            echo "RELEASE_TOKEN must be configured in the release environment to push the version bump."
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "RELEASE_TOKEN must be configured in the release environment to create the checked version PR."
             exit 1
           fi
-          git remote set-url origin "https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git config --local credential.helper '!gh auth git-credential'
 
       - name: Reattach local dev branch
         if: steps.release_context.outputs.should_release == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          git checkout -B dev origin/dev
+          git checkout -B dev "$GITHUB_SHA"
 
       - name: Configure git author
         if: steps.release_context.outputs.should_release == 'true'

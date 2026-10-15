@@ -37,8 +37,8 @@ try {
     return
   }
 
-  # Update Cargo.lock deterministically for the new workspace versions.
-  $null = Invoke-Checked cargo @('generate-lockfile') -Quiet
+  # Update workspace versions while preserving the tested third-party lock entries.
+  $null = Invoke-Checked cargo @('update', '--workspace') -Quiet
 
   $null = Invoke-Checked git @('add', 'Cargo.toml', 'Cargo.lock', 'crates/rust-switcher-core/Cargo.toml') -Quiet
   $msg = if ([string]::IsNullOrWhiteSpace($SourceCommit)) {
