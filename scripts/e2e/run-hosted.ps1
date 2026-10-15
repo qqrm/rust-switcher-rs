@@ -65,7 +65,17 @@ public static class HostedInput {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture EM_GETSEL failed");
         ulong range = result.ToUInt64();
         if ((range & 0xFFFF) != 0 || ((range >> 16) & 0xFFFF) != (ulong)length)
-            throw new InvalidOperationException("Fixture selection did not match the whole input");
+            throw new InvalidOperationException("Fixture selection mismatch: hwnd=" + window + ", expected=" + length + ", packed=0x" + range.ToString("X"));
+    }
+    public static bool HasSelection(IntPtr window, int length) {
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0xB0, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture selection read failed");
+        return result.ToUInt64() == ((ulong)length << 16);
+    }
+    public static bool Responsive(IntPtr window) {
+        UIntPtr result;
+        return SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out result) != IntPtr.Zero;
     }
 }
 '@
@@ -243,6 +253,7 @@ try {
     $editor = [System.Diagnostics.Process]::Start($editorInfo)
     $ownedProcesses.Add($editor)
     Wait-Condition { $null -ne (Find-AppWindow $editor) } 'isolated external editor'
+    if (-not $editor.WaitForInputIdle(5000)) { throw 'Editor did not reach an idle message loop' }
     $editorWindow = Find-AppWindow $editor
     Focus-App $editorWindow
     $editCondition = [System.Windows.Automation.PropertyCondition]::new(
@@ -252,13 +263,18 @@ try {
     $edit.SetFocus()
     $editValue = Get-Pattern $edit ([System.Windows.Automation.ValuePattern]::Pattern)
     $editValue.SetValue('ghbdtn')
+    Wait-Condition { $editValue.Current.Value -eq 'ghbdtn' } 'fixture initial text'
     $edit.SetFocus()
+    Wait-Condition { $edit.Current.HasKeyboardFocus } 'fixture keyboard focus'
+    Write-Output "Fixture native handle=$($edit.Current.NativeWindowHandle); value='$($editValue.Current.Value)'; focused=$($edit.Current.HasKeyboardFocus)"
     [HostedInput]::SelectFixtureText([IntPtr]$edit.Current.NativeWindowHandle, 6)
     $clipboardBefore = [HostedInput]::GetClipboardSequenceNumber()
     Tap-Shift 2
     Assert-Value $editValue 'привет' 'release selected text converted in external editor'
+    Wait-Condition { [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, 6) } 'converted selection restored'
     Tap-Shift 2
     Assert-Value $editValue 'ghbdtn' 'release selected text reverse conversion'
+    Wait-Condition { [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, 6) } 'reverse converted selection restored'
     if ([HostedInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Selection conversion changed the clipboard' }
     Record-Pass 'release selection leaves clipboard unchanged'
     # Either a complete conversion or refusal is safe at the UTF-16/character limit.
@@ -266,6 +282,7 @@ try {
     $unicodeInput = ('a' * 500) + ('😀' * 10)
     $unicodeExpected = ('ф' * 500) + ('😀' * 10)
     $editValue.SetValue($unicodeInput)
+    Wait-Condition { $editValue.Current.Value -eq $unicodeInput } 'fixture complete Unicode text'
     $edit.SetFocus()
     [HostedInput]::SelectFixtureText([IntPtr]$edit.Current.NativeWindowHandle, $unicodeInput.Length)
     Tap-Shift 2
@@ -274,6 +291,15 @@ try {
     if ($unicodeActual -ne $unicodeInput -and $unicodeActual -ne $unicodeExpected) {
         $scenarioFailures.Add("Unicode selection was partially replaced: input UTF-16 length=$($unicodeInput.Length), output=$($unicodeActual.Length)")
     } else { Record-Pass 'release Unicode selection boundary preserves complete text' }
+    if ($release.HasExited -or -not [HostedInput]::Responsive([IntPtr]$window.Current.NativeWindowHandle)) {
+        throw 'Release app stopped responding after Unicode selection'
+    }
+    $editValue.SetValue('ghbdtn')
+    Wait-Condition { $editValue.Current.Value -eq 'ghbdtn' } 'fixture recovery text'
+    [HostedInput]::SelectFixtureText([IntPtr]$edit.Current.NativeWindowHandle, 6)
+    Tap-Shift 2
+    Assert-Value $editValue 'привет' 'release short selection still works after Unicode boundary'
+    Wait-Condition { [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, 6) } 'recovery selection restored'
     Focus-App $window
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
@@ -308,11 +334,25 @@ try {
     Write-Output $_.ScriptStackTrace
     throw
 } finally {
+    $cleanupErrors = [System.Collections.Generic.List[string]]::new()
     foreach ($process in $ownedProcesses) {
-        if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
+        try {
+            if (-not $process.HasExited) {
+                $process.Kill()
+                if (-not $process.WaitForExit(5000)) { $cleanupErrors.Add("Owned process $($process.Id) did not exit") }
+            }
+        } catch { $cleanupErrors.Add($_.Exception.Message) }
     }
-    $result = [ordered]@{ passed = $checks.ToArray(); failures = $scenarioFailures.ToArray(); failure = $failure; commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
+    try {
+        $ownedRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+        $ownedCommand = '"' + $ReleaseExe + '" --autostart'
+        if ((Get-ItemPropertyValue -LiteralPath $ownedRunKey -Name RustSwitcher -ErrorAction SilentlyContinue) -eq $ownedCommand) {
+            Remove-ItemProperty -LiteralPath $ownedRunKey -Name RustSwitcher
+        }
+    } catch { $cleanupErrors.Add($_.Exception.Message) }
+    $result = [ordered]@{ passed = $checks.ToArray(); failures = $scenarioFailures.ToArray(); failure = $failure; cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
     $result | ConvertTo-Json -Depth 5 | Write-Output
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')
+    if ($cleanupErrors.Count -gt 0 -and $null -eq $failure) { throw ($cleanupErrors -join '; ') }
     # Only repository-owned fixture data was created; VM teardown disposes it.
 }
