@@ -18,6 +18,7 @@ $ReleaseExe = (Resolve-Path -LiteralPath $ReleaseExe).Path
 $runRoot = Join-Path $env:RUNNER_TEMP ('switcher-desktop-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 $checks = [System.Collections.Generic.List[string]]::new()
+$scenarioFailures = [System.Collections.Generic.List[string]]::new()
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $failure = $null
 
@@ -54,6 +55,18 @@ public static class HostedInput {
     }
     public static int InputSize() { return Marshal.SizeOf<INPUT>(); }
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeout(
+        IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
+    public static void SelectFixtureText(IntPtr window, int length) {
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0xB1, UIntPtr.Zero, new IntPtr(-1), 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture EM_SETSEL failed");
+        if (SendMessageTimeout(window, 0xB0, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture EM_GETSEL failed");
+        ulong range = result.ToUInt64();
+        if ((range & 0xFFFF) != 0 || ((range >> 16) & 0xFFFF) != (ulong)length)
+            throw new InvalidOperationException("Fixture selection did not match the whole input");
+    }
 }
 '@
 if ([HostedInput]::InputSize() -ne $(if ([IntPtr]::Size -eq 8) {40} else {28})) {
@@ -148,7 +161,8 @@ function Select-All {
     Start-Sleep -Milliseconds 100
 }
 function Assert-Value($Pattern, [string]$Expected, [string]$Name) {
-    Wait-Condition { $Pattern.Current.Value -eq $Expected } "$Name; expected '$Expected'"
+    try { Wait-Condition { $Pattern.Current.Value -eq $Expected } "$Name; expected '$Expected'" }
+    catch { throw "$Name; expected '$Expected'; actual '$($Pattern.Current.Value)'" }
     Record-Pass $Name
 }
 function Quit-Owned($Process, $Window) {
@@ -186,6 +200,29 @@ try {
     Assert-Value $value 'ghbdtn' 'debug deferred double Shift reverse conversion'
     Quit-Owned $debug $window
     Record-Pass 'debug cleanup and exit'
+    foreach ($scenario in @('sequence', 'autoconvert')) {
+        $debug = Start-Switcher $DebugExe $debugProfile $true
+        Wait-Condition { $null -ne (Find-AppWindow $debug) } "debug $scenario startup"
+        $window = Find-AppWindow $debug
+        Focus-App $window
+        $playground = Find-Playground $window
+        $playground.SetFocus()
+        $value = Get-Pattern $playground ([System.Windows.Automation.ValuePattern]::Pattern)
+        [HostedInput]::PostMessage([IntPtr]$window.Current.NativeWindowHandle, 0x50, [UIntPtr]::Zero, $english) | Out-Null
+        Start-Sleep -Milliseconds 300
+        if ($scenario -eq 'autoconvert') {
+            Tap-Key 0xA3; Start-Sleep -Milliseconds 100; Tap-Key 0xA3
+            Start-Sleep -Milliseconds 300
+            foreach ($character in 'GHBDTN '.ToCharArray()) { Tap-Key ([ushort]$character) }
+            Assert-Value $value 'привет ' 'debug autoconvert after explicit runtime toggle'
+        } else {
+            foreach ($character in 'GHBDTN VBH'.ToCharArray()) { Tap-Key ([ushort]$character) }
+            Assert-Value $value 'ghbdtn vbh' 'debug last-sequence initial input'
+            Tap-Key 0xA4; Start-Sleep -Milliseconds 100; Tap-Key 0xA4
+            Assert-Value $value 'привет мир' 'debug double Alt last-sequence conversion'
+        }
+        Quit-Owned $debug $window
+    }
 
     $releaseProfile = Join-Path $runRoot 'release-profile'
     $release = Start-Switcher $ReleaseExe $releaseProfile $false
@@ -215,7 +252,8 @@ try {
     $edit.SetFocus()
     $editValue = Get-Pattern $edit ([System.Windows.Automation.ValuePattern]::Pattern)
     $editValue.SetValue('ghbdtn')
-    Select-All
+    $edit.SetFocus()
+    [HostedInput]::SelectFixtureText([IntPtr]$edit.Current.NativeWindowHandle, 6)
     $clipboardBefore = [HostedInput]::GetClipboardSequenceNumber()
     Tap-Shift 2
     Assert-Value $editValue 'привет' 'release selected text converted in external editor'
@@ -223,6 +261,19 @@ try {
     Assert-Value $editValue 'ghbdtn' 'release selected text reverse conversion'
     if ([HostedInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Selection conversion changed the clipboard' }
     Record-Pass 'release selection leaves clipboard unchanged'
+    # Either a complete conversion or refusal is safe at the UTF-16/character limit.
+    # Partial replacement would destroy the rest of the selected text.
+    $unicodeInput = ('a' * 500) + ('😀' * 10)
+    $unicodeExpected = ('ф' * 500) + ('😀' * 10)
+    $editValue.SetValue($unicodeInput)
+    $edit.SetFocus()
+    [HostedInput]::SelectFixtureText([IntPtr]$edit.Current.NativeWindowHandle, $unicodeInput.Length)
+    Tap-Shift 2
+    Start-Sleep -Milliseconds 1500
+    $unicodeActual = $editValue.Current.Value
+    if ($unicodeActual -ne $unicodeInput -and $unicodeActual -ne $unicodeExpected) {
+        $scenarioFailures.Add("Unicode selection was partially replaced: input UTF-16 length=$($unicodeInput.Length), output=$($unicodeActual.Length)")
+    } else { Record-Pass 'release Unicode selection boundary preserves complete text' }
     Focus-App $window
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
@@ -250,6 +301,7 @@ try {
     Record-Pass 'release settings reloaded after restart'
     Quit-Owned $release $window
     Record-Pass 'release cleanup and exit'
+    if ($scenarioFailures.Count -gt 0) { throw ($scenarioFailures -join '; ') }
 } catch {
     $failure = $_.Exception.Message
     Write-Output "FAIL: $failure"
@@ -259,7 +311,7 @@ try {
     foreach ($process in $ownedProcesses) {
         if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
     }
-    $result = [ordered]@{ passed = $checks.ToArray(); failure = $failure; commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
+    $result = [ordered]@{ passed = $checks.ToArray(); failures = $scenarioFailures.ToArray(); failure = $failure; commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
     $result | ConvertTo-Json -Depth 5 | Write-Output
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')
     # Only repository-owned fixture data was created; VM teardown disposes it.
