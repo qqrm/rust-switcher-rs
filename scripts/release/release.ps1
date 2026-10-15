@@ -79,10 +79,45 @@ try {
 
     $head = (Invoke-Checked git @('rev-parse', 'HEAD') -Quiet).Output.Trim()
 
-    # Publish the release commit before creating an immutable tag. This keeps
-    # the dev branch, tag, GitHub Release, and crates.io version on one source commit.
-    Write-Host "`n>> git push origin dev"
-    Invoke-Checked git @('push', 'origin', 'dev')
+    # The version commit must pass the same native gates as every other change.
+    # Never use an admin bypass or push the bump directly to the protected branch.
+    $releaseBranch = "automation/release-$sourceHead"
+    $repo = $env:GITHUB_REPOSITORY
+    if (-not $repo) {
+      $repo = (Invoke-Checked gh @('repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner') -Quiet).Output.Trim()
+    }
+    $prs = @((Invoke-Checked gh @('pr', 'list', '--repo', $repo, '--base', 'dev', '--head', $releaseBranch,
+      '--state', 'all', '--json', 'number,headRefOid,state') -Quiet).Output | ConvertFrom-Json)
+    if ($prs.Count -gt 1) { throw 'Multiple version PRs for the same source commit; reconcile before release.' }
+    if ($prs.Count -eq 1) {
+      $pr = $prs[0]
+      if ($pr.state -eq 'CLOSED') { throw 'Version PR was closed; publication refused.' }
+      Invoke-Checked git @('fetch', 'origin', $pr.headRefOid) | Out-Null
+      # A retry may have a different commit timestamp, but must have the identical tree.
+      Invoke-Checked git @('diff', '--exit-code', $head, $pr.headRefOid) | Out-Null
+      $head = $pr.headRefOid
+    } else {
+      Invoke-Checked git @('push', 'origin', "HEAD:refs/heads/$releaseBranch") | Out-Null
+      $bodyFile = New-TemporaryFile
+      try {
+        Set-Content -LiteralPath $bodyFile -Value "Release version $target for tested source $sourceHead. Native CI and security gates must pass before publication." -Encoding UTF8
+        Invoke-Checked gh @('pr', 'create', '--repo', $repo, '--base', 'dev', '--head', $releaseBranch,
+          '--title', "chore: release $target", '--body-file', $bodyFile) | Out-Null
+      } finally { Remove-Item -LiteralPath $bodyFile }
+      $pr = (Invoke-Checked gh @('pr', 'view', $releaseBranch, '--repo', $repo,
+        '--json', 'number,headRefOid,state') -Quiet).Output | ConvertFrom-Json
+      if ($pr.headRefOid -ne $head) { throw 'Version PR head changed before merge.' }
+    }
+    if ($pr.state -ne 'MERGED') {
+      Invoke-Checked gh @('pr', 'merge', "$($pr.number)", '--repo', $repo, '--auto', '--squash',
+        '--match-head-commit', $head, '--subject', "chore: release $target", '--body', "release-source: $sourceHead") | Out-Null
+    }
+    $mergedHead = (Invoke-Checked python @('.github/scripts/release_gate.py', '--repo', $repo,
+      '--pr', "$($pr.number)", '--head', $head, '--base', 'dev') -Quiet).Output.Trim()
+    if ($mergedHead -notmatch '^[a-f0-9]{40}$') { throw 'Missing checked version merge SHA.' }
+    Invoke-Checked git @('fetch', 'origin', $mergedHead) | Out-Null
+    Invoke-Checked git @('checkout', '--detach', $mergedHead) | Out-Null
+    $head = $mergedHead
 
     $created = Ensure-Tag-Immutable -Tag $tag -ExpectedSha $head
 
@@ -99,7 +134,7 @@ try {
 
   # Build artifacts.
   Write-Host "`n>> cargo build --release"
-  Invoke-Checked cargo @('build', '--release')
+  Invoke-Checked cargo @('build', '--release', '--locked')
 
   $exe = Join-Path $repoRoot 'target\release\rust-switcher.exe'
   if (-not (Test-Path $exe)) {
