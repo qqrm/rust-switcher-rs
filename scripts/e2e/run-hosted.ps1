@@ -55,23 +55,26 @@ public static class HostedInput {
     }
     public static int InputSize() { return Marshal.SizeOf<INPUT>(); }
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
-    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SendMessageTimeout(
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)] static extern IntPtr SendMessageTimeout(
         IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)] static extern IntPtr ReadSelection(
+        IntPtr window, uint message, out uint start, out uint end, uint flags, uint timeout, out UIntPtr result);
     public static void SelectFixtureText(IntPtr window, int length) {
         UIntPtr result;
-        if (SendMessageTimeout(window, 0xB1, UIntPtr.Zero, new IntPtr(-1), 2, 1000, out result) == IntPtr.Zero)
+        if (SendMessageTimeout(window, 0xB1, UIntPtr.Zero, new IntPtr(length), 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture EM_SETSEL failed");
-        if (SendMessageTimeout(window, 0xB0, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+        uint start, end;
+        if (ReadSelection(window, 0xB0, out start, out end, 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture EM_GETSEL failed");
-        ulong range = result.ToUInt64();
-        if ((range & 0xFFFF) != 0 || ((range >> 16) & 0xFFFF) != (ulong)length)
-            throw new InvalidOperationException("Fixture selection mismatch: hwnd=" + window + ", expected=" + length + ", packed=0x" + range.ToString("X"));
+        if (start != 0 || end != (uint)length)
+            throw new InvalidOperationException("Fixture selection mismatch: hwnd=" + window + ", expected=" + length + ", actual=" + start + ".." + end + ", packed=0x" + result.ToUInt64().ToString("X"));
     }
     public static bool HasSelection(IntPtr window, int length) {
         UIntPtr result;
-        if (SendMessageTimeout(window, 0xB0, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+        uint start, end;
+        if (ReadSelection(window, 0xB0, out start, out end, 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture selection read failed");
-        return result.ToUInt64() == ((ulong)length << 16);
+        return start == 0 && end == (uint)length;
     }
     public static bool Responsive(IntPtr window) {
         UIntPtr result;

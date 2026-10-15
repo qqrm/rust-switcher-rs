@@ -9,14 +9,38 @@ The environment guard prevents accidental local launches; it is not a sandbox.
 Do not spoof its variables or run interactive checks on a working desktop.
 All compilation, native input and UI Automation stay on the remote runner.
 
-The hosted scenarios cover debug keyboard input, overlapping triple/double
-Shift conversion, and release startup, single-instance handoff, saving/loading
-settings and Exit. The debug path accepts injected typing through the existing
-debug-only switch; this is not evidence of physical keyboard capture in release.
+The hosted scenarios run real executables and inspect real windows. The debug
+path accepts injected typing through the existing debug-only switch; this is
+not evidence of physical keyboard capture in release. Release selection checks
+use a separate native Windows Edit control, without debug switches. Setting
+fixture text and its initial selection only prepares the input: actual hotkeys
+must cause the application to replace and reselect it.
 Assertions fail on missing desktop capabilities or timeouts, never skip to green.
 Only unique temporary profiles and processes created by the scenario are used.
 No local Sandbox, shutdown, driver installation or paid runner is required.
 Results are printed in the job log without adding stored workflow artifacts.
+
+### Coverage manifest
+
+| Feature or boundary | Hosted check | Remaining limit |
+| --- | --- | --- |
+| Last word and overlapping smart hotkeys | Debug triple Shift and deferred double Shift, both directions | Injected input accepted through the debug-only opt-in |
+| Last typed sequence | Debug double Alt converts two words | Physical typing in release requires a separate VM with keyboard access |
+| Automatic last-word conversion | Debug runtime toggle followed by a word and space | Other delimiters are not exercised by this GUI scenario |
+| Selected text | Release double Shift in a separate native Edit, both directions, restored selection | Other applications, rich editors and elevated targets are not exercised |
+| Clipboard isolation | Clipboard sequence unchanged during selection conversion | Does not audit unrelated applications on the desktop |
+| Unicode boundary | A 510-character selection containing emoji must remain complete, followed by a short conversion | Does not prove every UI Automation provider's truncation behavior |
+| Startup and single instance | Release launch and second-instance handoff | A published release download is not installed or exercised |
+| Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
+| Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
+| Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |
+| Tray actions, pause and CapsLock layout switching | No hosted GUI assertion yet | Requires additional scenarios; source/unit checks are not runtime proof |
+| Focus changes, unresponsive editors and interrupted config writes | Source audit only | Adversarial runtime and fault-injection scenarios remain open |
+| Operating system and devices | Fresh Windows Server 2025 hosted VM | Windows 11 client, physical keyboard, device drivers and real user profiles remain unverified |
+
+The manifest describes assertions implemented by the harness, not a permanent
+claim of success: use the `windows-full` log for the exact tested commit. All
+rows without a hosted assertion remain coverage gaps even when CI is green.
 
 ## Existing Windows Sandbox scenario
 
