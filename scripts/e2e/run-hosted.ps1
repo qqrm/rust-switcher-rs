@@ -53,6 +53,7 @@ public static class HostedInput {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "SendInput did not inject one event");
     }
     public static int InputSize() { return Marshal.SizeOf<INPUT>(); }
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
 }
 '@
 if ([HostedInput]::InputSize() -ne $(if ([IntPtr]::Size -eq 8) {40} else {28})) {
@@ -68,12 +69,12 @@ function Wait-Condition([scriptblock]$Condition, [string]$Description, [int]$Mil
     throw "Timed out: $Description"
 }
 function Record-Pass([string]$Name) { $checks.Add($Name); Write-Output "PASS: $Name" }
-function Start-Switcher([string]$Exe, [string]$Profile, [bool]$DebugMode) {
+function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode) {
     $info = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.WorkingDirectory = $runRoot
-    $info.Environment['APPDATA'] = $Profile
+    $info.Environment['APPDATA'] = $ProfilePath
     $info.Environment['RUST_LOG'] = 'warn'
     if ($DebugMode) {
         $info.Environment['RUST_SWITCHER_E2E_PLAYGROUND'] = '1'
@@ -194,11 +195,47 @@ try {
     if (-not $second.WaitForExit(8000) -or $second.ExitCode -ne 0) { throw 'Second instance did not exit successfully' }
     if ($release.HasExited) { throw 'Primary instance exited during second launch' }
     Record-Pass 'release single-instance handoff'
+    $editorInfo = [System.Diagnostics.ProcessStartInfo]::new('powershell.exe')
+    $editorInfo.UseShellExecute = $false
+    $editorInfo.CreateNoWindow = $true
+    foreach ($argument in @('-NoProfile', '-STA', '-File', (Join-Path $PSScriptRoot 'editor-fixture.ps1'))) {
+        $editorInfo.ArgumentList.Add($argument)
+    }
+    $editor = [System.Diagnostics.Process]::Start($editorInfo)
+    $ownedProcesses.Add($editor)
+    Wait-Condition { $null -ne (Find-AppWindow $editor) } 'isolated external editor'
+    $editorWindow = Find-AppWindow $editor
+    Focus-App $editorWindow
+    $edit = Find-Control $editorWindow 'Isolated editor'
+    $edit.SetFocus()
+    $editValue = Get-Pattern $edit ([System.Windows.Automation.ValuePattern]::Pattern)
+    $editValue.SetValue('ghbdtn')
+    Select-All
+    $clipboardBefore = [HostedInput]::GetClipboardSequenceNumber()
+    Tap-Shift 2
+    Assert-Value $editValue 'привет' 'release selected text converted in external editor'
+    Tap-Shift 2
+    Assert-Value $editValue 'ghbdtn' 'release selected text reverse conversion'
+    if ([HostedInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Selection conversion changed the clipboard' }
+    Record-Pass 'release selection leaves clipboard unchanged'
+    Focus-App $window
+    # Closing our fixture through its real window message loop leaves no input target behind.
+    [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    if (-not $editor.WaitForExit(5000)) { throw 'Isolated editor did not close' }
     Toggle-Control $window 'Dark theme' $true
     Apply-Settings $window
     $config = Join-Path $releaseProfile 'RustSwitcher/config.json'
     Wait-Condition { (Test-Path -LiteralPath $config) -and (Get-Content -LiteralPath $config -Raw) -match 'theme_dark\s*=\s*true' } 'release setting persisted'
     Record-Pass 'release settings saved'
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if ($null -ne (Get-ItemPropertyValue -LiteralPath $runKey -Name RustSwitcher -ErrorAction SilentlyContinue)) {
+        throw 'Unexpected pre-existing autostart entry on fresh VM'
+    }
+    Toggle-Control $window 'Start on startup' $true
+    Wait-Condition { (Get-ItemPropertyValue -LiteralPath $runKey -Name RustSwitcher -ErrorAction SilentlyContinue) -eq ('"' + $ReleaseExe + '" --autostart') } 'autostart registry target'
+    Toggle-Control $window 'Start on startup' $false
+    Wait-Condition { $null -eq (Get-ItemPropertyValue -LiteralPath $runKey -Name RustSwitcher -ErrorAction SilentlyContinue) } 'autostart removal'
+    Record-Pass 'release autostart registration and removal'
     Quit-Owned $release $window
     $release = Start-Switcher $ReleaseExe $releaseProfile $false
     Wait-Condition { $null -ne (Find-AppWindow $release) } 'release restart'
