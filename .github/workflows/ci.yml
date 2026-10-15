@@ -74,7 +74,8 @@ jobs:
 
   windows-full:
     name: windows-full
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -100,6 +101,19 @@ jobs:
           fallback: none
       - name: Cargo nextest --locked
         run: cargo +nightly nextest run --locked
+      - name: Build desktop test and release applications
+        shell: pwsh
+        run: |
+          cargo +nightly build --locked --bin rust-switcher-debug --features debug-tracing,debug-binary
+          if ($LASTEXITCODE -ne 0) { throw 'Debug build failed' }
+          cargo +nightly build --release --locked --bin rust-switcher
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+      - name: Exercise actual applications in the isolated desktop
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/run-hosted.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
 
   dependency-security:
     name: dependency-security

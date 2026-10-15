@@ -1,5 +1,25 @@
 # Interactive E2E
 
+## GitHub-hosted validation (preferred)
+
+The `windows-full` required CI job builds and runs the debug test application
+and the release executable on a fresh standard `windows-2025` GitHub VM.
+`run-hosted.ps1` refuses to run outside that explicitly enabled hosted job.
+The environment guard prevents accidental local launches; it is not a sandbox.
+Do not spoof its variables or run interactive checks on a working desktop.
+All compilation, native input and UI Automation stay on the remote runner.
+
+The hosted scenarios cover debug keyboard input, overlapping triple/double
+Shift conversion, and release startup, single-instance handoff, saving/loading
+settings and Exit. The debug path accepts injected typing through the existing
+debug-only switch; this is not evidence of physical keyboard capture in release.
+Assertions fail on missing desktop capabilities or timeouts, never skip to green.
+Only unique temporary profiles and processes created by the scenario are used.
+No local Sandbox, shutdown, driver installation or paid runner is required.
+Results are printed in the job log without adding stored workflow artifacts.
+
+## Existing Windows Sandbox scenario
+
 These checks exercise the real Windows keyboard hook, foreground focus, and
 `SendInput` behavior in an isolated Windows Sandbox desktop.
 
