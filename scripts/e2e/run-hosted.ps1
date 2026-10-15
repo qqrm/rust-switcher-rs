@@ -305,6 +305,7 @@ try {
     Tap-Shift 2
     Start-Sleep -Milliseconds 1500
     $unicodeActual = $editValue.Current.Value
+    Write-Output "Unicode boundary: input UTF-16=$($unicodeInput.Length), output=$($unicodeActual.Length), converted=$($unicodeActual -eq $unicodeExpected), unchanged=$($unicodeActual -eq $unicodeInput)"
     if ($unicodeActual -ne $unicodeInput -and $unicodeActual -ne $unicodeExpected) {
         $scenarioFailures.Add("Unicode selection was partially replaced: input UTF-16 length=$($unicodeInput.Length), output=$($unicodeActual.Length)")
     } else { Record-Pass 'release Unicode selection boundary preserves complete text' }
@@ -317,16 +318,15 @@ try {
     Tap-Shift 2
     Assert-Value $editValue 'привет' 'release short selection still works after Unicode boundary'
     Wait-Condition { [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, 6) } 'recovery selection restored'
-    Focus-App $window
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     if (-not $editor.WaitForExit(5000)) { throw 'Isolated editor did not close' }
+    # Settings use addressed UI Automation patterns; they do not need foreground input.
     Toggle-Control $window 'Dark theme' $true
     Apply-Settings $window
     $config = Join-Path $releaseProfile 'RustSwitcher/config.json'
     Wait-Condition { (Test-Path -LiteralPath $config) -and (Get-Content -LiteralPath $config -Raw) -match 'theme_dark\s*=\s*true' } 'release setting persisted'
     Record-Pass 'release settings saved'
-    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     if ($null -ne (Get-AutostartCommand)) {
         throw 'Unexpected pre-existing autostart entry on fresh VM'
     }
