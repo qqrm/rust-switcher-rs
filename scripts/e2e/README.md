@@ -30,7 +30,7 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Selected text | Release double Shift in a separate native Edit, both directions, restored selection | Other applications, rich editors and elevated targets are not exercised |
 | Clipboard isolation | Clipboard sequence unchanged during selection conversion | Does not audit unrelated applications on the desktop |
 | Unicode boundary | A 510-character selection containing emoji must remain complete, followed by a short conversion | Does not prove every UI Automation provider's truncation behavior |
-| Startup and single instance | Release launch and second-instance handoff | A published release download is not installed or exercised |
+| Startup and single instance | Release launch and duplicate-instance rejection | Focus activation by a second launch and a published release download are not exercised |
 | Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
 | Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
 | Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |

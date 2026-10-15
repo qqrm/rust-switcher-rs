@@ -95,6 +95,12 @@ function Wait-Condition([scriptblock]$Condition, [string]$Description, [int]$Mil
     throw "Timed out: $Description"
 }
 function Record-Pass([string]$Name) { $checks.Add($Name); Write-Output "PASS: $Name" }
+function Get-AutostartCommand {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+    if ($null -eq $key) { return $null }
+    try { return $key.GetValue('RustSwitcher', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+    finally { $key.Dispose() }
+}
 function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode) {
     $info = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     $info.UseShellExecute = $false
@@ -179,6 +185,8 @@ function Quit-Owned($Process, $Window) {
     if ($Process.ExitCode -ne 0) { throw "Application exit code: $($Process.ExitCode)" }
 }
 
+$fixtureStdout = $null
+$fixtureStderr = $null
 try {
     [ordered]@{
         os = (Get-CimInstance Win32_OperatingSystem).Caption
@@ -241,16 +249,23 @@ try {
     $second = Start-Switcher $ReleaseExe $releaseProfile $false
     if (-not $second.WaitForExit(8000) -or $second.ExitCode -ne 0) { throw 'Second instance did not exit successfully' }
     if ($release.HasExited) { throw 'Primary instance exited during second launch' }
-    Record-Pass 'release single-instance handoff'
+    Record-Pass 'release duplicate-instance rejection'
     $editorInfo = [System.Diagnostics.ProcessStartInfo]::new('powershell.exe')
     $editorInfo.UseShellExecute = $false
     $editorInfo.CreateNoWindow = $true
+    $editorInfo.RedirectStandardOutput = $true
+    $editorInfo.RedirectStandardError = $true
     foreach ($argument in @('-NoProfile', '-STA', '-File', (Join-Path $PSScriptRoot 'editor-fixture.ps1'))) {
         $editorInfo.ArgumentList.Add($argument)
     }
     $editor = [System.Diagnostics.Process]::Start($editorInfo)
     $ownedProcesses.Add($editor)
-    Wait-Condition { $null -ne (Find-AppWindow $editor) } 'isolated external editor'
+    $fixtureStdout = $editor.StandardOutput.ReadToEndAsync()
+    $fixtureStderr = $editor.StandardError.ReadToEndAsync()
+    Wait-Condition {
+        if ($editor.HasExited) { throw "Editor fixture exited before opening: $($editor.ExitCode)" }
+        $null -ne (Find-AppWindow $editor)
+    } 'isolated external editor (including cold framework/compiler startup)' 30000
     $editorWindow = Find-AppWindow $editor
     # The fixture is hosted by a console process; WaitForInputIdle rejects it.
     Wait-Condition { [HostedInput]::Responsive([IntPtr]$editorWindow.Current.NativeWindowHandle) } 'editor message loop'
@@ -268,13 +283,16 @@ try {
     Write-Output "Fixture native handle=$($edit.Current.NativeWindowHandle); value='$($editValue.Current.Value)'; focused=$($edit.Current.HasKeyboardFocus)"
     [HostedInput]::SelectFixtureText([IntPtr]$edit.Current.NativeWindowHandle, 6)
     $clipboardBefore = [HostedInput]::GetClipboardSequenceNumber()
+    if ($clipboardBefore -eq 0) { throw 'Clipboard sequence is unavailable' }
     Tap-Shift 2
     Assert-Value $editValue 'привет' 'release selected text converted in external editor'
     Wait-Condition { [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, 6) } 'converted selection restored'
     Tap-Shift 2
     Assert-Value $editValue 'ghbdtn' 'release selected text reverse conversion'
     Wait-Condition { [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, 6) } 'reverse converted selection restored'
-    if ([HostedInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Selection conversion changed the clipboard' }
+    $clipboardAfter = [HostedInput]::GetClipboardSequenceNumber()
+    if ($clipboardAfter -eq 0) { throw 'Clipboard sequence became unavailable' }
+    if ($clipboardAfter -ne $clipboardBefore) { throw 'Selection conversion changed the clipboard' }
     Record-Pass 'release selection leaves clipboard unchanged'
     # Either a complete conversion or refusal is safe at the UTF-16/character limit.
     # Partial replacement would destroy the rest of the selected text.
@@ -309,13 +327,13 @@ try {
     Wait-Condition { (Test-Path -LiteralPath $config) -and (Get-Content -LiteralPath $config -Raw) -match 'theme_dark\s*=\s*true' } 'release setting persisted'
     Record-Pass 'release settings saved'
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-    if ($null -ne (Get-ItemPropertyValue -LiteralPath $runKey -Name RustSwitcher -ErrorAction SilentlyContinue)) {
+    if ($null -ne (Get-AutostartCommand)) {
         throw 'Unexpected pre-existing autostart entry on fresh VM'
     }
     Toggle-Control $window 'Start on startup' $true
-    Wait-Condition { (Get-ItemPropertyValue -LiteralPath $runKey -Name RustSwitcher -ErrorAction SilentlyContinue) -eq ('"' + $ReleaseExe + '" --autostart') } 'autostart registry target'
+    Wait-Condition { (Get-AutostartCommand) -eq ('"' + $ReleaseExe + '" --autostart') } 'autostart registry target'
     Toggle-Control $window 'Start on startup' $false
-    Wait-Condition { $null -eq (Get-ItemPropertyValue -LiteralPath $runKey -Name RustSwitcher -ErrorAction SilentlyContinue) } 'autostart removal'
+    Wait-Condition { $null -eq (Get-AutostartCommand) } 'autostart removal'
     Record-Pass 'release autostart registration and removal'
     Quit-Owned $release $window
     $release = Start-Switcher $ReleaseExe $releaseProfile $false
@@ -345,10 +363,13 @@ try {
     try {
         $ownedRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
         $ownedCommand = '"' + $ReleaseExe + '" --autostart'
-        if ((Get-ItemPropertyValue -LiteralPath $ownedRunKey -Name RustSwitcher -ErrorAction SilentlyContinue) -eq $ownedCommand) {
+        if ((Get-AutostartCommand) -eq $ownedCommand) {
             Remove-ItemProperty -LiteralPath $ownedRunKey -Name RustSwitcher
         }
     } catch { $cleanupErrors.Add($_.Exception.Message) }
+    foreach ($outputTask in @($fixtureStdout, $fixtureStderr)) {
+        if ($null -ne $outputTask -and $outputTask.Wait(1000)) { Write-Output $outputTask.Result }
+    }
     $result = [ordered]@{ passed = $checks.ToArray(); failures = $scenarioFailures.ToArray(); failure = $failure; cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
     $result | ConvertTo-Json -Depth 5 | Write-Output
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')
