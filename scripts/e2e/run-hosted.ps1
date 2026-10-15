@@ -108,7 +108,9 @@ function Find-Control($Window, [string]$Name) {
 }
 function Get-Pattern($Element, $PatternId) {
     $value = $null
-    if (-not $Element.TryGetCurrentPattern($PatternId, [ref]$value)) { throw 'Required UI Automation pattern unavailable' }
+    if (-not $Element.TryGetCurrentPattern($PatternId, [ref]$value)) {
+        throw "UI Automation pattern $($PatternId.ProgrammaticName) unavailable: name='$($Element.Current.Name)', class='$($Element.Current.ClassName)'"
+    }
     return $value
 }
 function Toggle-Control($Window, [string]$Name, [bool]$On) {
@@ -206,7 +208,10 @@ try {
     Wait-Condition { $null -ne (Find-AppWindow $editor) } 'isolated external editor'
     $editorWindow = Find-AppWindow $editor
     Focus-App $editorWindow
-    $edit = Find-Control $editorWindow 'Isolated editor'
+    $editCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'Edit')
+    $edit = $editorWindow.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
+    if ($null -eq $edit) { throw 'Native Edit fixture not found' }
     $edit.SetFocus()
     $editValue = Get-Pattern $edit ([System.Windows.Automation.ValuePattern]::Pattern)
     $editValue.SetValue('ghbdtn')
@@ -248,6 +253,7 @@ try {
 } catch {
     $failure = $_.Exception.Message
     Write-Output "FAIL: $failure"
+    Write-Output $_.ScriptStackTrace
     throw
 } finally {
     foreach ($process in $ownedProcesses) {

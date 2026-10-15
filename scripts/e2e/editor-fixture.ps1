@@ -8,10 +8,19 @@ $form = [System.Windows.Forms.Form]::new()
 $form.Text = 'Rust Switcher isolated editor'
 $form.Width = 550
 $form.Height = 200
-$editor = [System.Windows.Forms.TextBox]::new()
-$editor.AccessibleName = 'Isolated editor'
-$editor.Multiline = $true
-$editor.SetBounds(10, 10, 500, 100)
-$form.Controls.Add($editor)
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class EditorFixture {
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern IntPtr CreateWindowEx(uint exStyle, string className, string text,
+        uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu,
+        IntPtr instance, IntPtr parameter);
+}
+'@
+# Use the OS Edit class: the application explicitly supports Edit/RichEdit and UIA.
+$editor = [EditorFixture]::CreateWindowEx(0x200, 'EDIT', '', 0x50010080,
+    10, 10, 500, 100, $form.Handle, [IntPtr]1001, [IntPtr]::Zero, [IntPtr]::Zero)
+if ($editor -eq [IntPtr]::Zero) { throw 'Native Edit fixture creation failed' }
 [System.Windows.Forms.Clipboard]::SetText('switcher-clipboard-sentinel')
 try { [System.Windows.Forms.Application]::Run($form) } finally { $form.Dispose() }
