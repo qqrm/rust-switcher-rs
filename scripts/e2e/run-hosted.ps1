@@ -165,11 +165,6 @@ function Tap-Key([ushort]$Key) {
 function Tap-Shift([int]$Count) {
     for ($index = 0; $index -lt $Count; $index++) { Tap-Key 0xA0; Start-Sleep -Milliseconds 100 }
 }
-function Select-All {
-    [HostedInput]::Key(0xA2, $false)
-    try { Tap-Key 0x41 } finally { [HostedInput]::Key(0xA2, $true) }
-    Start-Sleep -Milliseconds 100
-}
 function Assert-Value($Pattern, [string]$Expected, [string]$Name) {
     try { Wait-Condition { $Pattern.Current.Value -eq $Expected } "$Name; expected '$Expected'" }
     catch { throw "$Name; expected '$Expected'; actual '$($Pattern.Current.Value)'" }
@@ -253,8 +248,9 @@ try {
     $editor = [System.Diagnostics.Process]::Start($editorInfo)
     $ownedProcesses.Add($editor)
     Wait-Condition { $null -ne (Find-AppWindow $editor) } 'isolated external editor'
-    if (-not $editor.WaitForInputIdle(5000)) { throw 'Editor did not reach an idle message loop' }
     $editorWindow = Find-AppWindow $editor
+    # The fixture is hosted by a console process; WaitForInputIdle rejects it.
+    Wait-Condition { [HostedInput]::Responsive([IntPtr]$editorWindow.Current.NativeWindowHandle) } 'editor message loop'
     Focus-App $editorWindow
     $editCondition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'Edit')
