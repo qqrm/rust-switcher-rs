@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     app::AppState,
-    conversion::input::{KeySequence, send_text_unicode},
+    conversion::input::{send_text_unicode, tap_key},
     input_journal::{InputRun, LayoutTag, RunKind, RunOrigin},
 };
 const VK_BACKSPACE_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x08);
@@ -795,7 +795,7 @@ fn move_caret_right(count: usize) -> bool {
     repeat_tap(VK_RIGHT_KEY, count, "right arrow tap failed")
 }
 fn repeat_tap(vk: VIRTUAL_KEY, count: usize, err_msg: &'static str) -> bool {
-    match (0..count).try_for_each(|i| KeySequence::tap(vk).then_some(()).ok_or(i)) {
+    match (0..count).try_for_each(|i| tap_key(vk).then_some(()).ok_or(i)) {
         Ok(()) => true,
         Err(i) => {
             tracing::error!(i, count, %err_msg);

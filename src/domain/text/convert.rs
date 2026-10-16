@@ -100,7 +100,7 @@ enum ConvertOutcome {
 
 /// Attempts to convert selection and returns a high level outcome.
 ///
-/// This function does not perform UI safety checks.
+/// Revalidates the captured target, selection range and text before input.
 fn convert_selection_outcome(
     state: &mut AppState,
     max_chars: usize,

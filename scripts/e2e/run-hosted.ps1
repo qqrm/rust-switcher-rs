@@ -43,6 +43,7 @@ public static class HostedInput {
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string title);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr window, uint message, UIntPtr w, IntPtr l);
@@ -78,7 +79,12 @@ public static class HostedInput {
     }
     public static bool Responsive(IntPtr window) {
         UIntPtr result;
-        return SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out result) != IntPtr.Zero;
+        return SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 2, 500, out result) != IntPtr.Zero;
+    }
+    public static void ArmFixture(IntPtr window, uint mode) {
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0x8011, new UIntPtr(mode), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture trap setup failed");
     }
 }
 '@
@@ -255,6 +261,8 @@ try {
     $editorInfo.CreateNoWindow = $true
     $editorInfo.RedirectStandardOutput = $true
     $editorInfo.RedirectStandardError = $true
+    $signalPath = Join-Path $runRoot 'editor-signal.txt'
+    $editorInfo.Environment['RUST_SWITCHER_E2E_SIGNAL_PATH'] = $signalPath
     foreach ($argument in @('-NoProfile', '-STA', '-File', (Join-Path $PSScriptRoot 'editor-fixture.ps1'))) {
         $editorInfo.ArgumentList.Add($argument)
     }
@@ -318,6 +326,46 @@ try {
     Tap-Shift 2
     Assert-Value $editValue 'привет' 'release short selection still works after Unicode boundary'
     Wait-Condition { [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, 6) } 'recovery selection restored'
+    $editHandle = [IntPtr]$edit.Current.NativeWindowHandle
+    $otherHandle = [HostedInput]::GetDlgItem([IntPtr]$editorWindow.Current.NativeWindowHandle, 1002)
+    if ($otherHandle -eq [IntPtr]::Zero) { throw 'Secondary input target not found' }
+    $otherEdit = [System.Windows.Automation.AutomationElement]::FromHandle($otherHandle)
+    $otherValue = Get-Pattern $otherEdit ([System.Windows.Automation.ValuePattern]::Pattern)
+    foreach ($mode in @(1, 2, 3)) {
+        $editValue.SetValue('ghbdtn')
+        $otherValue.SetValue('untouched')
+        $edit.SetFocus()
+        Wait-Condition { $edit.Current.HasKeyboardFocus } 'adversarial fixture focus'
+        [HostedInput]::SelectFixtureText($editHandle, 6)
+        Set-Content -LiteralPath $signalPath -Value 'ready' -NoNewline
+        if ($mode -eq 3) {
+            [HostedInput]::PostMessage($editHandle, 0x8011, [UIntPtr]3, [IntPtr]::Zero) | Out-Null
+            Wait-Condition { (Get-Content -LiteralPath $signalPath -Raw) -eq 'blocked' } 'editor deliberately blocked'
+        } else {
+            [HostedInput]::ArmFixture($editHandle, $mode)
+        }
+        Tap-Shift 2
+        if ($mode -eq 3) {
+            Start-Sleep -Milliseconds 500
+            if ((Get-Content -LiteralPath $signalPath -Raw) -ne 'blocked') { throw 'Hung-editor check missed the blocked interval' }
+            if (-not [HostedInput]::Responsive([IntPtr]$window.Current.NativeWindowHandle)) {
+                throw 'Release UI blocked behind an unresponsive editor'
+            }
+            Record-Pass 'release remains responsive while external editor is hung'
+            Wait-Condition { (Get-Content -LiteralPath $signalPath -Raw) -eq 'released' } 'editor resumes'
+        } else {
+            Wait-Condition { (Get-Content -LiteralPath $signalPath -Raw) -eq "changed-$mode" } 'selection or focus race actually occurred'
+        }
+        Start-Sleep -Milliseconds 600
+        if ($editValue.Current.Value -ne 'ghbdtn' -or $otherValue.Current.Value -ne 'untouched') {
+            throw "Stale or blocked selection injected text (mode $mode)"
+        }
+        Record-Pass "release cancels unsafe selection (mode $mode)"
+        $edit.SetFocus()
+        [HostedInput]::SelectFixtureText($editHandle, 6)
+        Tap-Shift 2
+        Assert-Value $editValue 'привет' "release conversion recovers after adversarial mode $mode"
+    }
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     if (-not $editor.WaitForExit(5000)) { throw 'Isolated editor did not close' }

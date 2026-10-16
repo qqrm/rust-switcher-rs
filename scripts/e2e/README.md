@@ -35,7 +35,9 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
 | Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |
 | Tray actions, pause and CapsLock layout switching | No hosted GUI assertion yet | Requires additional scenarios; source/unit checks are not runtime proof |
-| Focus changes, unresponsive editors and interrupted config writes | Source audit only | Adversarial runtime and fault-injection scenarios remain open |
+| Focus and selection changes | Release conversion cancels after the external fixture changes focus or selection, then recovers | Does not make programmatic OS focus changes atomic with input delivery |
+| Unresponsive editors | External Edit blocks for three seconds; release UI stays responsive, does not type later and recovers | A permanently hung UIA provider consumes the one bounded probe worker until restart |
+| Interrupted config writes | Source audit only | Fault-injection scenarios remain open |
 | Operating system and devices | Fresh Windows Server 2025 hosted VM | Windows 11 client, physical keyboard, device drivers and real user profiles remain unverified |
 
 The manifest describes assertions implemented by the harness, not a permanent
