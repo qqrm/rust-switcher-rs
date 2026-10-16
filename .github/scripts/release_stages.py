@@ -194,6 +194,27 @@ def validate_plan(directory, source):
     return plan
 
 
+def recover_pushed_branch(branch, source, version, proposed):
+    """Recover push-success/PR-create-failure without replacing any remote branch."""
+    ref = "refs/heads/" + branch
+    helper = "credential.helper=!gh auth git-credential"
+    advertised = git("-c", helper, "ls-remote", "--refs", "origin", ref)
+    if not advertised:
+        return None
+    match = re.fullmatch(r"([a-f0-9]{40})\s+" + re.escape(ref), advertised)
+    if not match:
+        raise ValueError("Unexpected version branch advertisement")
+    head = checked_sha(match[1])
+    git("-c", helper, "fetch", "--no-tags", "origin", head)
+    if git("rev-list", "--parents", "-n", "1", head).split() != [head, source]:
+        raise ValueError("Existing version branch has an unexpected parent")
+    intended = f"chore: release {version}\n\nrelease-source: {source}"
+    if git("log", "-1", "--format=%B", head) != intended:
+        raise ValueError("Existing version branch has an unexpected release identity")
+    git("diff", "--exit-code", proposed, head)
+    return head
+
+
 def version_pr(args):
     plan = validate_plan(args.directory, args.source)
     if plan["merged"]:
@@ -222,8 +243,12 @@ def version_pr(args):
         git("fetch", "origin", head)
         git("diff", "--exit-code", proposed, head)
     else:
-        # Command-scoped helper; no persisted checkout credentials.
-        git("-c", "credential.helper=!gh auth git-credential", "push", "origin", f"HEAD:refs/heads/{branch}")
+        existing = recover_pushed_branch(branch, plan["source"], plan["version"], proposed)
+        if existing:
+            proposed = existing
+        else:
+            # Command-scoped helper; no persisted checkout credentials.
+            git("-c", "credential.helper=!gh auth git-credential", "push", "origin", f"HEAD:refs/heads/{branch}")
         with tempfile.TemporaryDirectory() as temp:
             body = Path(temp) / "body.txt"
             body.write_text(f'Release {plan["version"]} for tested source {plan["source"]}. '
@@ -431,6 +456,12 @@ def publish_crates(args):
         publish_error = None
         for attempt in range(20):
             try:
+                # Reproduce individual publish input without a token before every attempt.
+                command(cargo, "+nightly", "package", "--locked", "--no-verify", "--registry", "crates-io",
+                        "--manifest-path", str(ROOT / "Cargo.toml"), "-p", package,
+                        cwd=temporary, env=cargo_environment(temporary))
+                if digest(temporary / "target/package" / filename) != expected:
+                    raise ValueError("Individual package differs from the verified release archive")
                 command(cargo, "+nightly", "publish", "--locked", "--no-verify", "--registry", "crates-io",
                         "--manifest-path", str(ROOT / "Cargo.toml"), "-p", package, cwd=temporary, env=env)
                 break

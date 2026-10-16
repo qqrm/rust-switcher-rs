@@ -132,6 +132,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: read
+      actions: read
     outputs:
       merged: ${{ steps.await.outputs.merged }}
       version: ${{ steps.writer.outputs.version }}

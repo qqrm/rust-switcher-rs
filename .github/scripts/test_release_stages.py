@@ -119,6 +119,75 @@ class VersionPlanTests(unittest.TestCase):
                     release.validate_plan(directory, SOURCE)
 
 
+    def test_branch_only_retry_reuses_remote_commit_after_pr_creation_failure(self):
+        remote, proposed = "c" * 40, "d" * 40
+        branch = "automation/release-" + SOURCE
+        seen_head = 0
+
+        def fake_git(*args):
+            nonlocal seen_head
+            if args == ("rev-parse", "HEAD"):
+                seen_head += 1
+                return SOURCE if seen_head == 1 else proposed
+            if "ls-remote" in args:
+                return remote + "\trefs/heads/" + branch
+            if args[0] == "rev-list":
+                return remote + " " + SOURCE
+            if args[0] == "log":
+                return f"chore: release {VERSION}\n\nrelease-source: {SOURCE}"
+            return ""
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            directory = root / "plan"
+            directory.mkdir()
+            for name in release.VERSION_FILES:
+                target = directory / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("version data")
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+            plan = {"source": SOURCE, "version": VERSION, "merged": ""}
+            args = argparse.Namespace(directory=str(directory), source=SOURCE)
+            with patch.object(release, "ROOT", root), \
+                    patch.object(release, "validate_plan", return_value=plan), \
+                    patch.object(release, "git", side_effect=fake_git) as git, \
+                    patch.object(release, "gh", side_effect=[
+                        [], {"number": 7, "headRefOid": remote, "state": "OPEN"}]), \
+                    patch.object(release, "command") as command, \
+                    patch.object(release, "output") as output, \
+                    patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}):
+                release.version_pr(args)
+                git.assert_any_call("diff", "--exit-code", proposed, remote)
+                self.assertFalse(any("push" in call.args for call in git.call_args_list))
+                command.assert_any_call(
+                    "gh", "pr", "merge", "7", "--repo", "owner/repo", "--auto", "--squash",
+                    "--match-head-commit", remote, "--subject", f"chore: release {VERSION}",
+                    "--body", f"release-source: {SOURCE}")
+                output.assert_called_once_with(merged="", pr=7, head=remote, version=VERSION)
+
+    def test_branch_only_retry_refuses_unexpected_parent_message_or_tree(self):
+        remote, proposed = "c" * 40, "d" * 40
+        branch = "automation/release-" + SOURCE
+        for invalid in ("parent", "message", "tree"):
+            with self.subTest(invalid=invalid):
+                def fake_git(*args):
+                    if "ls-remote" in args:
+                        return remote + "\trefs/heads/" + branch
+                    if args[0] == "rev-list":
+                        return remote + " " + (proposed if invalid == "parent" else SOURCE)
+                    if args[0] == "log":
+                        return "other release" if invalid == "message" else (
+                            f"chore: release {VERSION}\n\nrelease-source: {SOURCE}")
+                    if args[0] == "diff" and invalid == "tree":
+                        raise RuntimeError("different tree")
+                    return ""
+
+                with patch.object(release, "git", side_effect=fake_git) as git:
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        release.recover_pushed_branch(branch, SOURCE, VERSION, proposed)
+                    self.assertFalse(any("push" in call.args for call in git.call_args_list))
+
+
 class PublicationBoundaryTests(unittest.TestCase):
     def test_manifest_and_files_must_match_the_checked_commit(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -180,7 +249,7 @@ class PublicationBoundaryTests(unittest.TestCase):
                     release.publish_crates(args)
                 command.assert_not_called()
 
-    def test_publish_has_no_compilation_and_reconciles_upload_response_loss(self):
+    def test_each_upload_regenerates_without_token_then_reconciles_response_loss(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             sha, manifest = write_bundle(directory)
@@ -193,19 +262,97 @@ class PublicationBoundaryTests(unittest.TestCase):
                 expected += [None, manifest["files"][filename]["sha256"]]
             args = argparse.Namespace(directory=str(directory), source=SOURCE, commit=COMMIT,
                                       version=VERSION, manifest_sha=sha, sterile=str(sterile))
+
+            def fake_command(*args, **_kwargs):
+                if "publish" in args:
+                    raise RuntimeError("response lost")
+                return ""
+
             with patch.object(release, "validate_bundle", return_value=manifest), \
                     patch.object(release, "git", return_value=COMMIT), \
                     patch.object(release, "index_checksum", side_effect=expected), \
-                    patch.object(release, "command", side_effect=RuntimeError("response lost")) as command, \
+                    patch.object(release, "command", side_effect=fake_command) as command, \
                     patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "test-only", "GH_TOKEN": "must-not-leak"}), \
                     patch.object(release.shutil, "which", return_value="cargo"):
                 release.publish_crates(args)
-                self.assertEqual(command.call_count, 2)
+                self.assertEqual(command.call_count, 4)
+                self.assertEqual([call.args[2] for call in command.call_args_list],
+                                 ["package", "publish", "package", "publish"])
                 for call in command.call_args_list:
                     self.assertIn("--no-verify", call.args)
                     self.assertIn("--locked", call.args)
                     self.assertEqual(call.kwargs["cwd"], sterile)
                     self.assertNotIn("GH_TOKEN", call.kwargs["env"])
+                    if call.args[2] == "package":
+                        self.assertNotIn("CARGO_REGISTRY_TOKEN", call.kwargs["env"])
+                    else:
+                        self.assertEqual(call.kwargs["env"]["CARGO_REGISTRY_TOKEN"], "test-only")
+
+    def test_individual_package_divergence_stops_before_any_upload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            sha, manifest = write_bundle(directory)
+            sterile = directory / "sterile"
+            (sterile / "target/package").mkdir(parents=True)
+            for package in release.PACKAGES:
+                filename = f"{package}-{VERSION}.crate"
+                (sterile / "target/package" / filename).write_bytes((directory / filename).read_bytes())
+            args = argparse.Namespace(directory=str(directory), source=SOURCE, commit=COMMIT,
+                                      version=VERSION, manifest_sha=sha, sterile=str(sterile))
+
+            def repackage(*command, **kwargs):
+                self.assertEqual(command[2], "package")
+                self.assertNotIn("CARGO_REGISTRY_TOKEN", kwargs["env"])
+                self.assertEqual(command[3:7], ("--locked", "--no-verify", "--registry", "crates-io"))
+                (sterile / "target/package" / f"rust-switcher-core-{VERSION}.crate").write_bytes(b"different")
+
+            with patch.object(release, "validate_bundle", return_value=manifest), \
+                    patch.object(release, "git", return_value=COMMIT), \
+                    patch.object(release, "index_checksum", return_value=None), \
+                    patch.object(release, "command", side_effect=repackage) as command, \
+                    patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "test-only"}), \
+                    patch.object(release.shutil, "which", return_value="cargo"):
+                with self.assertRaisesRegex(ValueError, "Individual package differs"):
+                    release.publish_crates(args)
+                self.assertEqual(command.call_count, 1)
+
+
+    def test_dependency_retry_repackages_without_token_before_each_upload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            sha, manifest = write_bundle(directory)
+            sterile = directory / "sterile"
+            (sterile / "target/package").mkdir(parents=True)
+            checksums = []
+            for package in release.PACKAGES:
+                filename = f"{package}-{VERSION}.crate"
+                (sterile / "target/package" / filename).write_bytes((directory / filename).read_bytes())
+                checksums.append(manifest["files"][filename]["sha256"])
+            args = argparse.Namespace(directory=str(directory), source=SOURCE, commit=COMMIT,
+                                      version=VERSION, manifest_sha=sha, sterile=str(sterile))
+            uploads = 0
+
+            def fake_command(*command, **kwargs):
+                nonlocal uploads
+                if command[2] == "package":
+                    self.assertNotIn("CARGO_REGISTRY_TOKEN", kwargs["env"])
+                else:
+                    uploads += 1
+                    if uploads == 1:
+                        raise RuntimeError("no matching package named rust-switcher-core")
+                return ""
+
+            with patch.object(release, "validate_bundle", return_value=manifest), \
+                    patch.object(release, "git", return_value=COMMIT), \
+                    patch.object(release, "index_checksum", side_effect=[checksums[0], None, None, checksums[1]]), \
+                    patch.object(release, "command", side_effect=fake_command) as command, \
+                    patch.object(release.time, "sleep") as sleep, \
+                    patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "test-only"}), \
+                    patch.object(release.shutil, "which", return_value="cargo"):
+                release.publish_crates(args)
+                self.assertEqual([call.args[2] for call in command.call_args_list],
+                                 ["package", "publish", "package", "publish"])
+                sleep.assert_called_once_with(15)
 
 
 class WorkflowPolicyTests(unittest.TestCase):
@@ -218,6 +365,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("id-token:", build)
         self.assertNotIn("contents: write", build)
         self.assertNotIn("GH_TOKEN:", build)
+        self.assertIn("actions: read", writer)
         self.assertNotIn("cargo ", writer)
         self.assertNotIn("rust-toolchain@", writer)
         self.assertEqual(workflow.count("secrets.RELEASE_TOKEN"), 1)

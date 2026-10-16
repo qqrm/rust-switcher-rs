@@ -30,7 +30,7 @@ follow the workflow and its version PR.
    dependency compilation or build scripts run with it.
 
 The publisher's ordinary GitHub token creates the tag/release and uploads assets.
-Trusted publishing is preferred for crates.io; the existing release-environment
+Trusted publishing is preferred for crates.io; the existing
 `CARGO_REGISTRY_TOKEN` remains the fallback. No new approval requirement is added.
 Actions are pinned to commits. Publication artifacts expire after one day.
 
@@ -39,7 +39,9 @@ Actions are pinned to commits. Publication artifacts expire after one day.
 The version PR is a normal protected PR, never a direct push or an admin bypass.
 The release workflow waits for `ci-gate` and `workflow-security-gate` on its exact
 head before using its merge SHA. Its squash body records `release-source: SHA`.
-Retries reuse the same version PR or matching source tag. Multiple mappings,
+Retries reuse the same version PR or matching source tag. If branch push succeeded
+before PR creation failed, its parent, release identity and tree must match before
+the branch is reused; retries never force-replace it. Multiple mappings,
 a closed version PR, altered artifact data, or conflicting tags fail closed.
 
 A release tag never moves. Same-tag asset upload retains the existing
@@ -47,6 +49,10 @@ A release tag never moves. Same-tag asset upload retains the existing
 is checked between packages. An already published version counts as success
 only when the registry checksum matches the verified archive. An ambiguous upload
 is reconciled against that checksum, not accepted from an error-message string.
+Before every upload attempt, individual package regeneration runs without a token
+and must match the verified archive, including after core becomes available in
+the registry. Cargo regenerates again during upload; source, toolchain and lockfile
+are fixed, and the resulting registry checksum is reconciled afterward.
 
 Rerun the **original** Release workflow to retry its original source. A new
 dispatch on the version commit is a new source and may request another patch
