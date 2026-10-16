@@ -266,20 +266,6 @@ fn pattern_failure(code: windows::core::HRESULT) -> SelectionProbe {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL};
-
-    #[test]
-    fn provider_errors_do_not_authorize_last_word_fallback() {
-        for error in [E_ACCESSDENIED, E_FAIL] {
-            assert!(matches!(pattern_failure(error), SelectionProbe::Blocked));
-        }
-        assert!(matches!(pattern_failure(E_NOINTERFACE), SelectionProbe::Absent));
-    }
-}
-
 fn read_automation_text(range: &IUIAutomationTextRange, max_chars: usize) -> windows::core::Result<String> {
     // UIA counts UTF-16 units; two units per scalar plus a sentinel prevents
     // accepting a truncated supplementary-character selection as complete.
@@ -346,4 +332,18 @@ unsafe fn bounded_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         MESSAGE_TIMEOUT_MS, Some(&raw mut result),
     ) };
     (status.0 != 0).then_some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL};
+
+    #[test]
+    fn provider_errors_do_not_authorize_last_word_fallback() {
+        for error in [E_ACCESSDENIED, E_FAIL] {
+            assert!(matches!(pattern_failure(error), SelectionProbe::Blocked));
+        }
+        assert!(matches!(pattern_failure(E_NOINTERFACE), SelectionProbe::Absent));
+    }
 }

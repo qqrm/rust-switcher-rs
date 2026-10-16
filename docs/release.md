@@ -1,108 +1,76 @@
-# Release process (official)
+# Release process
 
-This repository uses a one-command, production-ready release flow driven by `just` + PowerShell scripts.
-The primary branch is `dev`.
+The primary branch is `dev`. From a clean, synchronized checkout, `just release`
+dispatches the Release workflow for that exact GitHub commit. `just release 1.2.3`
+requests an explicit numeric version. Dispatch does not mean publication succeeded;
+follow the workflow and its version PR.
 
-## One-command release
+## Trust boundaries
 
-Patch bump (recommended default):
+1. **Prepare (read-only):** determine the version and generate a data-only plan.
+   Only the two workspace versions, their internal dependency, and corresponding
+   lock entries may change. No dependency resolution or repository hooks run.
+2. **Version PR:** a fresh runner checks the plan against the exact source before
+   a step-scoped `RELEASE_TOKEN` creates/reuses its version PR. Native auto-merge
+   and both required gates must succeed for the exact PR head. The writer runs no
+   Cargo build, test, package, or dependency code and stores no Git credentials.
+3. **Build (read-only):** a fresh Windows runner checks out the resulting merge,
+   runs formatting, Clippy, tests, a release build, and verified workspace
+   packaging. It receives no release environment, registry token, or OIDC
+   permission. An immutable artifact ID and SHA-256 manifest bind the executable,
+   ZIP, optional PDB, and both crate archives to source/merge/version/toolchain.
+4. **Publish:** another fresh Windows runner downloads only that run's artifact
+   by ID and validates all identities and hashes. Before authentication it
+   repackages with `cargo package --no-verify` from an empty directory and fresh
+   `CARGO_HOME`, requiring byte-for-byte equality with the verified archives.
+   Project Cargo config, credential providers, environment wrappers, build
+   outputs, and caches are excluded. GitHub credentials are available only to
+   the asset/tag step. The registry token is available only to
+   `cargo publish --locked --no-verify` in the same sterile environment; no
+   dependency compilation or build scripts run with it.
 
-```powershell
-just release
-```
+The publisher's ordinary GitHub token creates the tag/release and uploads assets.
+Trusted publishing is preferred for crates.io; the existing release-environment
+`CARGO_REGISTRY_TOKEN` remains the fallback. No new approval requirement is added.
+Actions are pinned to commits. Publication artifacts expire after one day.
 
-Exact version:
+## Checks and retries
 
-```powershell
-just release 1.2.3
-```
+The version PR is a normal protected PR, never a direct push or an admin bypass.
+The release workflow waits for `ci-gate` and `workflow-security-gate` on its exact
+head before using its merge SHA. Its squash body records `release-source: SHA`.
+Retries reuse the same version PR or matching source tag. Multiple mappings,
+a closed version PR, altered artifact data, or conflicting tags fail closed.
 
-## What `just release` does
+A release tag never moves. Same-tag asset upload retains the existing
+`--clobber` retry behavior. Crates publish core first, then app; index propagation
+is checked between packages. An already published version counts as success
+only when the registry checksum matches the verified archive. An ambiguous upload
+is reconciled against that checksum, not accepted from an error-message string.
 
-1. Safety checks
+Rerun the **original** Release workflow to retry its original source. A new
+dispatch on the version commit is a new source and may request another patch
+version. A nightly toolchain change between build and publication causes a safe
+failure; rerun from the build stage with one toolchain rather than bypassing the
+version check.
 
-   * Refuses to run unless the current branch is `dev`.
-   * Refuses to run if the worktree is dirty.
-   * Fetches tags from `origin` to enforce tag immutability.
+## Local commands and validation
 
-2. Quality gates
+`just bump [version]` remains a local version preparation command. It does not
+publish. Direct `just github-release` and `just crates-release` commands fail
+closed: compilation and publication must use the isolated workflow.
 
-   * `cargo fmt --all -- --check`
-   * `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-   * `cargo test --workspace --all-features --all-targets --locked`
+CI tests configuration write failures, release identity/retry rules, and secret
+boundaries. Windows CI also verifies real workspace packaging and tokenless
+publisher preflight; it never dispatches Release or publishes anything. A stale
+lockfile causes a failing diagnostic that prints the candidate workspace-only
+lock delta. Review and commit that delta; CI never silently accepts it.
 
-3. Version bump (single commit)
-
-   * Updates versions consistently across workspace crates:
-
-     * `rust-switcher`
-     * `rust-switcher-core`
-   * Updates the dependency version in the root `Cargo.toml`.
-   * Regenerates `Cargo.lock`.
-   * Creates a single commit: `chore: bump version to X.Y.Z`.
-
-4. Push
-
-   * Normal push only: `git push origin dev`.
-
-5. Immutable tag
-
-   * Creates `vX.Y.Z` at `HEAD`.
-   * If the tag already exists:
-
-     * If it points to `HEAD`: continues.
-     * If it points elsewhere: fails (the tag is never moved).
-   * Pushes the tag: `git push origin vX.Y.Z`.
-
-6. GitHub Release + Windows artifacts
-
-   * Builds: `cargo build --release`.
-   * Uploads:
-
-     * `target/release/rust-switcher.exe` (required)
-     * `target/release/rust-switcher.pdb` (optional, if present)
-   * Creates or edits the GitHub Release for `vX.Y.Z` and uploads assets with `--clobber`.
-
-     * Note: `--clobber` replaces assets **for the same tag only**; the tag itself is never moved.
-
-7. crates.io publish (idempotent)
-
-   * Publishes in dependency order:
-
-     1. `cargo publish -p rust-switcher-core --locked`
-     2. `cargo publish -p rust-switcher --locked`
-   * If a version is already published, it is treated as success.
-
-## Safety rules
-
-* No branch history rewrites (no hard resets to remote refs, no force-push). Only normal pushes of commits and tags.
-* `dev` is the primary branch; release scripts must not assume any other primary branch.
-* Tags are immutable:
-
-  * If `vX.Y.Z` exists and is not `HEAD`, the release flow fails.
-* The release flow is designed to be safe to re-run:
-
-  * Existing tags/releases are reused if they match `HEAD`.
-  * crates.io publish treats "already published" as success.
-
-## Supporting commands
-
-* Version bump only:
-
-```powershell
-just bump
-just bump 1.2.3
-```
-
-* GitHub Release upload only (requires existing `vX.Y.Z` tag at `HEAD`):
-
-```powershell
-just github-release
-just github-release 1.2.3
-```
-
-* crates.io publish only:
-
-```powershell
-just crates-release
-```
+Settings keep the historical `%APPDATA%/RustSwitcher/config.json` path and TOML
+format. Saves validate and serialize before writing a same-directory temporary
+file, sync its contents, then atomically replace the destination. Missing defaults
+are created without overwriting a racing writer. Invalid existing files are
+reported unchanged. This prevents truncation on interrupted/failed writes; it is
+not a guarantee against power loss, failing storage, or concurrent last-writer
+updates. A replacement inherits directory permissions rather than preserving a
+custom per-file ACL.

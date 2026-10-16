@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    branches:
-      - dev
+    branches: [dev]
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -16,27 +15,26 @@ on:
         type: string
 
 permissions:
-  contents: write
-  id-token: write
-  pull-requests: read
+  contents: read
 
 concurrency:
   group: release-dev
   cancel-in-progress: false
 
 jobs:
-  release:
+  prepare:
     if: github.ref == 'refs/heads/dev'
-    runs-on: windows-latest
-    timeout-minutes: 90
-    environment: release
-    env:
-      CARGO_TERM_PROGRESS_WHEN: never
-      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_release: ${{ steps.release_context.outputs.should_release }}
+      version: ${{ steps.prepare.outputs.version }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Verify publication commit
-        shell: bash
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           ACTUAL_SHA: ${{ github.sha }}
@@ -46,13 +44,12 @@ jobs:
             [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
             test "$ACTUAL_SHA" = "$EXPECTED_SHA"
           fi
-      - name: Checkout dev
+      - name: Checkout exact source without stored credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
-
       - name: Detect release-worthy dependency merge
         id: release_context
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -108,80 +105,167 @@ jobs:
             core.setOutput('should_release', 'true');
             core.setOutput('reason', `dependabot-pr-${prNumber}`);
 
-      - name: Stop when this push is not a cargo Dependabot merge
-        if: steps.release_context.outputs.should_release != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Skipping release: ${{ steps.release_context.outputs.reason }}"
-
-      - name: Configure authenticated origin
+      - name: Prepare only validated version data
         if: steps.release_context.outputs.should_release == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${GH_TOKEN}" ]]; then
-            echo "RELEASE_TOKEN must be configured in the release environment to create the checked version PR."
-            exit 1
-          fi
-          git config --local credential.helper '!gh auth git-credential'
-
-      - name: Reattach local dev branch
+        id: prepare
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python3 .github/scripts/release_stages.py prepare --source "$SOURCE_SHA" --version "$RELEASE_VERSION" --directory "$RUNNER_TEMP/version-plan"
+      - name: Transfer version plan to the isolated writer
         if: steps.release_context.outputs.should_release == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git checkout -B dev "$GITHUB_SHA"
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: version-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/version-plan
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Configure git author
-        if: steps.release_context.outputs.should_release == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+  version-pr:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      merged: ${{ steps.await.outputs.merged }}
+      version: ${{ steps.writer.outputs.version }}
+    steps:
+      - name: Checkout exact source without stored credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Download this run's version plan by immutable artifact ID
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: ${{ runner.temp }}/version-plan
+          merge-multiple: true
+      - name: Create or reuse the protected version PR
+        id: writer
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/release_stages.py version-pr --source "$SOURCE_SHA" --directory "$RUNNER_TEMP/version-plan"
+      - name: Wait for native checks and the exact PR head to merge
+        id: await
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_PR: ${{ steps.writer.outputs.pr }}
+          VERSION_HEAD: ${{ steps.writer.outputs.head }}
+          EXISTING_MERGE: ${{ steps.writer.outputs.merged }}
+        run: python3 .github/scripts/release_stages.py await-version --pr "$VERSION_PR" --head "$VERSION_HEAD" --commit "$EXISTING_MERGE"
 
-      - name: Install Rust toolchain (nightly)
-        if: steps.release_context.outputs.should_release == 'true'
+  build:
+    needs: version-pr
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      manifest_sha: ${{ steps.bundle.outputs.manifest_sha }}
+    steps:
+      - name: Checkout checked version merge without stored credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.version-pr.outputs.merged }}
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly
           components: rustfmt, clippy
+      - name: Verify and package without publication credentials
+        shell: pwsh
+        run: |
+          cargo +nightly fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Formatting failed' }
+          cargo +nightly clippy --workspace --all-targets --all-features --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
+          cargo +nightly test --workspace --all-features --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+          cargo +nightly build --release --locked --bin rust-switcher
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          cargo +nightly package --workspace --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+      - name: Bind publication files to the checked source
+        id: bundle
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          MERGED_SHA: ${{ needs.version-pr.outputs.merged }}
+          RELEASE_VERSION: ${{ needs.version-pr.outputs.version }}
+        run: |
+          python .github/scripts/release_stages.py bundle --source "$env:SOURCE_SHA" --commit "$env:MERGED_SHA" --version "$env:RELEASE_VERSION" --directory "$env:RUNNER_TEMP/publication"
+          if ($LASTEXITCODE -ne 0) { throw 'Publication manifest failed' }
+      - name: Transfer verified publication files
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publication
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Rust cache
-        if: steps.release_context.outputs.should_release == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
+  publish:
+    needs: [version-pr, build]
+    runs-on: windows-2025
+    timeout-minutes: 25
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      MERGED_SHA: ${{ needs.version-pr.outputs.merged }}
+      RELEASE_VERSION: ${{ needs.version-pr.outputs.version }}
+      MANIFEST_SHA: ${{ needs.build.outputs.manifest_sha }}
+    steps:
+      - name: Checkout checked version merge without stored credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.version-pr.outputs.merged }}
+      - name: Install matching Cargo without reusing build caches
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: nightly
+      - name: Download this run's verified files by immutable artifact ID
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: ${{ runner.temp }}/publication
+          merge-multiple: true
+      - name: Check package identity in a sterile Cargo environment before authentication
+        shell: pwsh
+        run: |
+          python .github/scripts/release_stages.py preflight --source "$env:SOURCE_SHA" --commit "$env:MERGED_SHA" --version "$env:RELEASE_VERSION" --directory "$env:RUNNER_TEMP/publication" --manifest-sha "$env:MANIFEST_SHA" --sterile "$env:RUNNER_TEMP/publication-cargo"
+          if ($LASTEXITCODE -ne 0) { throw 'Publication preflight failed' }
+      - name: Publish immutable tag and verified GitHub assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/release_stages.py publish-github --source "$env:SOURCE_SHA" --commit "$env:MERGED_SHA" --version "$env:RELEASE_VERSION" --directory "$env:RUNNER_TEMP/publication" --manifest-sha "$env:MANIFEST_SHA"
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub publication failed' }
       - name: Authenticate to crates.io with trusted publishing
-        if: steps.release_context.outputs.should_release == 'true'
         id: crates_auth
         continue-on-error: true
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Verify crates.io token source
-        if: steps.release_context.outputs.should_release == 'true'
+      - name: Publish checked crates without compilation
         shell: pwsh
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          if (-not $env:CARGO_REGISTRY_TOKEN) {
-            throw 'No crates.io token source is available. Configure trusted publishing for this crate or add the CARGO_REGISTRY_TOKEN secret to the release environment.'
-          }
-
-      - name: Run release automation
-        if: steps.release_context.outputs.should_release == 'true'
-        shell: pwsh
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-          RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $version = ($env:RELEASE_VERSION ?? '').Trim()
-          if ($version) {
-            & pwsh -ExecutionPolicy Bypass -NoLogo -NoProfile -File .\scripts\release\release.ps1 $version
-          } else {
-            & pwsh -ExecutionPolicy Bypass -NoLogo -NoProfile -File .\scripts\release\release.ps1
-          }
+          python .github/scripts/release_stages.py publish-crates --source "$env:SOURCE_SHA" --commit "$env:MERGED_SHA" --version "$env:RELEASE_VERSION" --directory "$env:RUNNER_TEMP/publication" --manifest-sha "$env:MANIFEST_SHA" --sterile "$env:RUNNER_TEMP/publication-cargo"
+          if ($LASTEXITCODE -ne 0) { throw 'Crates publication failed' }
