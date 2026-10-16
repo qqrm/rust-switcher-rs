@@ -1,245 +1,303 @@
+use std::{sync::OnceLock, time::Duration};
+
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, RPC_E_CHANGED_MODE, WPARAM},
-        System::Com::{
-            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-            CoUninitialize,
+        Foundation::{HWND, LPARAM, WPARAM},
+        System::{
+            Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize},
+            Threading::GetCurrentProcessId,
         },
         UI::{
             Accessibility::{
-                CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPatternId,
+                CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
+                IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+                UIA_TextPatternId,
             },
             Controls::EM_GETSEL,
             WindowsAndMessaging::{
                 GUITHREADINFO, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
-                GetWindowThreadProcessId, SendMessageW, WM_GETTEXT, WM_GETTEXTLENGTH,
+                GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW,
+                WM_GETTEXT, WM_GETTEXTLENGTH,
             },
         },
     },
-    core::PWSTR,
 };
+use crate::utils::bounded_worker::BoundedWorker;
+
+const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+const MESSAGE_TIMEOUT_MS: u32 = 50;
+const MAX_WINDOW_TEXT_UNITS: usize = 1_048_576;
+
+/// Plain handle values may cross the worker boundary; COM objects never do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FocusTarget {
+    foreground: usize,
+    focus: usize,
+    thread: u32,
+    process: u32,
+}
+
+impl FocusTarget {
+    pub(super) fn capture() -> Option<Self> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.0.is_null() { return None; }
+        let thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+        if thread == 0 { return None; }
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetGUIThreadInfo(thread, &mut info) }.is_err() || info.hwndFocus.0.is_null() {
+            return None;
+        }
+        let mut process = 0;
+        let focus_thread = unsafe { GetWindowThreadProcessId(info.hwndFocus, Some(&mut process)) };
+        if process == 0 || focus_thread == 0 { return None; }
+        Some(Self {
+            foreground: foreground.0 as usize, focus: info.hwndFocus.0 as usize,
+            thread: focus_thread, process,
+        })
+    }
+
+    pub(super) fn is_current(self) -> bool { Self::capture() == Some(self) }
+
+    pub(super) fn foreground_hwnd(self) -> HWND { HWND(self.foreground as *mut _) }
+
+    fn focus_hwnd(self) -> HWND { HWND(self.focus as *mut _) }
+
+    fn is_own_native_edit(self) -> bool {
+        self.process == unsafe { GetCurrentProcessId() } && is_native_edit(self.focus_hwnd())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SelectionIdentity {
+    Native { start: u32, end: u32 },
+    Automation(u64),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CapturedSelection {
+    pub(super) text: String,
+    pub(super) target: FocusTarget,
+    identity: SelectionIdentity,
+    max_chars: usize,
+}
+
+impl CapturedSelection {
+    /// Validate both target identity and the exact selection after the conversion delay.
+    pub(super) fn is_current(&self) -> bool {
+        if !self.target.is_current() { return false; }
+        if self.target.is_own_native_edit() {
+            return same_native_selection(self);
+        }
+        matches!(request(Command::Validate(self.clone())), Some(Response::Valid(true)))
+            && self.target.is_current()
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum SelectionProbe {
-    NoSelection,
-    SelectionText(String),
-    SelectionPresentButIneligible,
-    SelectionPresentButUnreadable(windows::core::Error),
-    Unsupported,
+    Absent,
+    Selected(CapturedSelection),
+    Blocked,
 }
 
-/// Attempts to read the current selection from the focused control via UI Automation.
-///
-/// This probe never sends synthetic input.
-pub(super) fn probe_selection_uia(max_chars: usize) -> SelectionProbe {
-    struct CoUninitGuard(bool);
+enum Command {
+    Capture(FocusTarget, usize),
+    Validate(CapturedSelection),
+}
 
-    impl Drop for CoUninitGuard {
-        fn drop(&mut self) {
-            if self.0 {
-                unsafe { CoUninitialize() };
+enum Response {
+    Probe(SelectionProbe),
+    Valid(bool),
+}
+
+struct AutomationSnapshot {
+    generation: u64,
+    element: IUIAutomationElement,
+    range: IUIAutomationTextRange,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    generation: u64,
+    automation: Option<IUIAutomation>,
+    snapshot: Option<AutomationSnapshot>,
+}
+
+struct ComGuard(bool);
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 { unsafe { CoUninitialize() }; }
+    }
+}
+
+fn request(command: Command) -> Option<Response> {
+    static WORKER: OnceLock<Option<BoundedWorker<Command, Response>>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        BoundedWorker::start("selection-probe", || {
+            let guard = ComGuard(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok());
+            let mut state = ProbeState::default();
+            move |command| {
+                // Keep apartment lifetime and all provider interfaces on this one MTA thread.
+                let _apartment = &guard;
+                match command {
+                    Command::Capture(target, max_chars) => {
+                        Response::Probe(state.capture(target, max_chars))
+                    }
+                    Command::Validate(selection) => Response::Valid(state.validate(&selection)),
+                }
             }
+        }).ok()
+    }).as_ref()?.request(command, PROBE_TIMEOUT)
+}
+
+pub(super) fn probe_selection(max_chars: usize) -> SelectionProbe {
+    let Some(target) = FocusTarget::capture() else { return SelectionProbe::Blocked; };
+    // Our known standard Edit is on this UI thread. Calling it directly avoids
+    // waiting for a worker which would in turn wait for this same message loop.
+    if target.is_own_native_edit() {
+        return probe_native(target, max_chars);
+    }
+    match request(Command::Capture(target, max_chars)) {
+        Some(Response::Probe(result)) if target.is_current() => result,
+        _ => SelectionProbe::Blocked,
+    }
+}
+
+impl ProbeState {
+    fn capture(&mut self, target: FocusTarget, max_chars: usize) -> SelectionProbe {
+        self.snapshot = None;
+        if !target.is_current() { return SelectionProbe::Blocked; }
+        if is_native_edit(target.focus_hwnd()) {
+            return probe_native(target, max_chars);
         }
+        self.capture_automation(target, max_chars).unwrap_or(SelectionProbe::Blocked)
     }
 
-    let should_uninit = match unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok() {
-        Ok(()) => true,
-        Err(e) if e.code() == RPC_E_CHANGED_MODE => {
-            // COM already initialized on this thread in a different model; do not uninit.
-            tracing::trace!("UIA probe: COM already initialized with different threading model");
-            false
+    fn capture_automation(&mut self, target: FocusTarget, max_chars: usize) -> windows::core::Result<SelectionProbe> {
+        if self.automation.is_none() {
+            self.automation = Some(unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }?);
         }
-        Err(e) => {
-            tracing::trace!(error = ?e, "UIA probe COM initialization failed");
-            return SelectionProbe::Unsupported;
-        }
-    };
-    let _com_guard = CoUninitGuard(should_uninit);
-
-    let automation: IUIAutomation =
-        match unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) } {
-            Ok(v) => v,
-            Err(err) => {
-                tracing::trace!(error = ?err, "UIA probe automation creation failed");
-                return SelectionProbe::Unsupported;
-            }
+        let Some(automation) = self.automation.as_ref() else { return Ok(SelectionProbe::Blocked); };
+        let element = unsafe { automation.GetFocusedElement() }?;
+        let pattern: IUIAutomationTextPattern = match unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) } {
+            Ok(pattern) => pattern,
+            Err(_) => return Ok(SelectionProbe::Absent),
         };
-
-    let focused = match unsafe { automation.GetFocusedElement() } {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::trace!(error = ?err, "UIA probe focused element unavailable");
-            return SelectionProbe::Unsupported;
+        let ranges = unsafe { pattern.GetSelection() }?;
+        let count = unsafe { ranges.Length() }?;
+        if count == 0 { return Ok(SelectionProbe::Absent); }
+        if count != 1 { return Ok(SelectionProbe::Blocked); }
+        let range = unsafe { ranges.GetElement(0) }?;
+        let text = read_automation_text(&range, max_chars)?;
+        if text.is_empty() { return Ok(SelectionProbe::Absent); }
+        if !super::convert::is_convertible_selection(&text, max_chars) || !target.is_current() {
+            return Ok(SelectionProbe::Blocked);
         }
-    };
+        self.generation = self.generation.wrapping_add(1);
+        self.snapshot = Some(AutomationSnapshot { generation: self.generation, element, range });
+        Ok(SelectionProbe::Selected(CapturedSelection {
+            text, target, identity: SelectionIdentity::Automation(self.generation), max_chars,
+        }))
+    }
 
-    let pattern: IUIAutomationTextPattern =
-        match unsafe { focused.GetCurrentPatternAs(UIA_TextPatternId) } {
-            Ok(v) => v,
-            Err(err) => {
-                tracing::trace!(error = ?err, "UIA text pattern is unsupported");
-                return SelectionProbe::Unsupported;
-            }
+    fn validate(&self, selection: &CapturedSelection) -> bool {
+        if !selection.target.is_current() { return false; }
+        if matches!(selection.identity, SelectionIdentity::Native { .. }) {
+            return same_native_selection(selection);
+        }
+        self.validate_automation(selection).unwrap_or(false) && selection.target.is_current()
+    }
+
+    fn validate_automation(&self, selection: &CapturedSelection) -> windows::core::Result<bool> {
+        let (Some(automation), Some(snapshot)) = (&self.automation, &self.snapshot) else {
+            return Ok(false);
         };
-
-    let selection = match unsafe { pattern.GetSelection() } {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::trace!(error = ?err, "UIA GetSelection failed");
-            return SelectionProbe::Unsupported;
+        if selection.identity != SelectionIdentity::Automation(snapshot.generation) { return Ok(false); }
+        let element = unsafe { automation.GetFocusedElement() }?;
+        if !unsafe { automation.CompareElements(&snapshot.element, &element) }?.as_bool() {
+            return Ok(false);
         }
-    };
-
-    let len = match unsafe { selection.Length() } {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::trace!(error = ?err, "UIA selection length query failed");
-            return SelectionProbe::Unsupported;
-        }
-    };
-
-    if len == 0 {
-        return SelectionProbe::NoSelection;
+        let pattern: IUIAutomationTextPattern = unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) }?;
+        let ranges = unsafe { pattern.GetSelection() }?;
+        if unsafe { ranges.Length() }? != 1 { return Ok(false); }
+        let range = unsafe { ranges.GetElement(0) }?;
+        let same_start = unsafe { snapshot.range.CompareEndpoints(
+            TextPatternRangeEndpoint_Start, &range, TextPatternRangeEndpoint_Start,
+        ) }? == 0;
+        let same_end = unsafe { snapshot.range.CompareEndpoints(
+            TextPatternRangeEndpoint_End, &range, TextPatternRangeEndpoint_End,
+        ) }? == 0;
+        Ok(same_start && same_end && read_automation_text(&range, selection.max_chars)? == selection.text)
     }
-
-    let range = match unsafe { selection.GetElement(0) } {
-        Ok(v) => v,
-        Err(err) => return SelectionProbe::SelectionPresentButUnreadable(err),
-    };
-
-    let text_bstr = match unsafe { range.GetText((max_chars + 1) as i32) } {
-        Ok(v) => v,
-        Err(err) => return SelectionProbe::SelectionPresentButUnreadable(err),
-    };
-
-    let text = text_bstr.to_string();
-    if text.is_empty() {
-        return SelectionProbe::NoSelection;
-    }
-
-    if !super::convert::is_convertible_selection(&text, max_chars) {
-        return SelectionProbe::SelectionPresentButIneligible;
-    }
-
-    SelectionProbe::SelectionText(text)
 }
 
-/// Attempts to read the current selection from the focused Win32 Edit/RichEdit control.
-///
-/// This probe never sends synthetic input.
-pub(super) fn probe_selection_win32(max_chars: usize) -> SelectionProbe {
-    let Some(focus) = focused_hwnd() else {
-        return SelectionProbe::Unsupported;
-    };
-
-    if !is_supported_edit_control(focus) {
-        return SelectionProbe::Unsupported;
-    }
-
-    let mut start: u32 = 0;
-    let mut end: u32 = 0;
-    unsafe {
-        let _ = send_message_w(
-            focus,
-            EM_GETSEL,
-            WPARAM((&mut start as *mut u32) as usize),
-            LPARAM((&mut end as *mut u32) as isize),
-        );
-    }
-
-    if start == end {
-        return SelectionProbe::NoSelection;
-    }
-
-    // Defensive bound: some controls may report indices that do not reflect actual text.
-    if (end - start) as usize > max_chars.saturating_mul(2) {
-        return SelectionProbe::NoSelection;
-    }
-
-    let text = match read_window_text(focus) {
-        Some(v) => v,
-        None => {
-            return SelectionProbe::SelectionPresentButUnreadable(
-                windows::core::Error::from_thread(),
-            );
-        }
-    };
-
-    let start_idx = start as usize;
-    let end_idx = end as usize;
-    if end_idx > text.len() || start_idx > end_idx {
-        return SelectionProbe::SelectionPresentButUnreadable(windows::core::Error::from_thread());
-    }
-
-    let selection = String::from_utf16_lossy(&text[start_idx..end_idx]);
-    if !super::convert::is_convertible_selection(&selection, max_chars) {
-        return SelectionProbe::SelectionPresentButIneligible;
-    }
-
-    SelectionProbe::SelectionText(selection)
+fn read_automation_text(range: &IUIAutomationTextRange, max_chars: usize) -> windows::core::Result<String> {
+    // UIA counts UTF-16 units; two units per scalar plus a sentinel prevents
+    // accepting a truncated supplementary-character selection as complete.
+    let limit = max_chars.saturating_mul(2).saturating_add(1);
+    let limit = i32::try_from(limit).unwrap_or(i32::MAX);
+    Ok(unsafe { range.GetText(limit) }?.to_string())
 }
 
-fn focused_hwnd() -> Option<HWND> {
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        return None;
+fn same_native_selection(selection: &CapturedSelection) -> bool {
+    match probe_native(selection.target, selection.max_chars) {
+        SelectionProbe::Selected(current) => current.identity == selection.identity
+            && current.text == selection.text && selection.target.is_current(),
+        _ => false,
     }
-
-    let tid = unsafe { GetWindowThreadProcessId(fg, None) };
-    if tid == 0 {
-        return None;
-    }
-
-    let mut info = GUITHREADINFO {
-        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-        ..Default::default()
-    };
-
-    let ok = unsafe { GetGUIThreadInfo(tid, &mut info) }.is_ok();
-    if !ok || info.hwndFocus.0.is_null() {
-        return None;
-    }
-
-    Some(info.hwndFocus)
 }
 
-fn is_supported_edit_control(hwnd: HWND) -> bool {
+fn probe_native(target: FocusTarget, max_chars: usize) -> SelectionProbe {
+    if !target.is_current() { return SelectionProbe::Blocked; }
+    let hwnd = target.focus_hwnd();
+    let mut start = 0u32;
+    let mut end = 0u32;
+    // System messages below WM_USER marshal these pointers across processes.
+    if unsafe { bounded_message(hwnd, EM_GETSEL,
+        WPARAM((&raw mut start) as usize), LPARAM((&raw mut end) as isize)) }.is_none() {
+        return SelectionProbe::Blocked;
+    }
+    if start == end { return SelectionProbe::Absent; }
+    let Some(length) = end.checked_sub(start) else { return SelectionProbe::Blocked; };
+    if length as usize > max_chars.saturating_mul(2) { return SelectionProbe::Blocked; }
+    let Some(text) = read_window_text(hwnd) else { return SelectionProbe::Blocked; };
+    let Some(selected) = text.get(start as usize..end as usize) else { return SelectionProbe::Blocked; };
+    let Ok(selected) = String::from_utf16(selected) else { return SelectionProbe::Blocked; };
+    if !super::convert::is_convertible_selection(&selected, max_chars) || !target.is_current() {
+        return SelectionProbe::Blocked;
+    }
+    SelectionProbe::Selected(CapturedSelection {
+        text: selected, target, identity: SelectionIdentity::Native { start, end }, max_chars,
+    })
+}
+
+fn is_native_edit(hwnd: HWND) -> bool {
     let mut class_name = [0u16; 128];
     let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
-    if len <= 0 {
-        return false;
-    }
-
+    if len <= 0 { return false; }
     let class = String::from_utf16_lossy(&class_name[..len as usize]);
     class == "Edit" || class.starts_with("RichEdit") || class.starts_with("RICHEDIT")
 }
 
 fn read_window_text(hwnd: HWND) -> Option<Vec<u16>> {
-    let len = unsafe { send_message_w(hwnd, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0)).0 };
-    if len <= 0 {
-        return Some(Vec::new());
-    }
-
-    let cap = (len as usize).saturating_add(1);
-    let mut buf = vec![0u16; cap];
-    let copied = unsafe {
-        send_message_w(
-            hwnd,
-            WM_GETTEXT,
-            WPARAM(cap),
-            LPARAM(PWSTR(buf.as_mut_ptr()).0 as isize),
-        )
-        .0
-    };
-
-    if copied < 0 {
-        return None;
-    }
-
-    buf.truncate(copied as usize);
-    Some(buf)
+    let length = unsafe { bounded_message(hwnd, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0)) }?;
+    if length > MAX_WINDOW_TEXT_UNITS { return None; }
+    let capacity = length.checked_add(1)?;
+    let mut text = vec![0u16; capacity];
+    let copied = unsafe { bounded_message(hwnd, WM_GETTEXT, WPARAM(capacity), LPARAM(text.as_mut_ptr() as isize)) }?;
+    if copied > length { return None; }
+    text.truncate(copied);
+    Some(text)
 }
 
-unsafe fn send_message_w(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe { SendMessageW(hwnd, msg, Some(wparam), Some(lparam)) }
+unsafe fn bounded_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<usize> {
+    let mut result = 0usize;
+    let status = unsafe { SendMessageTimeoutW(
+        hwnd, message, wparam, lparam, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        MESSAGE_TIMEOUT_MS, Some(&raw mut result),
+    ) };
+    (status.0 != 0).then_some(result)
 }

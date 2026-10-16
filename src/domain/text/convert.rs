@@ -5,7 +5,7 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, HKL, VIRTUAL_KEY,
+            GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, HKL,
             VK_LSHIFT, VK_RSHIFT,
         },
         WindowsAndMessaging::{
@@ -16,55 +16,15 @@ use windows::Win32::{
 
 use super::{
     mapping,
-    selection_probe::{SelectionProbe, probe_selection_uia, probe_selection_win32},
+    selection_probe::{CapturedSelection, SelectionProbe, probe_selection},
     smart,
 };
 use crate::{
     app::AppState,
-    conversion::input::{KeySequence, reselect_last_inserted_text_utf16_units, send_text_unicode},
+    conversion::input::replace_selection_unicode,
 };
 
 const MAX_SELECTION_CHARS: usize = 512;
-
-/// Virtual key code for the Delete key.
-///
-/// Used to remove the current selection before inserting converted text.
-const VK_DELETE_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x2E);
-
-fn probe_convertible_selection(max_chars: usize) -> Option<String> {
-    match probe_selection_uia(max_chars) {
-        SelectionProbe::SelectionText(text) => {
-            tracing::trace!(len = text.chars().count(), "selection detected through UIA");
-            return Some(text);
-        }
-        SelectionProbe::SelectionPresentButUnreadable(err) => {
-            tracing::trace!(error = ?err, "UIA selection present but unreadable");
-        }
-        SelectionProbe::SelectionPresentButIneligible => {
-            tracing::trace!("UIA selection present but ineligible");
-        }
-        SelectionProbe::NoSelection | SelectionProbe::Unsupported => {}
-    }
-
-    match probe_selection_win32(max_chars) {
-        SelectionProbe::SelectionText(text) => {
-            tracing::trace!(
-                len = text.chars().count(),
-                "selection detected through Win32"
-            );
-            Some(text)
-        }
-        SelectionProbe::SelectionPresentButUnreadable(err) => {
-            tracing::trace!(error = ?err, "Win32 selection present but unreadable");
-            None
-        }
-        SelectionProbe::SelectionPresentButIneligible => {
-            tracing::trace!("Win32 selection present but ineligible");
-            None
-        }
-        SelectionProbe::NoSelection | SelectionProbe::Unsupported => None,
-    }
-}
 
 /// Converts the currently selected text, if there is any selection.
 ///
@@ -83,7 +43,7 @@ pub fn smart_convert_selection_if_any(state: &mut AppState) -> bool {
 fn convert_selection_if_any_impl(state: &mut AppState, mode: SelectionDirectionMode) -> bool {
     match convert_selection_outcome(state, MAX_SELECTION_CHARS, mode) {
         ConvertOutcome::Noop => false,
-        ConvertOutcome::Ok => true,
+        ConvertOutcome::Ok | ConvertOutcome::Cancelled => true,
         ConvertOutcome::Err(e) => {
             tracing::warn!(user_text = e.user_text(), error = ?e, "selection conversion failed");
             true
@@ -114,7 +74,7 @@ fn convert_selection_impl(state: &mut AppState, mode: SelectionDirectionMode) {
 
     match convert_selection_outcome(state, MAX_SELECTION_CHARS, mode) {
         ConvertOutcome::Noop => tracing::trace!("no selection"),
-        ConvertOutcome::Ok => {}
+        ConvertOutcome::Ok | ConvertOutcome::Cancelled => {}
         ConvertOutcome::Err(e) => {
             tracing::warn!(user_text = e.user_text(), error = ?e, "selection conversion failed");
         }
@@ -133,6 +93,7 @@ enum SelectionDirectionMode {
 #[derive(Debug)]
 enum ConvertOutcome {
     Noop,
+    Cancelled,
     Ok,
     Err(ConvertSelectionError),
 }
@@ -145,11 +106,14 @@ fn convert_selection_outcome(
     max_chars: usize,
     mode: SelectionDirectionMode,
 ) -> ConvertOutcome {
-    let Some(text) = probe_convertible_selection(max_chars) else {
-        return ConvertOutcome::Noop;
+    let selection = match probe_selection(max_chars) {
+        SelectionProbe::Absent => return ConvertOutcome::Noop,
+        // A busy or unreadable target must not fall through to last-word deletion.
+        SelectionProbe::Blocked => return ConvertOutcome::Cancelled,
+        SelectionProbe::Selected(selection) => selection,
     };
 
-    match convert_selection_from_text(state, &text, mode) {
+    match convert_selection_from_text(state, &selection, mode) {
         Ok(()) => ConvertOutcome::Ok,
         Err(e) => ConvertOutcome::Err(e),
     }
@@ -158,37 +122,31 @@ fn convert_selection_outcome(
 /// Errors that can occur while replacing the current selection with converted text.
 #[derive(Debug)]
 enum ConvertSelectionError {
-    /// Failed to send Delete to remove the current selection.
-    Delete,
-    /// Failed to inject Unicode text via `SendInput`.
-    InsertConverted,
-    /// Failed to reselect the inserted text within the retry budget.
-    Reselect,
+    TargetChanged,
+    InputRejected,
 }
 
 impl ConvertSelectionError {
     fn user_text(&self) -> &'static str {
         match self {
-            Self::Delete => "Failed to delete selection",
-            Self::InsertConverted => "Failed to insert converted text",
-            Self::Reselect => "Failed to reselect inserted text",
+            Self::TargetChanged => "Selection changed before conversion",
+            Self::InputRejected => "Selection input was rejected",
         }
     }
 }
 
 /// Replaces currently selected text with layout converted text.
 ///
-/// Returns `Ok(())` when:
-/// - Delete tap succeeded
-/// - Unicode injection succeeded
-/// - reselect succeeded within retry budget
+/// Returns `Ok(())` when the target and selection were revalidated and Windows
+/// accepted the complete replacement/reselection batch.
 ///
 /// Keyboard layout switching is best effort and does not affect the result.
 fn convert_selection_from_text(
     _state: &mut AppState,
-    text: &str,
+    selection: &CapturedSelection,
     mode: SelectionDirectionMode,
 ) -> Result<(), ConvertSelectionError> {
+    let text = &selection.text;
     if matches!(mode, SelectionDirectionMode::TextOnly) && smart::text_looks_correct(text) {
         tracing::trace!(%text, "smart selection convert skipped: text already looks correct");
         return Ok(());
@@ -203,54 +161,29 @@ fn convert_selection_from_text(
         }
     };
     let converted = convert_ru_en_with_direction(text, direction);
-    let converted_units = converted.encode_utf16().count();
 
     thread::sleep(Duration::from_millis(u64::from(
         crate::config::CONVERSION_DELAY_MS,
     )));
 
-    let _seq = KeySequence::new();
-
-    KeySequence::tap(VK_DELETE_KEY)
-        .then_some(())
-        .ok_or(ConvertSelectionError::Delete)?;
-
-    send_text_unicode(&converted)
-        .then_some(())
-        .ok_or(ConvertSelectionError::InsertConverted)?;
-
-    reselect_with_retry(
-        converted_units,
-        Duration::from_millis(120),
-        Duration::from_millis(5),
-    )
-    .then_some(())
-    .ok_or(ConvertSelectionError::Reselect)?;
-
-    if let Err(e) = switch_keyboard_layout() {
-        tracing::trace!(error = ?e, "layout switch failed");
+    if !selection.is_current() {
+        return Err(ConvertSelectionError::TargetChanged);
     }
 
+    // One SendInput call keeps Delete, insertion and reselection together.
+    // Recheck cheap window identity immediately before submitting that batch.
+    if !replace_selection_unicode(&converted, || selection.target.is_current()) {
+        return Err(ConvertSelectionError::InputRejected);
+    }
+
+    if selection.target.is_current() {
+        let fg = selection.target.foreground_hwnd();
+        let layouts = installed_layouts();
+        if !layouts.is_empty() {
+            let _ = post_layout_change(fg, next_layout(&layouts, current_layout_for_window(fg)));
+        }
+    }
     Ok(())
-}
-
-/// Attempts to reselect the last inserted text using bounded retries.
-///
-/// Some target applications apply caret and selection updates asynchronously relative to `SendInput`.
-/// This helper retries for a short time budget to reduce flakiness without adding a long fixed delay.
-///
-/// Returns `true` if reselect succeeds within `budget`, otherwise `false`.
-fn reselect_with_retry(units: usize, budget: Duration, step_sleep: Duration) -> bool {
-    let deadline = std::time::Instant::now() + budget;
-
-    std::iter::repeat_with(|| reselect_last_inserted_text_utf16_units(units))
-        .take_while(|_| std::time::Instant::now() < deadline)
-        .inspect(|ok| {
-            if !ok {
-                thread::sleep(step_sleep);
-            }
-        })
-        .any(|ok| ok)
 }
 
 /// Returns the current foreground window, or `None` if it is null.
