@@ -24,17 +24,17 @@ bump VERSION='':
 	@pwsh -ExecutionPolicy Bypass -NoLogo -NoProfile -File scripts\release\bump.ps1 {{VERSION}}
 
 # github-release VERSION?
-# Build and upload Windows artifacts to a GitHub Release for vX.Y.Z.
+# Deprecated: fails closed; retry the original isolated Release workflow instead.
 github-release VERSION='':
 	@pwsh -ExecutionPolicy Bypass -NoLogo -NoProfile -File scripts\release\github_release.ps1 {{VERSION}}
 
 # crates-release
-# Publish crates to crates.io in dependency order: core -> app
+# Deprecated: fails closed; use the isolated Release workflow.
 crates-release:
 	@pwsh -ExecutionPolicy Bypass -NoLogo -NoProfile -File scripts\release\cargo_publish.ps1
 
 # release VERSION?
-# One-command production release from dev:
-# checks -> bump -> push -> immutable tag -> GH Release + assets -> crates.io publish
+# Dispatch the isolated Release workflow for the exact clean dev commit.
+# checked version PR -> unprivileged build/package -> fresh publication job
 release VERSION='':
 	@pwsh -ExecutionPolicy Bypass -NoLogo -NoProfile -File scripts\release\release.ps1 {{VERSION}}

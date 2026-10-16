@@ -31,6 +31,15 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cargo fmt
         run: cargo +nightly fmt --all -- --check
+      - name: Verify locked dependency graph
+        shell: bash
+        run: |
+          if ! cargo +nightly metadata --locked --format-version 1 > /dev/null; then
+            cargo +nightly update --workspace
+            git diff -- Cargo.lock
+            echo 'Commit the reviewed lockfile update before merging.' >&2
+            exit 1
+          fi
 
   clippy-lib-tests:
     name: clippy-lib-tests
@@ -74,7 +83,8 @@ jobs:
 
   windows-full:
     name: windows-full
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -100,6 +110,34 @@ jobs:
           fallback: none
       - name: Cargo nextest --locked
         run: cargo +nightly nextest run --locked
+      - name: Build desktop test and release applications
+        shell: pwsh
+        run: |
+          cargo +nightly build --locked --bin rust-switcher-debug --features debug-tracing,debug-binary
+          if ($LASTEXITCODE -ne 0) { throw 'Debug build failed' }
+          cargo +nightly build --release --locked --bin rust-switcher
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+      - name: Exercise actual applications in the isolated desktop
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/run-hosted.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
+
+      - name: Verify real crate packaging and tokenless publisher preflight
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          cargo +nightly package --workspace --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Verified workspace packaging failed' }
+          $version = python -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read package version' }
+          python .github/scripts/release_stages.py bundle --source "$env:SOURCE_SHA" --commit "$env:SOURCE_SHA" --version "$version" --directory "$env:RUNNER_TEMP/ci-publication"
+          if ($LASTEXITCODE -ne 0) { throw 'Publication bundle validation failed' }
+          $manifestSha = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP/ci-publication/manifest.json").Hash.ToLowerInvariant()
+          python .github/scripts/release_stages.py preflight --source "$env:SOURCE_SHA" --commit "$env:SOURCE_SHA" --version "$version" --directory "$env:RUNNER_TEMP/ci-publication" --manifest-sha "$manifestSha" --sterile "$env:RUNNER_TEMP/ci-publish-cargo"
+          if ($LASTEXITCODE -ne 0) { throw 'Tokenless publication preflight failed' }
 
   dependency-security:
     name: dependency-security

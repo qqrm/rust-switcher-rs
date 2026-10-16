@@ -17,7 +17,8 @@ categories = ["gui", "os::windows-apis"]
 [dependencies]
 rust-switcher-core = { version = "1.0.19", path = "crates/rust-switcher-core" }
 serde = { version = "1.0", features = ["derive"] }
-confy = "2.0"
+toml = "0.9.12"
+tempfile = "3.27"
 lingua = { version = "1.8", default-features = false, features = [
     "english",
     "russian",
