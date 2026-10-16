@@ -332,6 +332,8 @@ try {
     $otherEdit = [System.Windows.Automation.AutomationElement]::FromHandle($otherHandle)
     $otherValue = Get-Pattern $otherEdit ([System.Windows.Automation.ValuePattern]::Pattern)
     foreach ($mode in @(1, 2, 3)) {
+        # Each scenario starts after the preceding modifier-sequence window closes.
+        Start-Sleep -Milliseconds 1200
         $editValue.SetValue('ghbdtn')
         $otherValue.SetValue('untouched')
         $edit.SetFocus()
@@ -365,6 +367,7 @@ try {
         [HostedInput]::SelectFixtureText($editHandle, 6)
         Tap-Shift 2
         Assert-Value $editValue 'привет' "release conversion recovers after adversarial mode $mode"
+        Wait-Condition { [HostedInput]::HasSelection($editHandle, 6) } 'adversarial recovery input completed'
     }
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null

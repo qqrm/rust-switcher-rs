@@ -30,14 +30,16 @@ public sealed class ProbeTrap : NativeWindow {
         timer.Interval = 40;
         timer.Tick += delegate {
             timer.Stop();
-            if (mode == 1) SendMessage(Handle, 0xB1, IntPtr.Zero, new IntPtr(3));
-            if (mode == 2) SetFocus(other);
-            System.IO.File.WriteAllText(signal, "changed-" + mode);
+            int triggeredMode = mode;
             mode = 0;
+            if (triggeredMode == 1) SendMessage(Handle, 0xB1, IntPtr.Zero, new IntPtr(3));
+            if (triggeredMode == 2) SetFocus(other);
+            System.IO.File.WriteAllText(signal, "changed-" + triggeredMode);
         };
     }
     protected override void WndProc(ref Message message) {
         if (message.Msg == 0x8011) {
+            timer.Stop();
             mode = message.WParam.ToInt32();
             if (mode == 3) {
                 System.IO.File.WriteAllText(signal, "blocked");

@@ -31,6 +31,15 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cargo fmt
         run: cargo +nightly fmt --all -- --check
+      - name: Verify locked dependency graph
+        shell: bash
+        run: |
+          if ! cargo +nightly metadata --locked --format-version 1 > /dev/null; then
+            cargo +nightly update --workspace
+            git diff -- Cargo.lock
+            echo 'Commit the reviewed lockfile update before merging.' >&2
+            exit 1
+          fi
 
   clippy-lib-tests:
     name: clippy-lib-tests
