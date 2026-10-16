@@ -28,8 +28,8 @@ const MAX_SELECTION_CHARS: usize = 512;
 
 /// Converts the currently selected text, if there is any selection.
 ///
-/// Returns `true` if a non empty eligible selection was found (conversion attempted),
-/// otherwise `false`.
+/// Returns `false` only when no supported selection is present. A failed probe
+/// returns `true` to suppress fallback input against an unreadable target.
 #[allow(dead_code)]
 #[tracing::instrument(level = "trace", skip(state))]
 pub fn convert_selection_if_any(state: &mut AppState) -> bool {

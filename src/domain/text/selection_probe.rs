@@ -2,16 +2,16 @@ use std::{sync::OnceLock, time::Duration};
 
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, WPARAM},
+        Foundation::{E_NOINTERFACE, HWND, LPARAM, WPARAM},
         System::{
             Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize},
-            Threading::GetCurrentProcessId,
+            Threading::{GetCurrentProcessId, GetCurrentThreadId},
         },
         UI::{
             Accessibility::{
                 CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern,
                 IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
-                UIA_TextPatternId,
+                UIA_E_NOTSUPPORTED, UIA_TextPatternId,
             },
             Controls::EM_GETSEL,
             WindowsAndMessaging::{
@@ -66,7 +66,9 @@ impl FocusTarget {
     fn focus_hwnd(self) -> HWND { HWND(self.focus as *mut _) }
 
     fn is_own_native_edit(self) -> bool {
-        self.process == unsafe { GetCurrentProcessId() } && is_native_edit(self.focus_hwnd())
+        self.process == unsafe { GetCurrentProcessId() }
+            && self.thread == unsafe { GetCurrentThreadId() }
+            && is_native_edit(self.focus_hwnd())
     }
 }
 
@@ -133,22 +135,36 @@ impl Drop for ComGuard {
     }
 }
 
+// Fields drop in declaration order: release all COM interfaces before the apartment.
+struct ProbeWorker {
+    state: ProbeState,
+    apartment: ComGuard,
+}
+
+impl ProbeWorker {
+    fn process(&mut self, command: Command) -> Response {
+        match command {
+            Command::Capture(target, max_chars) if self.apartment.0 => {
+                Response::Probe(self.state.capture(target, max_chars))
+            }
+            Command::Validate(selection) if self.apartment.0 => {
+                Response::Valid(self.state.validate(&selection))
+            }
+            Command::Capture(..) => Response::Probe(SelectionProbe::Blocked),
+            Command::Validate(..) => Response::Valid(false),
+        }
+    }
+}
+
 fn request(command: Command) -> Option<Response> {
     static WORKER: OnceLock<Option<BoundedWorker<Command, Response>>> = OnceLock::new();
     WORKER.get_or_init(|| {
         BoundedWorker::start("selection-probe", || {
-            let guard = ComGuard(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok());
-            let mut state = ProbeState::default();
-            move |command| {
-                // Keep apartment lifetime and all provider interfaces on this one MTA thread.
-                let _apartment = &guard;
-                match command {
-                    Command::Capture(target, max_chars) => {
-                        Response::Probe(state.capture(target, max_chars))
-                    }
-                    Command::Validate(selection) => Response::Valid(state.validate(&selection)),
-                }
-            }
+            let mut worker = ProbeWorker {
+                state: ProbeState::default(),
+                apartment: ComGuard(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok()),
+            };
+            move |command| worker.process(command)
         }).ok()
     }).as_ref()?.request(command, PROBE_TIMEOUT)
 }
@@ -157,8 +173,14 @@ pub(super) fn probe_selection(max_chars: usize) -> SelectionProbe {
     let Some(target) = FocusTarget::capture() else { return SelectionProbe::Blocked; };
     // Our known standard Edit is on this UI thread. Calling it directly avoids
     // waiting for a worker which would in turn wait for this same message loop.
-    if target.is_own_native_edit() {
-        return probe_native(target, max_chars);
+    if target.process == unsafe { GetCurrentProcessId() } {
+        return if target.is_own_native_edit() {
+            probe_native(target, max_chars)
+        } else {
+            // Same-process messages do not get OS pointer marshalling. Never
+            // time out a call whose other thread could still use our buffers.
+            SelectionProbe::Blocked
+        };
     }
     match request(Command::Capture(target, max_chars)) {
         Some(Response::Probe(result)) if target.is_current() => result,
@@ -184,7 +206,9 @@ impl ProbeState {
         let element = unsafe { automation.GetFocusedElement() }?;
         let pattern: IUIAutomationTextPattern = match unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) } {
             Ok(pattern) => pattern,
-            Err(_) => return Ok(SelectionProbe::Absent),
+            // Preserve fallback for an explicitly unsupported pattern only.
+            // Provider failures must never authorize last-word deletion.
+            Err(error) => return Ok(pattern_failure(error.code())),
         };
         let ranges = unsafe { pattern.GetSelection() }?;
         let count = unsafe { ranges.Length() }?;
@@ -231,6 +255,28 @@ impl ProbeState {
             TextPatternRangeEndpoint_End, &range, TextPatternRangeEndpoint_End,
         ) }? == 0;
         Ok(same_start && same_end && read_automation_text(&range, selection.max_chars)? == selection.text)
+    }
+}
+
+fn pattern_failure(code: windows::core::HRESULT) -> SelectionProbe {
+    if code == E_NOINTERFACE || code.0 as u32 == UIA_E_NOTSUPPORTED {
+        SelectionProbe::Absent
+    } else {
+        SelectionProbe::Blocked
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL};
+
+    #[test]
+    fn provider_errors_do_not_authorize_last_word_fallback() {
+        for error in [E_ACCESSDENIED, E_FAIL] {
+            assert!(matches!(pattern_failure(error), SelectionProbe::Blocked));
+        }
+        assert!(matches!(pattern_failure(E_NOINTERFACE), SelectionProbe::Absent));
     }
 }
 
