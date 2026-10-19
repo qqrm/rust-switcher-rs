@@ -3,7 +3,7 @@ members = ["crates/rust-switcher-core"]
 
 [package]
 name = "rust-switcher"
-version = "1.0.19"
+version = "1.0.20"
 edition = "2024"
 
 description = "Windows keyboard layout switcher and text conversion utility"
@@ -15,7 +15,7 @@ keywords = ["windows", "winapi", "keyboard", "hotkey", "tray"]
 categories = ["gui", "os::windows-apis"]
 
 [dependencies]
-rust-switcher-core = { version = "1.0.19", path = "crates/rust-switcher-core" }
+rust-switcher-core = { version = "1.0.20", path = "crates/rust-switcher-core" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1.6"
 tempfile = "3.27"
