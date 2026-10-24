@@ -4,6 +4,12 @@
 
 Rust Switcher is a Windows 11 utility that helps convert text between RU and EN keyboard layouts.
 
+It was created as an open-source alternative to Punto Switcher and Caramba
+Switcher with a clear privacy requirement: keyboard input stays on your device.
+**No telemetry, no usage analytics, and no data uploads.** Text conversion works
+offline; the application does not send your text or other user data to the
+developer or third parties.
+
 ## Features
 
 - Convert selected text (RU↔EN)
@@ -47,6 +53,21 @@ Default hotkey sequences:
 * Switch layout: CapsLock
 
 To remove a binding, focus its hotkey field and press Backspace or Delete.
+
+## Privacy
+
+**Your input stays on your device.** Rust Switcher processes keyboard input
+and selected text locally and does not collect telemetry or usage analytics.
+It does not upload typed text, selections, input history, or preferences to
+the developer or third parties.
+
+Recent input is held temporarily in memory to support conversion; preferences
+are saved locally. The [privacy policy](PRIVACY.md) explains this local
+processing, retention, clipboard behavior, and development logging.
+
+Pausing or disabling AutoConvert leaves keyboard tracking and manual hotkeys
+running. To stop all processing, right-click the tray icon and choose **Exit**;
+closing the settings window only hides it.
 
 ## Development
 
