@@ -41,12 +41,21 @@ public static class HostedInput {
     [StructLayout(LayoutKind.Sequential)] public struct MOUSE {
         public int x, y; public uint data, flags, time; public UIntPtr extra;
     }
+    [StructLayout(LayoutKind.Sequential)] private struct RECT {
+        public int left, top, right, bottom;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct GUI_THREAD_INFO {
+        public uint size, flags;
+        public IntPtr active, focus, capture, menuOwner, moveSize, caret;
+        public RECT caretRect;
+    }
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint thread);
+    [DllImport("user32.dll", SetLastError=true)] private static extern bool GetGUIThreadInfo(uint thread, ref GUI_THREAD_INFO info);
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string title);
@@ -98,6 +107,16 @@ public static class HostedInput {
         if (GetWindowThreadProcessId(window, out process) == 0)
             throw new InvalidOperationException("Window has no process");
         return process;
+    }
+    public static IntPtr WindowFocus(IntPtr window) {
+        uint process;
+        uint thread = GetWindowThreadProcessId(window, out process);
+        if (thread == 0) throw new InvalidOperationException("Focus target has no GUI thread");
+        var info = new GUI_THREAD_INFO();
+        info.size = checked((uint)Marshal.SizeOf<GUI_THREAD_INFO>());
+        if (!GetGUIThreadInfo(thread, ref info))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Source focus snapshot failed");
+        return info.focus;
     }
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)] static extern IntPtr SendMessageTimeout(

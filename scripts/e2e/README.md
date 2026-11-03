@@ -81,6 +81,9 @@ repeat twice. Ctrl/Alt cases start with the modifier held in the application's
 own playground, then focus the external destination and release the modifier
 immediately before typing. A harmless F24 chord establishes source keyboard
 state and prevents the release from counting as an additional Alt tap. The
+source-focus setup is bounded and may reissue UIA focus before any tested key;
+it requires three consecutive native/UIA focus observations and reports actual
+HWNDs on failure. Input and conversion are never retried. The
 0 ms case submits release and the first key in one `SendInput` batch; 1 and
 20 ms cases record the observed elapsed delay. Each modifier/text/delay pair
 runs twice. All cases assert exact original text before Double Alt and exact

@@ -31,6 +31,43 @@ function Set-JournalEnglish([IntPtr]$Window) {
     }
     Wait-Condition { [HostedInput]::WindowLayout($Window) -eq $EnglishLayout } 'fixture English layout'
 }
+function Set-JournalModifierSourceFocus($SourceWindow, $SourceEdit) {
+    $windowHandle = [IntPtr]$SourceWindow.Current.NativeWindowHandle
+    $editHandle = [IntPtr]$SourceEdit.Current.NativeWindowHandle
+    $deadline = [DateTime]::UtcNow.AddSeconds(4)
+    $stableSamples = 0
+    $requests = 0
+    $actualForeground = [IntPtr]::Zero
+    $actualFocus = [IntPtr]::Zero
+    $uiaFocused = $false
+    $lastError = $null
+    [HostedInput]::ShowWindow($windowHandle, 9) | Out-Null
+    do {
+        try {
+            $actualForeground = [HostedInput]::GetForegroundWindow()
+            $actualFocus = [HostedInput]::WindowFocus($windowHandle)
+            $uiaFocused = $SourceEdit.Current.HasKeyboardFocus
+            if ($actualForeground -eq $windowHandle -and $actualFocus -eq $editHandle -and $uiaFocused) {
+                $stableSamples++
+                if ($stableSamples -ge 3) { return $requests }
+            } else {
+                $stableSamples = 0
+                if ($actualForeground -ne $windowHandle) {
+                    [HostedInput]::SetForegroundWindow($windowHandle) | Out-Null
+                }
+                # Activation and UIA focus are asynchronous across processes.
+                # Reissue setup focus only; no tested key has been sent yet.
+                $SourceEdit.SetFocus()
+                $requests++
+            }
+        } catch {
+            $stableSamples = 0
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Modifier source focus setup failed: expectedWindow=$windowHandle expectedEdit=$editHandle actualForeground=$actualForeground actualFocus=$actualFocus uiaFocused=$uiaFocused requests=$requests lastError=$lastError"
+}
 
 $cases = [System.Collections.Generic.List[object]]::new()
 foreach ($sample in @(
@@ -81,6 +118,7 @@ try {
         $record = [ordered]@{
             scenario = $case.Mode; iteration = $case.Repeat; requestedReleaseDelayMs = $case.Delay
             observedReleaseDelayMs = $null; input = $case.Text; expected = $case.Expected
+            sourceFocusRequests = $null
             actualBefore = $null; actualAfter = $null; otherEditorsUnchanged = $null; error = $null
         }
         $heldModifier = [ushort]0
@@ -117,9 +155,7 @@ try {
             Set-JournalEnglish ([IntPtr]$targetWindow.Current.NativeWindowHandle)
             Set-JournalEnglish $appHandle
             if ($case.Modifier -ne 0) {
-                Focus-App $AppWindow
-                $AppPlayground.SetFocus()
-                Wait-Condition { $AppPlayground.Current.HasKeyboardFocus } 'modifier source focus'
+                $record.sourceFocusRequests = Set-JournalModifierSourceFocus $AppWindow $AppPlayground
                 $heldModifier = [ushort]$case.Modifier
                 [HostedInput]::Key($heldModifier, $false)
                 # F24 establishes a real modifier chord in the source queue,
