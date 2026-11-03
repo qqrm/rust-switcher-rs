@@ -879,7 +879,14 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
     // record_keydown filters physically held Ctrl/Alt shortcuts before decoding printable input.
     // Our thread's snapshot can still contain an old shortcut from a previously focused window.
     // Leaving those bits set makes ToUnicodeEx return a control character or no character at all.
-    for vk in [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU] {
+    for vk in [
+        VK_CONTROL,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_MENU,
+        VK_LMENU,
+        VK_RMENU,
+    ] {
         set_key_down_state(state, vk, false);
     }
 }
