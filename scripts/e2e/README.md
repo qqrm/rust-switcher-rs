@@ -25,7 +25,9 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Feature or boundary | Hosted check | Remaining limit |
 | --- | --- | --- |
 | Last word and overlapping smart hotkeys | Debug triple Shift and deferred double Shift, both directions | Injected input accepted through the debug-only opt-in |
-| Last typed sequence | Debug double Alt converts two words | Physical typing in release requires a separate VM with keyboard access |
+| Last typed sequence | Debug double Alt converts two words and short leading-dot inputs in external native Edit controls | Physical typing in release requires a separate VM with keyboard access |
+| First character after focus/modifiers | Debug journal matrix switches between two unowned external windows and two controls, releases Ctrl/Alt in the destination, and asserts exact before/after strings | Synthetic input and native Edit controls do not reproduce every Telegram/Qt or physical-keyboard interaction |
+| Journal capacity | Debug checks 100 and 101 characters, including a leading dot at 101 | This characterizes the existing 100-character tail policy; it does not assert full-message conversion |
 | Automatic last-word conversion | Debug runtime toggle followed by a word and space | Other delimiters are not exercised by this GUI scenario |
 | Selected text | Release double Shift in a separate native Edit, both directions, restored selection | Other applications, rich editors and elevated targets are not exercised |
 | Clipboard isolation | Clipboard sequence unchanged during selection conversion | Does not audit unrelated applications on the desktop |
@@ -43,6 +45,53 @@ Results are printed in the job log without adding stored workflow artifacts.
 The manifest describes assertions implemented by the harness, not a permanent
 claim of success: use the `windows-full` log for the exact tested commit. All
 rows without a hosted assertion remain coverage gaps even when CI is green.
+
+### Windows native-input regression workflow
+
+The dedicated **Windows Input Regression** workflow runs the eight
+`native_input_` regression tests on a Windows runner, separately from the larger
+GUI suite. These call the real Win32 `ToUnicodeEx` API with a controlled stale
+modifier snapshot on the first character, then feed decoded input through the
+journal. This makes normalization defects reproducible without asking anyone to
+type on a working desktop. The group also characterizes the 100-character
+capacity separately. A controlled native-API reproduction establishes the tested
+decoder behavior; it does not establish that a particular Telegram window
+produced that snapshot during physical typing.
+
+### Double Alt journal matrix
+
+`journal-cases.ps1` runs 39 bounded cases through the actual debug executable.
+`journal-fixture.ps1` creates two top-level windows in a separate process, each
+with two native Windows Edit controls. A debug-only hosted-E2E PID allowlist
+admits this one fixture process; release capture behavior is unchanged. The
+harness verifies that both windows are unowned and belong to the exact fixture
+PID. It does not call `AttachThreadInput` or create cross-process parent/owner
+relationships: those relationships implicitly attach input queues and would
+change the keyboard state being tested. See Microsoft's
+[explanation of cross-process window relationships](https://devblogs.microsoft.com/oldnewthing/20130412-00/?p=4683).
+
+The fixture allocates new Edit HWNDs before destroying the preceding controls,
+and the harness rejects a reused HWND. Destination setup uses addressed UIA and
+layout requests while unfocused; the first tested glyph is the first keyboard
+input delivered after the focus transition. Period is sent as `VK_OEM_PERIOD`,
+not ASCII `0x2E` (the Delete virtual key).
+
+Short cases cover `.`, `ghbdtn`, `.ghbdtn`, and two words; window/control changes
+repeat twice. Ctrl/Alt cases start with the modifier held in the application's
+own playground, then focus the external destination and release the modifier
+immediately before typing. A harmless F24 chord establishes source keyboard
+state and prevents the release from counting as an additional Alt tap. The
+0 ms case submits release and the first key in one `SendInput` batch; 1 and
+20 ms cases record the observed elapsed delay. Each modifier/text/delay pair
+runs twice. All cases assert exact original text before Double Alt and exact
+converted text afterward, plus unchanged source and neighboring editors.
+
+Every result includes actual strings, requested/observed timing, and any error in
+the job log and `result.json`. A failed case remains a CI failure while later
+cases run to collect useful evidence. The capacity cases deliberately expect
+the current retained-tail behavior: at 101 characters, the first character is
+outside the default 100-character journal. Passing that check alone does not
+reproduce or explain a short-input first-character failure.
 
 ## Existing Windows Sandbox scenario
 

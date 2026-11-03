@@ -13,9 +13,10 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState, HKL, ToUnicodeEx,
-            VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-            VK_INSERT, VK_LEFT, VK_LSHIFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RSHIFT,
-            VK_SHIFT, VK_TAB, VK_UP,
+            VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+            VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NEXT,
+            VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_TAB,
+            VK_UP,
         },
         WindowsAndMessaging::{
             GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
@@ -874,6 +875,13 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
     set_key_down_state(state, VK_LSHIFT, overrides.left_shift_down);
     set_key_down_state(state, VK_RSHIFT, overrides.right_shift_down);
     set_key_toggle_state(state, VK_CAPITAL, overrides.caps_lock_on);
+
+    // record_keydown filters physically held Ctrl/Alt shortcuts before decoding printable input.
+    // Our thread's snapshot can still contain an old shortcut from a previously focused window.
+    // Leaving those bits set makes ToUnicodeEx return a control character or no character at all.
+    for vk in [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU] {
+        set_key_down_state(state, vk, false);
+    }
 }
 
 #[cfg(windows)]
@@ -1229,9 +1237,8 @@ mod tests {
         let scan = unsafe { MapVirtualKeyExW(u32::from(vk.0), MAPVK_VK_TO_VSC, Some(layout)) };
         assert_ne!(scan, 0, "the test key must have a native scan code");
         let mut buf = [0u16; 8];
-        let count = unsafe {
-            ToUnicodeEx(u32::from(vk.0), scan, &state, &mut buf, 0, Some(layout))
-        };
+        let count =
+            unsafe { ToUnicodeEx(u32::from(vk.0), scan, &state, &mut buf, 0, Some(layout)) };
         let count = usize::try_from(count).expect("the test keys must not be dead keys");
         String::from_utf16(&buf[..count]).expect("native decoding must produce valid UTF-16")
     }
@@ -1363,10 +1370,8 @@ mod tests {
 
     #[test]
     fn native_input_letter_case_follows_physical_shift_and_caps_lock() {
-        for (name, lowercase, uppercase) in [
-            (w!("00000409"), "g", "G"),
-            (w!("00000419"), "п", "П"),
-        ] {
+        for (name, lowercase, uppercase) in [(w!("00000409"), "g", "G"), (w!("00000419"), "п", "П")]
+        {
             let layout = load_native_test_layout(name);
             for (shift, caps_lock, expected) in [
                 (false, false, lowercase),
@@ -1764,6 +1769,10 @@ mod tests {
             VIRTUAL_KEY(u16::from(b'A')),
             false
         ));
+        for vk in [VIRTUAL_KEY(u16::from(b'G')), VK_OEM_PERIOD, VK_OEM_2] {
+            assert!(should_clear_for_ctrl_alt_combo(vk, true));
+            assert!(!should_clear_for_ctrl_alt_combo(vk, false));
+        }
     }
 
     #[test]

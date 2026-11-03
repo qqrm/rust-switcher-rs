@@ -1,6 +1,8 @@
 mod capture;
 #[cfg(debug_assertions)]
 pub(crate) mod debug_timers;
+#[cfg(debug_assertions)]
+mod e2e_scope;
 mod keydown;
 mod keyup;
 #[cfg(test)]
@@ -133,7 +135,9 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let is_keyup = is_keyup_msg(msg);
 
     #[cfg(debug_assertions)]
-    if !foreground_is_owned_by_main() {
+    if !foreground_is_owned_by_main()
+        && !e2e_scope::allows_foreground(unsafe { GetForegroundWindow() })
+    {
         return unsafe { CallNextHookEx(hook, code, wparam, lparam) };
     }
 
