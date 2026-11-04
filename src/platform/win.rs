@@ -9,6 +9,7 @@ mod autostart;
 mod commands;
 pub(crate) mod hotkey_format;
 pub(crate) mod keyboard;
+pub(crate) mod layouts;
 pub(crate) mod menu_theme;
 pub(crate) mod mouse;
 pub mod state;
@@ -298,8 +299,7 @@ fn read_ui_to_config(state: &AppState, mut cfg: config::Config) -> config::Confi
     cfg.start_minimized = helpers::get_checkbox(state.checkboxes.start_minimized);
     cfg.theme_dark = helpers::get_checkbox(state.checkboxes.theme_dark);
     cfg.smarter_hotkeys_enabled = helpers::get_checkbox(state.checkboxes.smarter_hotkeys);
-    cfg.autoconvert_feature_enabled =
-        helpers::get_checkbox(state.checkboxes.autoconvert_feature);
+    cfg.autoconvert_feature_enabled = helpers::get_checkbox(state.checkboxes.autoconvert_feature);
 
     cfg.hotkey_convert_last_word_sequence = state.hotkey_sequence_values.last_word;
     cfg.hotkey_convert_last_sequence_sequence = state.hotkey_sequence_values.last_sequence;
@@ -1098,9 +1098,9 @@ fn on_timer(hwnd: HWND, wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
 
     if wparam.0 == crate::platform::win::keyboard::sequence::DEFERRED_SEQUENCE_TIMER_ID {
         with_state_mut_do(hwnd, |state| {
-            if let Err(e) =
-                crate::platform::win::keyboard::sequence::handle_deferred_sequence_timer(hwnd, state)
-            {
+            if let Err(e) = crate::platform::win::keyboard::sequence::handle_deferred_sequence_timer(
+                hwnd, state,
+            ) {
                 crate::platform::ui::error_notifier::push(
                     hwnd,
                     state,

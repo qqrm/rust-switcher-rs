@@ -1,12 +1,11 @@
 use std::{ptr::null_mut, thread, time::Duration};
 
-use mapping::{ConversionDirection, conversion_direction_for_text, convert_ru_en_with_direction};
+use mapping::ConversionDirection;
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, HKL,
-            VK_LSHIFT, VK_RSHIFT,
+            GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, HKL, VK_LSHIFT, VK_RSHIFT,
         },
         WindowsAndMessaging::{
             GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
@@ -16,13 +15,10 @@ use windows::Win32::{
 
 use super::{
     mapping,
+    multilang::{self, Policy},
     selection_probe::{CapturedSelection, SelectionProbe, probe_selection},
-    smart,
 };
-use crate::{
-    app::AppState,
-    conversion::input::replace_selection_unicode,
-};
+use crate::{app::AppState, conversion::input::replace_selection_unicode, platform::win::layouts};
 
 const MAX_SELECTION_CHARS: usize = 512;
 
@@ -147,20 +143,21 @@ fn convert_selection_from_text(
     mode: SelectionDirectionMode,
 ) -> Result<(), ConvertSelectionError> {
     let text = &selection.text;
-    if matches!(mode, SelectionDirectionMode::TextOnly) && smart::text_looks_correct(text) {
-        tracing::trace!(%text, "smart selection convert skipped: text already looks correct");
-        return Ok(());
-    }
-
-    let direction = match mode {
-        SelectionDirectionMode::TextThenForeground => conversion_direction_for_text(text)
-            .or_else(expected_direction_for_foreground_window)
-            .unwrap_or(ConversionDirection::RuToEn),
-        SelectionDirectionMode::TextOnly => {
-            conversion_direction_for_text(text).unwrap_or(ConversionDirection::RuToEn)
-        }
+    let policy = match mode {
+        SelectionDirectionMode::TextThenForeground => Policy::Manual,
+        SelectionDirectionMode::TextOnly => Policy::Smart,
     };
-    let converted = convert_ru_en_with_direction(text, direction);
+    // Selection can predate the foreground keyboard layout. For letters, inspect
+    // all supported source layouts; punctuation uses the actual foreground layout.
+    let source = if text.chars().any(char::is_alphabetic) {
+        None
+    } else {
+        layouts::foreground_layout()
+    };
+    let Some(plan) = multilang::plan_text(text, source, policy) else {
+        return Ok(());
+    };
+    let converted = plan.text;
 
     thread::sleep(Duration::from_millis(u64::from(
         crate::config::CONVERSION_DELAY_MS,
@@ -177,11 +174,8 @@ fn convert_selection_from_text(
     }
 
     if selection.target.is_current() {
-        let fg = selection.target.foreground_hwnd();
-        let layouts = installed_layouts();
-        if !layouts.is_empty() {
-            let _ = post_layout_change(fg, next_layout(&layouts, current_layout_for_window(fg)));
-        }
+        let _ =
+            layouts::activate_layout_for_window(plan.target, selection.target.foreground_hwnd());
     }
     Ok(())
 }

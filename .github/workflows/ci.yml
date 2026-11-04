@@ -102,14 +102,52 @@ jobs:
       - name: Cargo clippy
         run: cargo +nightly clippy --all-targets --all-features -- -D warnings
       - name: Cargo build (debug-tracing)
+        id: app_build
         run: cargo +nightly build --features debug-tracing
       - name: Install cargo-nextest
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest
           fallback: none
+      - name: Prepare installed-layout fixture
+        id: layout_fixture
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/initialize-layouts.ps1 -Mode All
       - name: Cargo nextest --locked
-        run: cargo +nightly nextest run --locked
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
+          cargo +nightly nextest run --locked --no-fail-fast
+          if ($LASTEXITCODE -ne 0) { throw 'Windows unit tests failed' }
+      - name: Verify the release workflow's parallel test mode
+        if: ${{ !cancelled() && steps.app_build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          cargo +nightly test --workspace --all-features --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Release-mode unit test isolation failed' }
+      - name: Verify multilingual planning
+        if: ${{ !cancelled() && steps.layout_fixture.outcome == 'success' }}
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
+          cargo +nightly test --locked --bin rust-switcher native_planner_ -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Multilingual planning regressions failed' }
+      - name: Compare native tables and live keyboard catalog changes
+        if: ${{ !cancelled() && steps.layout_fixture.outcome == 'success' }}
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
+          cargo +nightly test --locked --bin rust-switcher native_public_layout_ -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native keyboard tables/catalog regressions failed' }
+      - name: Prepare English and Russian desktop fixtures
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/initialize-layouts.ps1 -Mode Pair
       - name: Build desktop test and release applications
         shell: pwsh
         run: |
@@ -145,6 +183,15 @@ jobs:
           $manifestSha = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP/ci-publication/manifest.json").Hash.ToLowerInvariant()
           python .github/scripts/release_stages.py preflight --source "$env:SOURCE_SHA" --commit "$env:SOURCE_SHA" --version "$version" --directory "$env:RUNNER_TEMP/ci-publication" --manifest-sha "$manifestSha" --sterile "$env:RUNNER_TEMP/ci-publish-cargo"
           if ($LASTEXITCODE -ne 0) { throw 'Tokenless publication preflight failed' }
+
+      - name: Verify native model download and offline cache
+        if: ${{ !cancelled() && steps.app_build.outcome == 'success' }}
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
+          cargo +nightly test --lib ranking::model_cache::tests::hosted_native_model_download_verifies_cache_and_reuses_it_offline --locked -- --ignored --exact --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native model download/cache regression failed' }
 
   dependency-security:
     name: dependency-security

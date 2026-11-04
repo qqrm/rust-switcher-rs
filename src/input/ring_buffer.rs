@@ -8,15 +8,20 @@ use std::{
 };
 
 #[cfg(windows)]
+#[path = "layout_decode.rs"]
+mod layout_decode;
+
+#[cfg(all(test, windows))]
+use windows::Win32::UI::Input::KeyboardAndMouse::ToUnicodeEx;
+#[cfg(windows)]
 use windows::Win32::{
     System::SystemInformation::GetTickCount64,
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState, HKL, ToUnicodeEx,
-            VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-            VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NEXT,
-            VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_TAB,
-            VK_UP,
+            GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState, HKL, VIRTUAL_KEY,
+            VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
+            VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NEXT, VK_PRIOR,
+            VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_TAB, VK_UP,
         },
         WindowsAndMessaging::{
             GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
@@ -101,16 +106,12 @@ fn with_journal<R>(f: impl FnOnce(&InputJournal) -> R) -> R {
     f(&guard)
 }
 
-#[cfg(windows)]
-const LANG_ENGLISH_PRIMARY: u16 = 0x09;
-#[cfg(windows)]
-const LANG_RUSSIAN_PRIMARY: u16 = 0x19;
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum LayoutTag {
+    /// Complete Windows layout identity, including variants of the same language.
+    Native(usize),
     Ru,
     En,
-    Other(u16),
     Unknown,
 }
 
@@ -174,6 +175,8 @@ struct InputJournal {
     total_chars: usize,
     caret_from_end: usize,
     last_token_autoconverted: bool,
+    capture_unavailable: bool,
+    pending_dead_key: bool,
     // Shrinking the buffer later cannot make a discarded prefix known again.
     prefix_truncated: bool,
     #[cfg(windows)]
@@ -190,6 +193,8 @@ impl InputJournal {
             total_chars: 0,
             caret_from_end: 0,
             last_token_autoconverted: false,
+            capture_unavailable: false,
+            pending_dead_key: false,
             prefix_truncated: false,
             #[cfg(windows)]
             last_fg_hwnd: 0,
@@ -204,6 +209,8 @@ impl InputJournal {
         self.total_chars = 0;
         self.caret_from_end = 0;
         self.last_token_autoconverted = false;
+        self.capture_unavailable = false;
+        self.pending_dead_key = false;
         self.prefix_truncated = false;
     }
 
@@ -263,7 +270,7 @@ impl InputJournal {
 
     #[cfg(any(test, windows))]
     fn push_text_internal(&mut self, text: &str, layout: LayoutTag, origin: RunOrigin) {
-        if text.is_empty() {
+        if text.is_empty() || self.capture_unavailable {
             return;
         }
 
@@ -436,10 +443,27 @@ impl InputJournal {
     }
 
     #[cfg(windows)]
+    fn accept_decoded_focus(&mut self, captured: FocusCacheKey) -> bool {
+        if self
+            .last_focus_key
+            .is_some_and(|current| same_focus_identity(captured, current))
+        {
+            return true;
+        }
+        // A worker result belongs to the field in which its key was captured.
+        // Do not insert it into a new field after a focus switch during decoding.
+        self.clear();
+        self.capture_unavailable = true;
+        layout_decode::reset();
+        false
+    }
+
+    #[cfg(windows)]
     fn switch_foreground(&mut self, raw: isize, key: Option<FocusCacheKey>, now_ms: u64) {
         if raw == self.last_fg_hwnd && key == self.last_focus_key {
             return;
         }
+        let unknown_window_input = self.last_fg_hwnd == 0 && self.capture_unavailable;
 
         if raw == self.last_fg_hwnd
             && match (self.last_focus_key, key) {
@@ -450,6 +474,14 @@ impl InputJournal {
         {
             self.last_focus_key = key;
             return;
+        }
+
+        // Decoder composition is discarded when keyboard focus changes. Never
+        // restore a cached journal as if its abandoned dead key could resume.
+        if self.pending_dead_key {
+            self.clear();
+            self.capture_unavailable = true;
+            layout_decode::reset();
         }
 
         with_journal_cache_mut(|cache| {
@@ -478,6 +510,10 @@ impl InputJournal {
                 && let Some(cached) = cache.remove(&key)
             {
                 *self = cached.journal;
+                if unknown_window_input {
+                    self.clear();
+                    self.capture_unavailable = true;
+                }
                 self.last_fg_hwnd = raw;
                 self.last_focus_key = Some(key);
                 self.enforce_cap_chars();
@@ -485,6 +521,7 @@ impl InputJournal {
             }
 
             self.clear();
+            self.capture_unavailable = unknown_window_input;
             self.last_fg_hwnd = raw;
             self.last_focus_key = key;
         });
@@ -735,10 +772,7 @@ fn current_focus_cache_key(foreground: windows::Win32::Foundation::HWND) -> Opti
         ..Default::default()
     };
 
-    if unsafe { GetGUIThreadInfo(tid, &mut info) }.is_err()
-        || info.hwndFocus.0.is_null()
-        || info.hwndCaret.0.is_null()
-    {
+    if unsafe { GetGUIThreadInfo(tid, &mut info) }.is_err() || info.hwndFocus.0.is_null() {
         return None;
     }
 
@@ -760,6 +794,7 @@ fn current_focus_cache_key(foreground: windows::Win32::Foundation::HWND) -> Opti
 struct DecodedText {
     text: String,
     layout: LayoutTag,
+    focus: FocusCacheKey,
 }
 
 #[cfg(windows)]
@@ -779,14 +814,12 @@ pub fn layout_tag_from_hkl(hkl: HKL) -> LayoutTag {
         return LayoutTag::Unknown;
     }
 
-    let lang_id = (hkl_raw & 0xFFFF) as u16;
-    let primary = lang_id & 0x03FF;
+    LayoutTag::Native(hkl_raw)
+}
 
-    match primary {
-        LANG_ENGLISH_PRIMARY => LayoutTag::En,
-        LANG_RUSSIAN_PRIMARY => LayoutTag::Ru,
-        _ => LayoutTag::Other(lang_id),
-    }
+#[cfg(windows)]
+pub fn warm_decoder() {
+    let _ = layout_decode::warm();
 }
 
 #[cfg(windows)]
@@ -822,7 +855,12 @@ fn mods_ctrl_or_alt_down() -> bool {
 
 #[cfg(windows)]
 fn is_modifier_vk(vk: VIRTUAL_KEY) -> bool {
-    matches!(vk.0, 0xA0..=0xA5 | 0x5B | 0x5C)
+    matches!(vk.0, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
+}
+
+#[cfg(windows)]
+fn altgr_down() -> bool {
+    key_is_down(VK_RMENU) && !key_is_down(VK_LMENU) && !key_is_down(VK_RCONTROL)
 }
 
 #[cfg(windows)]
@@ -884,7 +922,7 @@ fn current_keyboard_state_overrides() -> KeyboardStateOverrides {
 fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStateOverrides) {
     // LL-hook decoding runs before the target thread's keyboard state is fully reflected in our
     // thread-local `GetKeyboardState` snapshot. Patch in the physical modifier/toggle state that
-    // affects character case before calling `ToUnicodeEx`.
+    // affects character case before interpreting the layout's character tables.
     set_key_down_state(state, VK_SHIFT, overrides.shift_down);
     set_key_down_state(state, VK_LSHIFT, overrides.left_shift_down);
     set_key_down_state(state, VK_RSHIFT, overrides.right_shift_down);
@@ -892,7 +930,7 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
 
     // record_keydown filters physically held Ctrl/Alt shortcuts before decoding printable input.
     // Our thread's snapshot can still contain an old shortcut from a previously focused window.
-    // Leaving those bits set makes ToUnicodeEx return a control character or no character at all.
+    // Leaving those bits set can select a control character or no character at all.
     for vk in [
         VK_CONTROL,
         VK_LCONTROL,
@@ -909,6 +947,7 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
 fn decode_typed_text(kb: &KBDLLHOOKSTRUCT, vk: VIRTUAL_KEY) -> Option<DecodedText> {
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
+        mark_capture_unavailable();
         return None;
     }
 
@@ -916,34 +955,77 @@ fn decode_typed_text(kb: &KBDLLHOOKSTRUCT, vk: VIRTUAL_KEY) -> Option<DecodedTex
     let hkl = unsafe { GetKeyboardLayout(tid) };
     let layout = layout_tag_from_hkl(hkl);
 
+    let Some(focus) = current_focus_cache_key(fg) else {
+        mark_capture_unavailable();
+        return None;
+    };
+
     let mut state = [0u8; 256];
     if unsafe { GetKeyboardState(&mut state) }.is_err() {
+        mark_capture_unavailable();
         return None;
     }
 
     apply_keyboard_state_overrides(&mut state, current_keyboard_state_overrides());
-
-    let mut buf = [0u16; 8];
-    let rc = unsafe { ToUnicodeEx(u32::from(vk.0), kb.scanCode, &state, &mut buf, 0, Some(hkl)) };
-
-    if rc == -1 {
-        let _ =
-            unsafe { ToUnicodeEx(u32::from(vk.0), kb.scanCode, &state, &mut buf, 0, Some(hkl)) };
+    // AltGr is printable input on many layouts. Restore only its *physical*
+    // state after clearing stale Ctrl/Alt bits; ordinary shortcuts stay filtered.
+    if altgr_down() {
+        for modifier in [VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RMENU] {
+            set_key_down_state(&mut state, modifier, true);
+        }
+    }
+    let decoded = layout_decode::decode(
+        u32::from(vk.0),
+        kb.scanCode,
+        state,
+        hkl.0 as usize,
+        (focus.foreground_hwnd as usize, focus.focus_hwnd as usize),
+    );
+    if !with_journal_mut(|journal| {
+        journal.invalidate_if_foreground_changed();
+        journal.accept_decoded_focus(focus)
+    }) {
         return None;
     }
-
-    if rc <= 0 {
-        return None;
+    match decoded {
+        layout_decode::DecodeResult::Text(text) => {
+            if text.chars().any(char::is_control) {
+                invalidate();
+                return None;
+            }
+            with_journal_mut(|journal| journal.pending_dead_key = false);
+            Some(DecodedText {
+                text,
+                layout,
+                focus,
+            })
+        }
+        layout_decode::DecodeResult::PendingDeadKey => {
+            with_journal_mut(|journal| journal.pending_dead_key = true);
+            None
+        }
+        layout_decode::DecodeResult::NoText => {
+            if mods_ctrl_or_alt_down() {
+                invalidate();
+            }
+            None
+        }
+        layout_decode::DecodeResult::Unavailable => {
+            // Do not retain a suffix after an unknown first character: that would
+            // make a later conversion look successful while leaving its prefix.
+            mark_capture_unavailable();
+            None
+        }
     }
+}
 
-    let rc = usize::try_from(rc).ok()?;
-    let s = String::from_utf16_lossy(&buf[..rc]);
-
-    if s.chars().any(char::is_control) {
-        return None;
-    }
-
-    Some(DecodedText { text: s, layout })
+#[cfg(windows)]
+fn mark_capture_unavailable() {
+    layout_decode::reset();
+    with_journal_mut(|journal| {
+        journal.clear();
+        journal.capture_unavailable = true;
+    });
 }
 
 #[cfg(windows)]
@@ -954,6 +1036,10 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
 
     let vk_u16 = u16::try_from(vk).ok()?;
     let vk = VIRTUAL_KEY(vk_u16);
+    if is_modifier_vk(vk) {
+        return None;
+    }
+    with_journal_mut(InputJournal::invalidate_if_foreground_changed);
 
     enum JournalAction {
         Clear,
@@ -970,6 +1056,7 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
 
     let mut action: Option<JournalAction> = None;
     let mut output: Option<String> = None;
+    let mut decoded_focus = None;
 
     match vk {
         VK_ESCAPE | VK_DELETE | VK_INSERT | VK_UP | VK_DOWN | VK_HOME | VK_PRIOR | VK_NEXT
@@ -992,12 +1079,13 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
         _ => {}
     }
 
-    if should_clear_for_ctrl_alt_combo(vk, mods_ctrl_or_alt_down()) {
+    if should_clear_for_ctrl_alt_combo(vk, mods_ctrl_or_alt_down() && !altgr_down()) {
         action = Some(JournalAction::Clear);
     }
 
     if action.is_none() {
         let decoded = decode_typed_text(kb, vk)?;
+        decoded_focus = Some(decoded.focus);
         output = Some(decoded.text.clone());
         action = Some(JournalAction::PushText {
             text: decoded.text,
@@ -1008,10 +1096,39 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
 
     with_journal_mut(|j| {
         j.invalidate_if_foreground_changed();
+        if let Some(focus) = decoded_focus
+            && !j.accept_decoded_focus(focus)
+        {
+            output = None;
+            return;
+        }
         if let Some(action) = action {
+            if j.pending_dead_key
+                && matches!(
+                    &action,
+                    JournalAction::MoveCaretLeft
+                        | JournalAction::MoveCaretRight
+                        | JournalAction::MoveCaretEnd
+                )
+            {
+                j.clear();
+                j.capture_unavailable = true;
+                layout_decode::reset();
+                return;
+            }
             match action {
-                JournalAction::Clear => j.clear(),
-                JournalAction::Backspace => j.backspace(),
+                JournalAction::Clear => {
+                    j.clear();
+                    layout_decode::reset();
+                }
+                JournalAction::Backspace => {
+                    if j.pending_dead_key {
+                        j.pending_dead_key = false;
+                        layout_decode::reset();
+                    } else {
+                        j.backspace();
+                    }
+                }
                 JournalAction::MoveCaretLeft => j.move_caret_left(),
                 JournalAction::MoveCaretRight => j.move_caret_right(),
                 JournalAction::MoveCaretEnd => j.move_caret_end(),
@@ -1020,6 +1137,10 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
                     layout,
                     origin,
                 } => {
+                    if text.contains('\n') {
+                        j.clear();
+                        layout_decode::reset();
+                    }
                     if text.chars().any(char::is_alphanumeric) {
                         j.last_token_autoconverted = false;
                     }
@@ -1038,6 +1159,9 @@ pub fn take_last_layout_run_with_suffix() -> Option<(InputRun, Vec<InputRun>)> {
         #[cfg(windows)]
         if j.last_fg_hwnd != 0 {
             j.invalidate_if_foreground_changed();
+        }
+        if j.pending_dead_key || j.capture_unavailable {
+            return None;
         }
         j.take_last_layout_run_with_suffix()
     })
@@ -1061,6 +1185,9 @@ pub fn take_last_sequence_with_suffix() -> Option<(Vec<InputRun>, Vec<InputRun>)
         #[cfg(windows)]
         if j.last_fg_hwnd != 0 {
             j.invalidate_if_foreground_changed();
+        }
+        if j.pending_dead_key || j.capture_unavailable {
+            return None;
         }
         j.take_last_sequence_with_suffix()
     })
@@ -1109,6 +1236,8 @@ pub fn runs_snapshot() -> Vec<InputRun> {
 
 #[cfg(any(test, windows))]
 pub fn invalidate() {
+    #[cfg(windows)]
+    layout_decode::reset();
     with_journal_mut(|j| {
         j.clear();
         #[cfg(windows)]
@@ -1350,9 +1479,17 @@ mod tests {
     }
 
     fn load_native_test_layout(name: PCWSTR) -> HKL {
+        let _guard = test_guard();
         // No activation flag: decoding uses this explicit layout without requiring foreground focus.
-        unsafe { LoadKeyboardLayoutW(name, Default::default()) }
-            .expect("the native test keyboard layout must load")
+        let layout = unsafe { LoadKeyboardLayoutW(name, Default::default()) }
+            .expect("the native test keyboard layout must load");
+        // Match startup preparation before the hook is installed. No keystroke
+        // is consumed here: the following assertion still checks the first one.
+        assert!(
+            layout_decode::prepare_layout(layout.0 as usize),
+            "the native test layout must be prepared before input capture"
+        );
+        layout
     }
 
     fn native_text_after_overrides(
@@ -1361,6 +1498,7 @@ mod tests {
         stale_keys: &[VIRTUAL_KEY],
         overrides: KeyboardStateOverrides,
     ) -> String {
+        let _guard = test_guard();
         let mut state = [0u8; 256];
         for key in stale_keys {
             state[usize::from(key.0)] = 0x80;
@@ -1373,7 +1511,14 @@ mod tests {
         let count =
             unsafe { ToUnicodeEx(u32::from(vk.0), scan, &state, &mut buf, 0, Some(layout)) };
         let count = usize::try_from(count).expect("the test keys must not be dead keys");
-        String::from_utf16(&buf[..count]).expect("native decoding must produce valid UTF-16")
+        let native_text =
+            String::from_utf16(&buf[..count]).expect("native decoding must produce valid UTF-16");
+        assert_eq!(
+            layout_decode::decode_probe(u32::from(vk.0), scan, state, layout.0 as usize, (1, 1)),
+            layout_decode::DecodeResult::Text(native_text.clone()),
+            "the production decoder must agree with the native first-character oracle"
+        );
+        native_text
     }
 
     fn assert_native_character_ignores_stale_shortcuts(
@@ -1411,6 +1556,54 @@ mod tests {
             mismatches.is_empty(),
             "released physical modifiers must override stale thread state: {mismatches:?}"
         );
+    }
+
+    #[test]
+    fn native_input_unavailable_first_key_never_exposes_known_suffix() {
+        let _guard = test_guard();
+        for suffix in ["hbdtn", "ghbdtn", "."] {
+            invalidate();
+            mark_capture_unavailable();
+
+            // Later successful decoding must not turn an unknown first glyph
+            // into a seemingly complete, convertible suffix.
+            with_journal_mut(|journal| {
+                journal.push_text_internal(suffix, LayoutTag::En, RunOrigin::Physical);
+            });
+            assert!(runs_snapshot().is_empty());
+            assert!(take_last_layout_run_with_suffix().is_none());
+            assert!(take_last_sequence_with_suffix().is_none());
+
+            // Restoring an older snapshot cannot bypass the conversion guard.
+            push_run(test_run(suffix, LayoutTag::En));
+            assert!(take_last_layout_run_with_suffix().is_none());
+            assert!(take_last_sequence_with_suffix().is_none());
+        }
+        invalidate();
+    }
+
+    #[test]
+    fn native_input_unavailable_capture_recovers_after_explicit_invalidation() {
+        let _guard = test_guard();
+        invalidate();
+        mark_capture_unavailable();
+        with_journal_mut(|journal| {
+            journal.push_text_internal("hbdtn", LayoutTag::En, RunOrigin::Physical);
+        });
+        assert!(take_last_sequence_with_suffix().is_none());
+
+        invalidate();
+        with_journal_mut(|journal| {
+            journal.push_text_internal(".ghbdtn", LayoutTag::En, RunOrigin::Physical);
+        });
+        let (runs, suffix) = take_last_sequence_with_suffix()
+            .expect("a new capture session should contain the complete new text");
+        assert!(suffix.is_empty());
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            ".ghbdtn"
+        );
+        invalidate();
     }
 
     #[test]
@@ -1816,6 +2009,65 @@ mod tests {
             runs.iter().map(|run| run.text.as_str()).collect::<String>()
         });
         assert_eq!(text, ".ghbdtn");
+    }
+
+    #[test]
+    fn native_input_unknown_first_target_never_exposes_a_later_suffix() {
+        let _guard = test_guard();
+        invalidate();
+        clear_foreground_cache_for_test();
+        test_switch_foreground_without_signature(0, 1_000);
+        mark_capture_unavailable();
+        test_switch_foreground_control(1001, 11, 21, 10, 1_001);
+        with_journal_mut(|journal| {
+            assert!(journal.capture_unavailable);
+            journal.push_text_internal("hbdtn", LayoutTag::En, RunOrigin::Physical);
+            assert!(journal.runs.is_empty());
+        });
+    }
+
+    #[test]
+    fn native_input_worker_result_keeps_caret_changes_but_rejects_another_field() {
+        let _guard = test_guard();
+        invalidate();
+        clear_foreground_cache_for_test();
+        test_switch_foreground_control(1001, 11, 21, 10, 1_000);
+        let captured = with_journal(|journal| journal.last_focus_key.unwrap());
+        push_run(test_run("g", LayoutTag::En));
+        test_switch_foreground_control(1001, 11, 22, 20, 1_001);
+        assert!(with_journal_mut(
+            |journal| journal.accept_decoded_focus(captured)
+        ));
+        assert_eq!(runs_snapshot()[0].text, "g");
+
+        test_switch_foreground_control(1001, 12, 22, 20, 1_002);
+        assert!(!with_journal_mut(
+            |journal| journal.accept_decoded_focus(captured)
+        ));
+        with_journal_mut(|journal| {
+            assert!(journal.capture_unavailable);
+            journal.push_text_internal("hbdtn", LayoutTag::En, RunOrigin::Physical);
+            assert!(journal.runs.is_empty());
+        });
+    }
+
+    #[test]
+    fn native_input_focus_cache_does_not_resume_abandoned_dead_key() {
+        let _guard = test_guard();
+        invalidate();
+        clear_foreground_cache_for_test();
+        test_switch_foreground_control(1001, 11, 21, 10, 1_000);
+        push_run(test_run("prefix", LayoutTag::En));
+        with_journal_mut(|journal| journal.pending_dead_key = true);
+        test_switch_foreground_control(2002, 12, 22, 10, 1_001);
+        push_run(test_run("other", LayoutTag::En));
+        test_switch_foreground_control(1001, 11, 21, 10, 1_002);
+        with_journal_mut(|journal| {
+            assert!(!journal.pending_dead_key);
+            assert!(journal.capture_unavailable);
+            journal.push_text_internal("e", LayoutTag::En, RunOrigin::Physical);
+            assert!(journal.runs.is_empty());
+        });
     }
 
     #[test]

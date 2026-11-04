@@ -28,6 +28,11 @@ jobs:
           components: rustfmt
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Read installed keyboard tables without changing the active layout
+        shell: pwsh
+        run: |
+          cargo +nightly test --lib native_layout_library_ --locked -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native keyboard table loading failed' }
       - name: Decode first characters through native Windows APIs
         shell: pwsh
         run: |
@@ -38,6 +43,11 @@ jobs:
           }
           cargo +nightly test --locked --bin rust-switcher native_input_ -- --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native input regression tests failed' }
+      - name: Decode dead keys without consuming another editor's pending accent
+        shell: pwsh
+        run: |
+          cargo +nightly test --lib native_decoder_ --locked -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native composition isolation regression failed' }
       - name: Keep the first glyph across caret recreation and isolate focus changes
         shell: pwsh
         run: |

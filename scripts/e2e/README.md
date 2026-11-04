@@ -51,10 +51,11 @@ rows without a hosted assertion remain coverage gaps even when CI is green.
 
 The dedicated **Windows Input Regression** workflow runs the
 `native_input_` regression tests on a Windows runner, separately from the larger
-GUI suite. The decoding cases call the real Win32 `ToUnicodeEx` API with a controlled stale
-modifier snapshot on the first character, then feed decoded input through the
-journal. This makes normalization defects reproducible without asking anyone to
-type on a working desktop. The group also verifies the 4096-character capacity,
+GUI suite. The decoding cases compare the production decoder with the real Win32
+`ToUnicodeEx` API using a controlled stale modifier snapshot on the first character,
+then feed decoded input through the journal. This makes normalization defects
+reproducible without asking anyone to type on a working desktop. The group also
+verifies the 4096-character capacity,
 rejection of truncated prefixes, and recovery after clearing the journal.
 A controlled native-API reproduction establishes the tested
 decoder behavior; it does not establish that a particular Telegram window
@@ -123,6 +124,37 @@ The separate focus unit regressions reproduce a caret-owner change under
 unchanged keyboard focus after the first glyph, and assert that changing the
 focused control still starts a separate journal. This tests the state transition
 directly; browser results establish which transitions occurred on that runner.
+
+### Installed layouts and language models
+
+`initialize-layouts.ps1 -Mode All` prepares an exact seven-layout catalog on the
+disposable hosted desktop: US English, US International, Russian, Ukrainian,
+German, French, and Polish. The script verifies the live catalog while its own
+window has focus. It changes the test user's Windows language settings and is
+guarded against use on a working desktop. `-Mode Pair` restores EN/RU before
+the existing application and browser scenarios.
+
+The mandatory CI step explicitly runs the ignored `native_planner_` integration
+tests against that complete catalog. These cover language ranking, ambiguity,
+valid-text preservation, full layout identities, repeated conversion, mixed
+language runs, and dead-key composition that consumes a space. A separate
+guarded test adds and removes Swedish after the provider starts and verifies
+that a removed layout cannot remain a target through its cached table. Ordinary
+developer test runs do not require changing the user's installed language list.
+
+The public-provider gate also compares the pure keyboard-table interpreter with
+the native `ToUnicodeEx` API across all seven layouts: 49 printable key positions
+and eight Shift/Caps Lock/AltGr states give 2,744 initial combinations. Every
+discovered dead-key stroke is paired with every printable stroke and followed
+by neutral probes to check remaining composition state. These guarded oracle
+calls run only in the disposable test process; production decoding uses owned
+driver tables and never calls the stateful translation API.
+
+The native model-download test calls the production WinHTTP path for a pinned
+German model, verifies its size and SHA-256, and then proves that the temporary
+cache loads without another download. The other model tests use published model
+fixtures locally, including integrity checks for all 75 catalog entries. These
+fixtures are development dependencies; release builds bundle only EN/RU models.
 
 ## Existing Windows Sandbox scenario
 

@@ -1,0 +1,8 @@
+# ISO 639-3 identifiers in the immutable language-model manifest are not prose.
+[type.model-catalog]
+extend-glob = ["model_catalog.rs"]
+
+[type.model-catalog.extend-words]
+som = "som"
+tha = "tha"
+yor = "yor"

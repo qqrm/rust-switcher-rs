@@ -19,10 +19,12 @@ rust-switcher-core = { version = "1.0.23", path = "crates/rust-switcher-core" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1.6"
 tempfile = "3.27"
-lingua = { version = "1.8", default-features = false, features = [
-    "english",
-    "russian",
-] }
+lingua = { version = "1.8", default-features = false, features = ["english", "russian"] }
+# The ranker uses EN/RU locally and verifies on-demand language model packs.
+fst = "0.4.7"
+sha2 = "0.10"
+lingua-english-language-model = "=1.3.0"
+lingua-russian-language-model = "=1.3.0"
 tracing = { version = "0.1", features = ["release_max_level_off"] }
 tracing-subscriber = { version = "0.3", features = [
     "fmt",
@@ -47,13 +49,18 @@ required-features = ["debug-binary"]
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Networking_WinHttp",
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Ime",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
     "Win32_System_SystemServices",
     "Win32_System_LibraryLoader",
     "Win32_Security",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_WinTrust",
     "Win32_UI_Shell",
     "Win32_UI_Controls",
     "Win32_System_DataExchange",
@@ -85,6 +92,80 @@ debug = 0
 incremental = false
 
 [dev-dependencies]
+# Offline fixtures validate every downloadable model against its pinned manifest.
+lingua-afrikaans-language-model = "=1.3.0"
+lingua-albanian-language-model = "=1.3.0"
+lingua-arabic-language-model = "=1.3.0"
+lingua-armenian-language-model = "=1.3.0"
+lingua-azerbaijani-language-model = "=1.3.0"
+lingua-basque-language-model = "=1.3.0"
+lingua-belarusian-language-model = "=1.3.0"
+lingua-bengali-language-model = "=1.3.0"
+lingua-bokmal-language-model = "=1.3.0"
+lingua-bosnian-language-model = "=1.3.0"
+lingua-bulgarian-language-model = "=1.3.0"
+lingua-catalan-language-model = "=1.3.0"
+lingua-chinese-language-model = "=1.3.0"
+lingua-croatian-language-model = "=1.3.0"
+lingua-czech-language-model = "=1.3.0"
+lingua-danish-language-model = "=1.3.0"
+lingua-dutch-language-model = "=1.3.0"
+lingua-esperanto-language-model = "=1.3.0"
+lingua-estonian-language-model = "=1.3.0"
+lingua-finnish-language-model = "=1.3.0"
+lingua-french-language-model = "=1.3.0"
+lingua-ganda-language-model = "=1.3.0"
+lingua-georgian-language-model = "=1.3.0"
+lingua-german-language-model = "=1.3.0"
+lingua-greek-language-model = "=1.3.0"
+lingua-gujarati-language-model = "=1.3.0"
+lingua-hebrew-language-model = "=1.3.0"
+lingua-hindi-language-model = "=1.3.0"
+lingua-hungarian-language-model = "=1.3.0"
+lingua-icelandic-language-model = "=1.3.0"
+lingua-indonesian-language-model = "=1.3.0"
+lingua-irish-language-model = "=1.3.0"
+lingua-italian-language-model = "=1.3.0"
+lingua-japanese-language-model = "=1.3.0"
+lingua-kazakh-language-model = "=1.3.0"
+lingua-korean-language-model = "=1.3.0"
+lingua-latin-language-model = "=1.3.0"
+lingua-latvian-language-model = "=1.3.0"
+lingua-lithuanian-language-model = "=1.3.0"
+lingua-macedonian-language-model = "=1.3.0"
+lingua-malay-language-model = "=1.3.0"
+lingua-maori-language-model = "=1.3.0"
+lingua-marathi-language-model = "=1.3.0"
+lingua-mongolian-language-model = "=1.3.0"
+lingua-nynorsk-language-model = "=1.3.0"
+lingua-persian-language-model = "=1.3.0"
+lingua-polish-language-model = "=1.3.0"
+lingua-portuguese-language-model = "=1.3.0"
+lingua-punjabi-language-model = "=1.3.0"
+lingua-romanian-language-model = "=1.3.0"
+lingua-serbian-language-model = "=1.3.0"
+lingua-shona-language-model = "=1.3.0"
+lingua-slovak-language-model = "=1.3.0"
+lingua-slovene-language-model = "=1.3.0"
+lingua-somali-language-model = "=1.3.0"
+lingua-sotho-language-model = "=1.3.0"
+lingua-spanish-language-model = "=1.3.0"
+lingua-swahili-language-model = "=1.3.0"
+lingua-swedish-language-model = "=1.3.0"
+lingua-tagalog-language-model = "=1.3.0"
+lingua-tamil-language-model = "=1.3.0"
+lingua-telugu-language-model = "=1.3.0"
+lingua-thai-language-model = "=1.3.0"
+lingua-tsonga-language-model = "=1.3.0"
+lingua-tswana-language-model = "=1.3.0"
+lingua-turkish-language-model = "=1.3.0"
+lingua-ukrainian-language-model = "=1.3.0"
+lingua-urdu-language-model = "=1.3.0"
+lingua-vietnamese-language-model = "=1.3.0"
+lingua-welsh-language-model = "=1.3.0"
+lingua-xhosa-language-model = "=1.3.0"
+lingua-yoruba-language-model = "=1.3.0"
+lingua-zulu-language-model = "=1.3.0"
 tracing-test = "0.2.6"
 
 [package.metadata.binstall]
