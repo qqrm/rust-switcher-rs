@@ -7,6 +7,7 @@ mod e2e_scope;
 pub(crate) mod isolated_env;
 mod keydown;
 mod keyup;
+mod menu_mask;
 pub(crate) mod mods;
 pub(crate) mod sequence;
 pub(crate) mod vk;
@@ -19,8 +20,8 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::SystemInformation::GetTickCount64,
     UI::WindowsAndMessaging::{
-        CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, PostMessageW, SetWindowsHookExW,
-        WH_KEYBOARD_LL,
+        CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, PostMessageW,
+        SetWindowsHookExW, WH_KEYBOARD_LL,
     },
 };
 
@@ -32,6 +33,14 @@ use crate::{
 
 static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Marks input emitted by Switcher so it cannot capture its own replacements or
+/// advance a shortcut while releasing modifiers. Fits both 32-bit and 64-bit Windows.
+pub(crate) const OWN_INPUT_MARKER: usize = 0x5253_5749;
+
+fn is_own_input(kb: &KBDLLHOOKSTRUCT) -> bool {
+    kb.flags.contains(LLKHF_INJECTED) && kb.dwExtraInfo == OWN_INPUT_MARKER
+}
 
 fn now_tick_ms() -> u64 {
     unsafe { GetTickCount64() }
@@ -129,6 +138,11 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     };
 
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    // This must precede shortcut handling, not just the journal's injected-input
+    // filter. Debug E2E deliberately admits other injected input as test typing.
+    if is_own_input(kb) {
+        return unsafe { CallNextHookEx(hook, code, wparam, lparam) };
+    }
     let vk = normalize_vk(kb);
     let is_mod = mod_bit_for_vk(vk).is_some();
 
@@ -169,6 +183,18 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     }
 
     match decision {
+        Ok(HookDecision::Swallow) if is_keyup && matches!(vk, 0xA4 | 0xA5) => {
+            // Alt-down already reached the target. Pass its matching release so
+            // Windows cannot retain a stuck modifier, but first make it a used
+            // Alt press so a consumed tap does not focus the application's menu.
+            if let Err(e) = menu_mask::send()
+                && let Some(hwnd) = main_hwnd()
+            {
+                super::with_state_mut_do(hwnd, |state| {
+                    report_hook_error(hwnd, state, &e);
+                });
+            }
+        }
         Ok(d) if d.should_swallow() && !(is_mod && is_keyup) => return LRESULT(1),
         Ok(_) => {}
         Err(e) => {
@@ -220,6 +246,21 @@ mod tests {
 
     fn hwnd(raw: isize) -> HWND {
         HWND(raw as *mut _)
+    }
+
+    #[test]
+    fn own_injected_input_is_distinct_from_physical_and_test_input() {
+        let mut kb = KBDLLHOOKSTRUCT {
+            flags: LLKHF_INJECTED,
+            dwExtraInfo: OWN_INPUT_MARKER,
+            ..Default::default()
+        };
+        assert!(is_own_input(&kb));
+        kb.dwExtraInfo = 0;
+        assert!(!is_own_input(&kb));
+        kb.dwExtraInfo = OWN_INPUT_MARKER;
+        kb.flags = Default::default();
+        assert!(!is_own_input(&kb));
     }
 
     #[test]

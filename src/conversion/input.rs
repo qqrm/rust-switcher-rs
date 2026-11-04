@@ -40,7 +40,7 @@ fn unicode_events(text: &str) -> Vec<INPUT> {
                         KEYEVENTF_UNICODE
                     },
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: crate::platform::win::keyboard::OWN_INPUT_MARKER,
                 },
             },
         }
@@ -71,7 +71,7 @@ fn key_event(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
                     KEYBD_EVENT_FLAGS::default()
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: crate::platform::win::keyboard::OWN_INPUT_MARKER,
             },
         },
     }

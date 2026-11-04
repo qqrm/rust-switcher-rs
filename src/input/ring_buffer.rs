@@ -463,6 +463,7 @@ impl InputJournal {
         if raw == self.last_fg_hwnd && key == self.last_focus_key {
             return;
         }
+        let unknown_window_input = self.last_fg_hwnd == 0 && self.capture_unavailable;
 
         if raw == self.last_fg_hwnd
             && match (self.last_focus_key, key) {
@@ -509,6 +510,10 @@ impl InputJournal {
                 && let Some(cached) = cache.remove(&key)
             {
                 *self = cached.journal;
+                if unknown_window_input {
+                    self.clear();
+                    self.capture_unavailable = true;
+                }
                 self.last_fg_hwnd = raw;
                 self.last_focus_key = Some(key);
                 self.enforce_cap_chars();
@@ -516,6 +521,7 @@ impl InputJournal {
             }
 
             self.clear();
+            self.capture_unavailable = unknown_window_input;
             self.last_fg_hwnd = raw;
             self.last_focus_key = key;
         });
@@ -941,6 +947,7 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
 fn decode_typed_text(kb: &KBDLLHOOKSTRUCT, vk: VIRTUAL_KEY) -> Option<DecodedText> {
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
+        mark_capture_unavailable();
         return None;
     }
 
@@ -1981,6 +1988,21 @@ mod tests {
             runs.iter().map(|run| run.text.as_str()).collect::<String>()
         });
         assert_eq!(text, ".ghbdtn");
+    }
+
+    #[test]
+    fn native_input_unknown_first_target_never_exposes_a_later_suffix() {
+        let _guard = test_guard();
+        invalidate();
+        clear_foreground_cache_for_test();
+        test_switch_foreground_without_signature(0, 1_000);
+        mark_capture_unavailable();
+        test_switch_foreground_control(1001, 11, 21, 10, 1_001);
+        with_journal_mut(|journal| {
+            assert!(journal.capture_unavailable);
+            journal.push_text_internal("hbdtn", LayoutTag::En, RunOrigin::Physical);
+            assert!(journal.runs.is_empty());
+        });
     }
 
     #[test]

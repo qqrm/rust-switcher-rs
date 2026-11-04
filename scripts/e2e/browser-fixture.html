@@ -15,6 +15,19 @@
   'use strict';
   document.title += location.hash === '#second' ? ' B' : ' A';
   let fields = {};
+  const events = [];
+
+  function observe(doc) {
+    for (const type of ['keydown', 'keyup', 'focusin', 'focusout']) {
+      doc.addEventListener(type, event => {
+        events.push({type, key: event.key ?? '', code: event.code ?? '',
+          alt: event.altKey ?? false, ctrl: event.ctrlKey ?? false,
+          target: event.target.id ?? '', focused: doc.hasFocus()});
+        if (events.length > 24) events.shift();
+      }, {capture: true, passive: true});
+    }
+  }
+  observe(document);
 
   function read(element) {
     return element.isContentEditable ? element.textContent : element.value;
@@ -46,6 +59,7 @@
       const root = document.getElementById('editors');
       root.replaceChildren();
       fields = {};
+      events.length = 0;
       for (const id of ['a', 'b', 'guard']) {
         let host = root;
         let doc = document;
@@ -66,6 +80,7 @@
           doc.open();
           doc.write('<!doctype html><meta charset="utf-8"><style>body{margin:8px}textarea{box-sizing:border-box;width:100%;height:100px;font:22px system-ui}</style>');
           doc.close();
+          observe(doc);
           host = doc.body;
           editorKind = 'textarea';
         }
@@ -91,16 +106,34 @@
       return deepActive() === element && document.hasFocus();
     },
     focused(id) { return deepActive() === fields[id] && document.hasFocus(); },
+    diagnostics() {
+      const active = deepActive();
+      return {documentFocused: document.hasFocus(), activeId: active?.id ?? '',
+        activeTag: active?.tagName ?? '',
+        field: Object.entries(fields).find(([, element]) => element === active)?.[0] ?? null,
+        events: [...events]};
+    },
     values() { return Object.fromEntries(Object.entries(fields).map(([id, element]) => [id, read(element)])); },
     point(id) {
       const element = fields[id];
+      for (let view = element.ownerDocument.defaultView; view !== window; view = view.parent) {
+        view.frameElement.scrollIntoView({block: 'center'});
+      }
       element.scrollIntoView({block: 'center'});
       const rect = element.getBoundingClientRect();
-      // Click cases use top-level editors. Large inset targets tolerate the
-      // small non-client border included in outerHeight - innerHeight.
+      let left = rect.left;
+      let top = rect.top;
+      for (let view = element.ownerDocument.defaultView; view !== window; view = view.parent) {
+        const frame = view.frameElement;
+        const frameRect = frame.getBoundingClientRect();
+        left += frameRect.left + frame.clientLeft;
+        top += frameRect.top + frame.clientTop;
+      }
+      // Large inset targets tolerate the small non-client border included in
+      // outerHeight - innerHeight. Iframe coordinates are relative to the page.
       return {
-        x: Math.round((screenX + (outerWidth - innerWidth) / 2 + rect.left + rect.width / 2) * devicePixelRatio),
-        y: Math.round((screenY + outerHeight - innerHeight + rect.top + rect.height / 2) * devicePixelRatio)
+        x: Math.round((screenX + (outerWidth - innerWidth) / 2 + left + rect.width / 2) * devicePixelRatio),
+        y: Math.round((screenY + outerHeight - innerHeight + top + rect.height / 2) * devicePixelRatio)
       };
     }
   };

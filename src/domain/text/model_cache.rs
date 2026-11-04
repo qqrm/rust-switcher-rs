@@ -219,7 +219,7 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
 
     use windows::{
         Win32::Networking::WinHttp::{
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+            ERROR_WINHTTP_TIMEOUT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
             WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2, WINHTTP_OPTION_REDIRECT_POLICY,
             WINHTTP_OPTION_REDIRECT_POLICY_NEVER, WINHTTP_OPTION_SECURE_PROTOCOLS,
             WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle,
@@ -234,9 +234,9 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
     struct Handle(*mut c_void);
 
     impl Handle {
-        fn new(value: *mut c_void) -> io::Result<Self> {
+        fn new(value: *mut c_void) -> windows::core::Result<Self> {
             if value.is_null() {
-                Err(io::Error::last_os_error())
+                Err(windows::core::Error::from_thread())
             } else {
                 Ok(Self(value))
             }
@@ -249,12 +249,19 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
         }
     }
 
-    fn windows_error(error: windows::core::Error) -> io::Error {
-        io::Error::other(error.to_string())
-    }
-
     validate_size(spec)?;
     let started = Instant::now();
+    let windows_error = |operation: &str, error: windows::core::Error| {
+        let kind = if error.code() == windows::core::HRESULT::from_win32(ERROR_WINHTTP_TIMEOUT) {
+            io::ErrorKind::TimedOut
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(
+            kind,
+            format!("{operation} after {:?}: {error}", started.elapsed()),
+        )
+    };
     let agent: Vec<u16> = concat!("RustSwitcher/", env!("CARGO_PKG_VERSION"))
         .encode_utf16()
         .chain(Some(0))
@@ -270,9 +277,13 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
             PCWSTR::null(),
             0,
         )
-    })?;
+    })
+    .map_err(|error| windows_error("WinHttpOpen", error))?;
+    #[cfg(test)]
+    install_network_diagnostics(session.0)
+        .map_err(|error| windows_error("WinHttpSetStatusCallback", error))?;
     unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 10_000) }
-        .map_err(windows_error)?;
+        .map_err(|error| windows_error("WinHttpSetTimeouts", error))?;
     let protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2.to_ne_bytes();
     unsafe {
         WinHttpSetOption(
@@ -281,10 +292,11 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
             Some(&protocols),
         )
     }
-    .map_err(windows_error)?;
+    .map_err(|error| windows_error("WinHttpSetOption(TLS)", error))?;
 
     let connection =
-        Handle::new(unsafe { WinHttpConnect(session.0, PCWSTR(host.as_ptr()), 443, 0) })?;
+        Handle::new(unsafe { WinHttpConnect(session.0, PCWSTR(host.as_ptr()), 443, 0) })
+            .map_err(|error| windows_error("WinHttpConnect", error))?;
     let request = Handle::new(unsafe {
         WinHttpOpenRequest(
             connection.0,
@@ -295,7 +307,8 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
             ptr::null(),
             WINHTTP_FLAG_SECURE,
         )
-    })?;
+    })
+    .map_err(|error| windows_error("WinHttpOpenRequest", error))?;
     let redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER.to_ne_bytes();
     unsafe {
         WinHttpSetOption(
@@ -304,9 +317,11 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
             Some(&redirect_policy),
         )
     }
-    .map_err(windows_error)?;
-    unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }.map_err(windows_error)?;
-    unsafe { WinHttpReceiveResponse(request.0, ptr::null_mut()) }.map_err(windows_error)?;
+    .map_err(|error| windows_error("WinHttpSetOption(redirect policy)", error))?;
+    unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }
+        .map_err(|error| windows_error("WinHttpSendRequest", error))?;
+    unsafe { WinHttpReceiveResponse(request.0, ptr::null_mut()) }
+        .map_err(|error| windows_error("WinHttpReceiveResponse", error))?;
     let mut status = 0u32;
     let mut status_len = size_of::<u32>() as u32;
     unsafe {
@@ -319,7 +334,7 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
             ptr::null_mut(),
         )
     }
-    .map_err(windows_error)?;
+    .map_err(|error| windows_error("WinHttpQueryHeaders(status)", error))?;
     if status != 200 {
         return Err(io::Error::other(format!(
             "model server returned HTTP {status}"
@@ -344,7 +359,7 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
                 &mut received,
             )
         }
-        .map_err(windows_error)?;
+        .map_err(|error| windows_error("WinHttpReadData", error))?;
         if received == 0 {
             break;
         }
@@ -356,6 +371,60 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
     }
     verify_payload(spec, &bytes)?;
     Ok(bytes)
+}
+
+// Hosted native tests need the phase of a transport failure, without logging
+// proxy addresses, request headers, response bodies, or any user text. No
+// callback or stderr output is installed in production builds.
+#[cfg(all(windows, test))]
+fn install_network_diagnostics(handle: *mut std::ffi::c_void) -> windows::core::Result<()> {
+    use windows::Win32::Networking::WinHttp::{
+        WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER,
+        WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER, WINHTTP_CALLBACK_STATUS_DETECTING_PROXY,
+        WINHTTP_CALLBACK_STATUS_NAME_RESOLVED, WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE,
+        WINHTTP_CALLBACK_STATUS_REQUEST_SENT, WINHTTP_CALLBACK_STATUS_RESOLVING_NAME,
+        WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED, WINHTTP_CALLBACK_STATUS_SECURE_FAILURE,
+        WINHTTP_CALLBACK_STATUS_SENDING_REQUEST, WinHttpSetStatusCallback,
+    };
+
+    unsafe extern "system" fn callback(
+        _handle: *mut std::ffi::c_void,
+        _context: usize,
+        status: u32,
+        _information: *mut std::ffi::c_void,
+        _information_len: u32,
+    ) {
+        let phase = match status {
+            WINHTTP_CALLBACK_STATUS_DETECTING_PROXY => "detecting proxy",
+            WINHTTP_CALLBACK_STATUS_RESOLVING_NAME => "resolving name",
+            WINHTTP_CALLBACK_STATUS_NAME_RESOLVED => "name resolved",
+            WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER => "connecting to server",
+            WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER => "connected to server",
+            WINHTTP_CALLBACK_STATUS_SENDING_REQUEST => "sending request",
+            WINHTTP_CALLBACK_STATUS_REQUEST_SENT => "request sent",
+            WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE => "receiving response",
+            WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED => "response received",
+            WINHTTP_CALLBACK_STATUS_SECURE_FAILURE => "secure connection failed",
+            _ => return,
+        };
+        // Writing must not panic across the FFI callback boundary.
+        let _ = writeln!(io::stderr(), "WinHTTP model download: {phase}");
+    }
+
+    let previous = unsafe {
+        WinHttpSetStatusCallback(
+            handle,
+            Some(callback),
+            WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS,
+            0,
+        )
+    };
+    // WINHTTP_INVALID_STATUS_CALLBACK is the pointer-sized -1 sentinel.
+    if previous.is_some_and(|callback| callback as usize == usize::MAX) {
+        Err(windows::core::Error::from_thread())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]

@@ -38,6 +38,11 @@ jobs:
           }
           cargo +nightly test --locked --bin rust-switcher native_input_ -- --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native input regression tests failed' }
+      - name: Decode dead keys without consuming another editor's pending accent
+        shell: pwsh
+        run: |
+          cargo +nightly test --lib native_decoder_ --locked -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native composition isolation regression failed' }
       - name: Keep the first glyph across caret recreation and isolate focus changes
         shell: pwsh
         run: |

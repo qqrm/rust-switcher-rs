@@ -102,25 +102,19 @@ jobs:
       - name: Cargo clippy
         run: cargo +nightly clippy --all-targets --all-features -- -D warnings
       - name: Cargo build (debug-tracing)
+        id: app_build
         run: cargo +nightly build --features debug-tracing
       - name: Install cargo-nextest
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest
           fallback: none
-      - name: Verify native model download and offline cache
-        shell: pwsh
-        env:
-          RUST_SWITCHER_HOSTED_E2E: '1'
-        run: |
-          cargo +nightly test --lib ranking::model_cache::tests::hosted_native_model_download_verifies_cache_and_reuses_it_offline --locked -- --ignored --exact --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw 'Native model download/cache regression failed' }
       - name: Cargo nextest --locked
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: |
           ./scripts/e2e/initialize-layouts.ps1 -Mode All
-          cargo +nightly nextest run --locked
+          cargo +nightly nextest run --locked --no-fail-fast
           if ($LASTEXITCODE -ne 0) { throw 'Windows unit tests failed' }
       - name: Verify multilingual planning and live keyboard catalog changes
         shell: pwsh
@@ -171,6 +165,15 @@ jobs:
           $manifestSha = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP/ci-publication/manifest.json").Hash.ToLowerInvariant()
           python .github/scripts/release_stages.py preflight --source "$env:SOURCE_SHA" --commit "$env:SOURCE_SHA" --version "$version" --directory "$env:RUNNER_TEMP/ci-publication" --manifest-sha "$manifestSha" --sterile "$env:RUNNER_TEMP/ci-publish-cargo"
           if ($LASTEXITCODE -ne 0) { throw 'Tokenless publication preflight failed' }
+
+      - name: Verify native model download and offline cache
+        if: ${{ !cancelled() && steps.app_build.outcome == 'success' }}
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
+          cargo +nightly test --lib ranking::model_cache::tests::hosted_native_model_download_verifies_cache_and_reuses_it_offline --locked -- --ignored --exact --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native model download/cache regression failed' }
 
   dependency-security:
     name: dependency-security
