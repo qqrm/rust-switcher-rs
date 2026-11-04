@@ -134,11 +134,14 @@ public static class HostedInput {
             throw new InvalidOperationException("Fixture selection mismatch: hwnd=" + window + ", expected=" + length + ", actual=" + start + ".." + end + ", packed=0x" + result.ToUInt64().ToString("X"));
     }
     public static bool HasSelection(IntPtr window, int length) {
+        return HasSelectionRange(window, 0, length);
+    }
+    public static bool HasSelectionRange(IntPtr window, int expectedStart, int expectedEnd) {
         UIntPtr result;
         uint start, end;
         if (ReadSelection(window, 0xB0, out start, out end, 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture selection read failed");
-        return start == 0 && end == (uint)length;
+        return start == (uint)expectedStart && end == (uint)expectedEnd;
     }
     public static bool Responsive(IntPtr window) {
         UIntPtr result;

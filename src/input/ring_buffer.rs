@@ -666,6 +666,19 @@ impl InputJournal {
     }
 
     fn take_last_sequence_with_suffix(&mut self) -> Option<(Vec<InputRun>, Vec<InputRun>)> {
+        let caret_from_end = self.caret_from_end.min(self.total_chars);
+        let suffix_after_caret = self.detach_suffix(caret_from_end);
+        self.caret_from_end = 0;
+
+        let result = self.take_last_sequence_at_end();
+
+        // The conversion deletes only text before the caret. Keep the untouched
+        // tail in place on both success and rejection, including truncated input.
+        self.restore_suffix_after_caret(suffix_after_caret);
+        result
+    }
+
+    fn take_last_sequence_at_end(&mut self) -> Option<(Vec<InputRun>, Vec<InputRun>)> {
         let mut suffix_runs = self.pop_suffix_whitespace();
 
         if self.runs.back().is_none_or(|run| run.kind != RunKind::Text) {
@@ -967,9 +980,11 @@ fn decode_typed_text(kb: &KBDLLHOOKSTRUCT, vk: VIRTUAL_KEY) -> Option<DecodedTex
     }
 
     apply_keyboard_state_overrides(&mut state, current_keyboard_state_overrides());
+    let ctrl_or_alt_held = mods_ctrl_or_alt_down();
+    let altgr_held = altgr_down();
     // AltGr is printable input on many layouts. Restore only its *physical*
     // state after clearing stale Ctrl/Alt bits; ordinary shortcuts stay filtered.
-    if altgr_down() {
+    if altgr_held {
         for modifier in [VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RMENU] {
             set_key_down_state(&mut state, modifier, true);
         }
@@ -987,6 +1002,17 @@ fn decode_typed_text(kb: &KBDLLHOOKSTRUCT, vk: VIRTUAL_KEY) -> Option<DecodedTex
     }) {
         return None;
     }
+    capture_decode_result(decoded, layout, focus, ctrl_or_alt_held, altgr_held)
+}
+
+#[cfg(windows)]
+fn capture_decode_result(
+    decoded: layout_decode::DecodeResult,
+    layout: LayoutTag,
+    focus: FocusCacheKey,
+    ctrl_or_alt_held: bool,
+    altgr_held: bool,
+) -> Option<DecodedText> {
     match decoded {
         layout_decode::DecodeResult::Text(text) => {
             if text.chars().any(char::is_control) {
@@ -1005,7 +1031,10 @@ fn decode_typed_text(kb: &KBDLLHOOKSTRUCT, vk: VIRTUAL_KEY) -> Option<DecodedTex
             None
         }
         layout_decode::DecodeResult::NoText => {
-            if mods_ctrl_or_alt_down() {
+            // An unmapped AltGr combination does not consume Windows' pending
+            // dead key. Preserve both that composition and the captured prefix;
+            // resetting here would make the next glyph differ from the editor.
+            if ctrl_or_alt_held && !altgr_held {
                 invalidate();
             }
             None
@@ -1082,6 +1111,12 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
     if should_clear_for_ctrl_alt_combo(vk, mods_ctrl_or_alt_down() && !altgr_down()) {
         action = Some(JournalAction::Clear);
     }
+    if matches!(vk, VK_LEFT | VK_RIGHT | VK_END) && key_is_down(VK_SHIFT) {
+        // Shift navigation extends a selection; it does not move a collapsed
+        // caret. Its next edit can replace many glyphs, which the journal does
+        // not track. Start fresh instead of authorizing deletion of stale text.
+        action = Some(JournalAction::Clear);
+    }
 
     if action.is_none() {
         let decoded = decode_typed_text(kb, vk)?;
@@ -1103,14 +1138,7 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
             return;
         }
         if let Some(action) = action {
-            if j.pending_dead_key
-                && matches!(
-                    &action,
-                    JournalAction::MoveCaretLeft
-                        | JournalAction::MoveCaretRight
-                        | JournalAction::MoveCaretEnd
-                )
-            {
+            if j.pending_dead_key && matches!(vk, VK_LEFT | VK_RIGHT | VK_END) {
                 j.clear();
                 j.capture_unavailable = true;
                 layout_decode::reset();
@@ -1438,6 +1466,9 @@ mod capacity_tests {
         );
         assert_eq!(journal.runs, before);
         assert_eq!(journal.caret_from_end, 3);
+        assert!(journal.take_last_sequence_with_suffix().is_none());
+        assert_eq!(journal.runs, before);
+        assert_eq!(journal.caret_from_end, 3);
     }
 
     #[test]
@@ -1461,8 +1492,8 @@ mod capacity_tests {
 mod tests {
     use windows::{
         Win32::UI::Input::KeyboardAndMouse::{
-            LoadKeyboardLayoutW, MAPVK_VK_TO_VSC, MapVirtualKeyExW, VK_CONTROL, VK_LCONTROL,
-            VK_LMENU, VK_MENU, VK_OEM_2, VK_OEM_PERIOD, VK_RCONTROL, VK_RMENU,
+            LoadKeyboardLayoutW, MAPVK_VK_TO_VSC, MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, VK_CONTROL,
+            VK_LCONTROL, VK_LMENU, VK_MENU, VK_OEM_2, VK_OEM_PERIOD, VK_RCONTROL, VK_RMENU,
         },
         core::{PCWSTR, w},
     };
@@ -1603,6 +1634,96 @@ mod tests {
             runs.iter().map(|run| run.text.as_str()).collect::<String>(),
             ".ghbdtn"
         );
+        invalidate();
+    }
+
+    #[test]
+    fn native_input_unmapped_altgr_keeps_dead_key_and_complete_prefix() {
+        let layout = load_native_test_layout(w!("00000407"));
+        let _guard = test_guard();
+        let focus = focus_key_for_test(1001, 0).expect("the fixture has a focused target");
+        let tag = layout_tag_from_hkl(layout);
+        let dead_vk = unsafe { MapVirtualKeyExW(0x29, MAPVK_VSC_TO_VK_EX, Some(layout)) };
+        assert_ne!(dead_vk, 0);
+        let decode = |vk, state| {
+            let scan = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, Some(layout)) };
+            assert_ne!(scan, 0);
+            layout_decode::decode(
+                vk,
+                scan,
+                state,
+                layout.0 as usize,
+                (focus.foreground_hwnd as usize, focus.focus_hwnd as usize),
+            )
+        };
+
+        for pending_accent in [false, true] {
+            invalidate();
+            with_journal_mut(|journal| {
+                journal.push_text_internal("abc", tag, RunOrigin::Physical);
+            });
+            if pending_accent {
+                let decoded = decode(dead_vk, [0; 256]);
+                assert_eq!(decoded, layout_decode::DecodeResult::PendingDeadKey);
+                assert!(capture_decode_result(decoded, tag, focus, false, false).is_none());
+            }
+
+            let mut altgr_state = [0; 256];
+            for key in [VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RMENU] {
+                set_key_down_state(&mut altgr_state, key, true);
+            }
+            // German X has no AltGr character. The native table oracle also
+            // covers this no-output stroke between the dead key and E.
+            let decoded = decode(u32::from(b'X'), altgr_state);
+            assert_eq!(decoded, layout_decode::DecodeResult::NoText);
+            assert!(capture_decode_result(decoded, tag, focus, true, true).is_none());
+            with_journal(|journal| {
+                assert_eq!(journal.pending_dead_key, pending_accent);
+                assert!(!journal.capture_unavailable);
+                assert_eq!(journal.total_chars, 3);
+            });
+
+            let decoded = decode(u32::from(b'E'), [0; 256]);
+            let captured = capture_decode_result(decoded, tag, focus, false, false)
+                .expect("the following E must remain capturable");
+            assert_eq!(captured.text, if pending_accent { "ê" } else { "e" });
+            with_journal_mut(|journal| {
+                journal.push_text_internal(&captured.text, captured.layout, RunOrigin::Physical);
+            });
+            let (runs, suffix) = take_last_sequence_with_suffix()
+                .expect("Double Alt must retain the whole prefix and following glyph");
+            assert!(suffix.is_empty());
+            assert_eq!(
+                runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                if pending_accent { "abcê" } else { "abce" }
+            );
+        }
+        invalidate();
+    }
+
+    #[test]
+    fn native_input_no_text_ctrl_alt_shortcut_still_invalidates_journal() {
+        let _guard = test_guard();
+        invalidate();
+        let focus = focus_key_for_test(1001, 0).expect("the fixture has a focused target");
+        with_journal_mut(|journal| {
+            journal.push_text_internal("abc", LayoutTag::En, RunOrigin::Physical);
+            journal.pending_dead_key = true;
+        });
+
+        assert!(
+            capture_decode_result(
+                layout_decode::DecodeResult::NoText,
+                LayoutTag::En,
+                focus,
+                true,
+                false,
+            )
+            .is_none()
+        );
+        assert!(runs_snapshot().is_empty());
+        assert!(!with_journal(|journal| journal.pending_dead_key));
+        assert!(take_last_sequence_with_suffix().is_none());
         invalidate();
     }
 

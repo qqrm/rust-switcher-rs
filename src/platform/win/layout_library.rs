@@ -806,6 +806,115 @@ mod tests {
         assert_eq!(catalog_member_tag(&[0x00, 0xab, 0xff]), wide("00ABFF"));
     }
 
+    // Select an initialized code byte, outside all PE headers and the excluded
+    // certificate table. The fixture is already trusted, but still bound every
+    // offset before modifying its temporary copy. PE32+ matches our 64-bit loader.
+    fn pe_code_byte_to_tamper(image: &[u8]) -> Option<usize> {
+        fn word(bytes: &[u8], offset: usize) -> Option<u16> {
+            Some(u16::from_le_bytes(
+                bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+            ))
+        }
+
+        fn dword(bytes: &[u8], offset: usize) -> Option<usize> {
+            usize::try_from(u32::from_le_bytes(
+                bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+            ))
+            .ok()
+        }
+
+        if image.get(..2)? != b"MZ" {
+            return None;
+        }
+        let pe = dword(image, 0x3c)?;
+        let coff_start = pe.checked_add(4)?;
+        if image.get(pe..coff_start)? != b"PE\0\0" {
+            return None;
+        }
+        let optional_start = coff_start.checked_add(20)?;
+        let coff = image.get(coff_start..optional_start)?;
+        let section_count = usize::from(word(coff, 2)?);
+        if !(1..=96).contains(&section_count) {
+            return None;
+        }
+        let section_start = optional_start.checked_add(usize::from(word(coff, 16)?))?;
+        let optional = image.get(optional_start..section_start)?;
+        if word(optional, 0)? != 0x20b || dword(optional, 108)? < 5 {
+            return None;
+        }
+        let headers_size = dword(optional, 60)?;
+        // IMAGE_DIRECTORY_ENTRY_SECURITY is entry 4. Its address is a file
+        // offset, unlike the RVAs used by other optional-header directories.
+        let certificate_start = dword(optional, 112 + 4 * 8)?;
+        let certificate_end = certificate_start.checked_add(dword(optional, 112 + 4 * 8 + 4)?)?;
+        let section_end = section_start.checked_add(section_count.checked_mul(40)?)?;
+        if section_end > headers_size || headers_size > image.len() || certificate_end > image.len()
+        {
+            return None;
+        }
+        for section in image.get(section_start..section_end)?.as_chunks::<40>().0 {
+            // IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE.
+            if dword(section, 36)? & 0x2000_0020 != 0x2000_0020 {
+                continue;
+            }
+            let raw_start = dword(section, 20)?;
+            let raw_size = dword(section, 16)?;
+            let raw_end = raw_start.checked_add(raw_size)?;
+            let initialized_size = raw_size.min(dword(section, 8)?);
+            if initialized_size == 0
+                || raw_start < headers_size
+                || raw_end > image.len()
+                || (raw_start < certificate_end && certificate_start < raw_end)
+            {
+                continue;
+            }
+            return raw_start.checked_add(initialized_size / 2);
+        }
+        None
+    }
+
+    #[test]
+    fn native_layout_library_rejects_tampered_signed_keyboard_image()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+
+        let _guard = crate::input::ring_buffer::test_guard();
+        let before = unsafe { GetKeyboardLayout(0) };
+        let library = KeyboardLibrary::load(before.0 as usize)
+            .ok_or("the active ordinary layout must have a trusted keyboard DLL")?;
+        let source = module_path(library.module.0).ok_or("resolve the trusted keyboard DLL")?;
+        let mut image = std::fs::read(source)?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("keyboard.dll");
+        // Copy the bytes without inheriting System32 file attributes. All writes
+        // target the temporary file, which is never loaded as code.
+        std::fs::write(&path, &image)?;
+        let path_wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        {
+            let file = ReadFile::open(PCWSTR(path_wide.as_ptr()))
+                .ok_or("open the untouched keyboard DLL copy")?;
+            assert!(
+                verify_file_signature(&file, PCWSTR(path_wide.as_ptr())),
+                "the untouched PE copy must retain embedded or catalog trust"
+            );
+        }
+
+        let offset = pe_code_byte_to_tamper(&image)
+            .ok_or("find a bounded, hashed code section in the trusted PE image")?;
+        image[offset] ^= 1;
+        std::fs::write(&path, &image)?;
+        let file = ReadFile::open(PCWSTR(path_wide.as_ptr()))
+            .ok_or("open the tampered keyboard DLL copy as data")?;
+        assert!(
+            !verify_file_signature(&file, PCWSTR(path_wide.as_ptr())),
+            "changing signed code bytes must invalidate both embedded and catalog trust"
+        );
+        assert_eq!(unsafe { GetKeyboardLayout(0) }, before);
+        Ok(())
+    }
+
     #[test]
     fn native_layout_library_reads_installed_table_without_changing_active_layout() {
         use windows::Win32::UI::Input::{

@@ -386,6 +386,118 @@ fn replacement_after_caret_left_preserves_suffix_after_caret() {
 }
 
 #[test]
+fn production_sequence_extraction_stops_at_caret_and_preserves_the_tail() {
+    let _guard = test_lock();
+    ring_buffer::invalidate();
+    ring_buffer::push_run(InputRun {
+        text: "ghbdtn".to_string(),
+        layout: LayoutTag::Native(0x0409_0409),
+        origin: RunOrigin::Physical,
+        kind: RunKind::Text,
+    });
+    ring_buffer::test_move_caret_left(3);
+
+    let (runs, suffix) = ring_buffer::take_last_sequence_with_suffix().expect("payload");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].text, "ghb");
+    assert_eq!(runs[0].layout, LayoutTag::Native(0x0409_0409));
+    assert!(suffix.is_empty());
+    assert_eq!(journal_text(), "dtn");
+
+    ring_buffer::push_run(InputRun {
+        text: "при".to_string(),
+        layout: LayoutTag::Native(0x0419_0419),
+        origin: RunOrigin::Programmatic,
+        kind: RunKind::Text,
+    });
+    assert_eq!(journal_text(), "приdtn");
+    let (runs, suffix) = ring_buffer::take_last_sequence_with_suffix().expect("repeat payload");
+    assert_eq!(
+        runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+        "при"
+    );
+    assert!(suffix.is_empty());
+    assert_eq!(journal_text(), "dtn");
+}
+
+#[test]
+fn production_sequence_extraction_keeps_the_mixed_origin_prefix_before_caret() {
+    let _guard = test_lock();
+    ring_buffer::invalidate();
+    ring_buffer::push_runs([
+        InputRun {
+            text: "hfp".to_string(),
+            layout: LayoutTag::Native(0x0409_0409),
+            origin: RunOrigin::Physical,
+            kind: RunKind::Text,
+        },
+        InputRun {
+            text: " ".to_string(),
+            layout: LayoutTag::Native(0x0409_0409),
+            origin: RunOrigin::Physical,
+            kind: RunKind::Whitespace,
+        },
+        InputRun {
+            text: "два".to_string(),
+            layout: LayoutTag::Native(0x0419_0419),
+            origin: RunOrigin::Programmatic,
+            kind: RunKind::Text,
+        },
+        InputRun {
+            text: " ".to_string(),
+            layout: LayoutTag::Native(0x0419_0419),
+            origin: RunOrigin::Programmatic,
+            kind: RunKind::Whitespace,
+        },
+        InputRun {
+            text: "три".to_string(),
+            layout: LayoutTag::Native(0x0419_0419),
+            origin: RunOrigin::Programmatic,
+            kind: RunKind::Text,
+        },
+    ]);
+    ring_buffer::test_move_caret_left(3);
+    let original = ring_buffer::runs_snapshot();
+
+    let (runs, suffix) = ring_buffer::take_last_sequence_with_suffix().expect("payload");
+    assert_eq!(
+        runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+        "hfp два"
+    );
+    assert_eq!(
+        suffix
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>(),
+        " "
+    );
+    assert_eq!(journal_text(), "три");
+
+    // A cancelled plan restores the exact metadata and the caret, not just text.
+    ring_buffer::push_runs(runs);
+    ring_buffer::push_runs(suffix);
+    assert_eq!(ring_buffer::runs_snapshot(), original);
+    ring_buffer::push_text("X");
+    assert_eq!(journal_text(), "hfp два Xтри");
+}
+
+#[test]
+fn production_sequence_without_text_before_caret_leaves_the_journal_unchanged() {
+    let _guard = test_lock();
+    for (text, left, expected) in [("tail", 4, "Xtail"), ("  tail", 4, "  Xtail")] {
+        ring_buffer::invalidate();
+        ring_buffer::push_text(text);
+        ring_buffer::test_move_caret_left(left);
+        let original = ring_buffer::runs_snapshot();
+
+        assert!(ring_buffer::take_last_sequence_with_suffix().is_none());
+        assert_eq!(ring_buffer::runs_snapshot(), original);
+        ring_buffer::push_text("X");
+        assert_eq!(journal_text(), expected);
+    }
+}
+
+#[test]
 fn autoconvert_trigger_uses_character_before_caret() {
     let _guard = test_lock();
     ring_buffer::invalidate();

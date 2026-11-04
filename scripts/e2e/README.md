@@ -63,7 +63,7 @@ produced that snapshot during physical typing.
 
 ### Double Alt journal matrix
 
-`journal-cases.ps1` runs 40 bounded cases through the actual debug executable.
+`journal-cases.ps1` runs 45 bounded cases through the actual debug executable.
 `journal-fixture.ps1` creates two top-level windows in a separate process, each
 with two native Windows Edit controls. A debug-only hosted-E2E PID allowlist
 admits this one fixture process; release capture behavior is unchanged. The
@@ -98,6 +98,15 @@ cases run to collect useful evidence. The capacity cases require complete
 conversion at 99, 100, and 101 characters, including the leading period. These
 regressions distinguish the former 100-character truncation defect from
 short-input focus or keyboard-state failures.
+
+Three caret cases move Left through real input before Double Alt: into a word,
+before the final word, and to the start of the captured text. They check the
+native caret before and after conversion, the exact converted prefix, and the
+unchanged text after the caret. The unit regressions call the production sequence
+extractor and also cover restoration after rejection and mixed-origin input.
+Two selection cases use Shift+Left followed by Backspace or replacement typing.
+They require Double Alt to leave deleted selections alone and convert only fresh
+typing after a selection replacement.
 
 ### Browser input matrix
 
