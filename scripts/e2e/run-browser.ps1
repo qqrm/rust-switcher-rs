@@ -22,8 +22,6 @@ $switcherErrors = $null
 $failure = $null
 $script:requestId = 0
 
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -303,12 +301,21 @@ try {
     if ($english -eq [IntPtr]::Zero -or $russian -eq [IntPtr]::Zero) { throw 'EN/RU test layouts unavailable' }
     foreach ($session in $sessions.Values) { Set-BrowserEnglish $session }
 
+    # Prepare the hotkey configuration before startup. The desktop suite tests
+    # the settings controls; this suite needs deterministic browser input setup.
+    $switcherProfile = Join-Path $runRoot 'switcher-profile'
+    $configDirectory = Join-Path $switcherProfile 'RustSwitcherDebug'
+    New-Item -ItemType Directory -Path $configDirectory | Out-Null
+    @'
+delay_ms = 100
+smarter_hotkeys_enabled = true
+'@ | Set-Content -LiteralPath (Join-Path $configDirectory 'config.json') -Encoding utf8NoBOM
     $switcherInfo = [System.Diagnostics.ProcessStartInfo]::new($DebugExe)
     $switcherInfo.UseShellExecute = $false
     $switcherInfo.CreateNoWindow = $true
     $switcherInfo.RedirectStandardOutput = $true
     $switcherInfo.RedirectStandardError = $true
-    $switcherInfo.Environment['APPDATA'] = Join-Path $runRoot 'switcher-profile'
+    $switcherInfo.Environment['APPDATA'] = $switcherProfile
     $switcherInfo.Environment['RUST_LOG'] = 'trace'
     $switcherInfo.Environment['RUST_SWITCHER_E2E_PLAYGROUND'] = '1'
     $switcherInfo.Environment['RUST_SWITCHER_E2E_ALLOW_INJECTED'] = '1'
@@ -322,15 +329,6 @@ try {
         $switcher.Refresh()
         $switcher.MainWindowHandle -ne [IntPtr]::Zero
     } 'debug Switcher window'
-    $app = [System.Windows.Automation.AutomationElement]::FromHandle($switcher.MainWindowHandle)
-    $toggle = $app.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Smarter hotkeys'))
-    if ($null -eq $toggle) { throw 'Smarter hotkeys control missing' }
-    $togglePattern = [System.Windows.Automation.TogglePattern]$toggle.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
-    if ($togglePattern.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) { $togglePattern.Toggle() }
-    $apply = $app.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Apply'))
-    ([System.Windows.Automation.InvokePattern]$apply.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
     [ordered]@{browser = $version.Browser; executable = $browserExe; browserPid = $browser.Id;
         windowA = $sessions.a.Handle.ToInt64(); windowB = $sessions.b.Handle.ToInt64();
         commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID} | ConvertTo-Json -Compress | Write-Output
@@ -348,6 +346,10 @@ try {
         foreach ($kind in @('textarea', 'editable')) {
             $cases.Add(@{Kind = $kind; Mode = $mode; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 0; Repeat = 1})
         }
+    }
+    foreach ($kind in @('textarea', 'editable')) {
+        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = 'a' * 101; Expected = 'ф' * 101; Gap = 0; Repeat = 1})
+        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.' + ('a' * 100); Expected = 'ю' + ('ф' * 100); Gap = 0; Repeat = 1})
     }
     foreach ($repeat in 1..6) {
         $cases.Add(@{Kind = 'editable'; Mode = 'fresh'; Text = 'ghbdtn'; Expected = 'привет'; Gap = 1; Repeat = $repeat})

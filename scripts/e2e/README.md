@@ -28,7 +28,7 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Last typed sequence | Debug double Alt converts two words and short leading-dot inputs in external native Edit controls | Physical typing in release requires a separate VM with keyboard access |
 | First character after focus/modifiers | Debug journal matrix switches between two unowned external windows and two controls, releases Ctrl/Alt in the destination, and asserts exact before/after strings | Synthetic input and native Edit controls do not reproduce every Telegram/Qt or physical-keyboard interaction |
 | Browser fields and first-character timing | Debug Double Alt in a real Chrome/Edge process, two windows, input/textarea/contenteditable/shadow DOM/iframe fields, first-key timing and Tab/click navigation | Synthetic input and a local fixture do not prove behavior in the user's exact browser, extensions or web application |
-| Journal capacity | Debug checks 100 and 101 characters, including a leading dot at 101 | This characterizes the existing 100-character tail policy; it does not assert full-message conversion |
+| Journal capacity | Native Edit checks 99/100/101 characters; browser checks 101 with a letter and a leading dot; journal unit tests cover 4096 and overflow | Overflow refuses any conversion that reaches the discarded prefix; a complete last word after a retained boundary can still convert |
 | Automatic last-word conversion | Debug runtime toggle followed by a word and space | Other delimiters are not exercised by this GUI scenario |
 | Selected text | Release double Shift in a separate native Edit, both directions, restored selection | Other applications, rich editors and elevated targets are not exercised |
 | Clipboard isolation | Clipboard sequence unchanged during selection conversion | Does not audit unrelated applications on the desktop |
@@ -51,17 +51,18 @@ rows without a hosted assertion remain coverage gaps even when CI is green.
 
 The dedicated **Windows Input Regression** workflow runs the
 `native_input_` regression tests on a Windows runner, separately from the larger
-GUI suite. These call the real Win32 `ToUnicodeEx` API with a controlled stale
+GUI suite. The decoding cases call the real Win32 `ToUnicodeEx` API with a controlled stale
 modifier snapshot on the first character, then feed decoded input through the
 journal. This makes normalization defects reproducible without asking anyone to
-type on a working desktop. The group also characterizes the 100-character
-capacity separately. A controlled native-API reproduction establishes the tested
+type on a working desktop. The group also verifies the 4096-character capacity,
+rejection of truncated prefixes, and recovery after clearing the journal.
+A controlled native-API reproduction establishes the tested
 decoder behavior; it does not establish that a particular Telegram window
 produced that snapshot during physical typing.
 
 ### Double Alt journal matrix
 
-`journal-cases.ps1` runs 39 bounded cases through the actual debug executable.
+`journal-cases.ps1` runs 40 bounded cases through the actual debug executable.
 `journal-fixture.ps1` creates two top-level windows in a separate process, each
 with two native Windows Edit controls. A debug-only hosted-E2E PID allowlist
 admits this one fixture process; release capture behavior is unchanged. The
@@ -92,10 +93,10 @@ converted text afterward, plus unchanged source and neighboring editors.
 
 Every result includes actual strings, requested/observed timing, and any error in
 the job log and `result.json`. A failed case remains a CI failure while later
-cases run to collect useful evidence. The capacity cases deliberately expect
-the current retained-tail behavior: at 101 characters, the first character is
-outside the default 100-character journal. Passing that check alone does not
-reproduce or explain a short-input first-character failure.
+cases run to collect useful evidence. The capacity cases require complete
+conversion at 99, 100, and 101 characters, including the leading period. These
+regressions distinguish the former 100-character truncation defect from
+short-input focus or keyboard-state failures.
 
 ### Browser input matrix
 
@@ -106,9 +107,11 @@ or contact a text service. The debug PID allowlist admits only this browser
 process. CDP prepares and reads the fixture; all tested text, modifier events,
 Tab navigation, physical mouse clicks and Double Alt use native input delivery.
 
-The 47 cases cover five editor types, a single period, words with a leading
+The 51 cases cover five editor types, a single period, words with a leading
 period, 0/1/30 ms first-key gaps, repeated fast typing, and transitions between
-fields/windows while Ctrl or Alt is released. Every case checks exact input
+fields/windows while Ctrl or Alt is released. Textarea and contenteditable cases
+also require complete conversion of 101 characters, both with a leading letter
+and a leading period. Every case checks exact input
 before conversion, exact output afterward, and unchanged neighboring/source
 fields in both windows. Input and conversion are never retried. Native focus,
 caret-owner HWND, caret rectangle and keyboard-layout snapshots are included in
