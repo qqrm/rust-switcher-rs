@@ -160,9 +160,10 @@ struct CachedJournal {
 
 #[cfg(windows)]
 fn same_focus_identity(a: FocusCacheKey, b: FocusCacheKey) -> bool {
-    a.foreground_hwnd == b.foreground_hwnd
-        && a.focus_hwnd == b.focus_hwnd
-        && a.caret_hwnd == b.caret_hwnd
+    // A caret can be recreated after the first glyph without moving keyboard focus.
+    // Treating its owner as a new editor discards that glyph from the live journal.
+    // The complete caret signature still guards restoration after a focus switch.
+    a.foreground_hwnd == b.foreground_hwnd && a.focus_hwnd == b.focus_hwnd
 }
 
 #[derive(Clone, Debug, Default)]
@@ -958,7 +959,8 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
     let mut output: Option<String> = None;
 
     match vk {
-        VK_ESCAPE | VK_DELETE | VK_INSERT | VK_UP | VK_DOWN | VK_HOME | VK_PRIOR | VK_NEXT => {
+        VK_ESCAPE | VK_DELETE | VK_INSERT | VK_UP | VK_DOWN | VK_HOME | VK_PRIOR | VK_NEXT
+        | VK_TAB => {
             action = Some(JournalAction::Clear);
         }
         VK_LEFT => action = Some(JournalAction::MoveCaretLeft),
@@ -970,15 +972,6 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
             output = Some("\n".to_string());
             action = Some(JournalAction::PushText {
                 text: "\n".to_string(),
-                layout,
-                origin: RunOrigin::Physical,
-            });
-        }
-        VK_TAB => {
-            let layout = current_foreground_layout_tag();
-            output = Some("\t".to_string());
-            action = Some(JournalAction::PushText {
-                text: "\t".to_string(),
                 layout,
                 origin: RunOrigin::Physical,
             });
@@ -1648,6 +1641,73 @@ mod tests {
                 .collect::<String>(),
             "second"
         );
+    }
+
+    #[test]
+    fn foreground_switch_same_control_caret_recreation_keeps_first_glyph() {
+        let _guard = test_guard();
+        for (first, rest) in [("g", "hbdtn"), (".", "ghbdtn"), (".", "")] {
+            invalidate();
+            test_switch_foreground_control(1001, 11, 21, 10, 1_000);
+            push_run(test_run(first, LayoutTag::En));
+
+            // The application processes the first glyph and replaces the caret owner.
+            // No focus transition or mouse/navigation input occurred in between.
+            test_switch_foreground_control(1001, 11, 22, 20, 1_001);
+            push_run(test_run(rest, LayoutTag::En));
+            let text = with_journal_mut(|journal| {
+                let (runs, _) = journal
+                    .take_last_sequence_with_suffix()
+                    .expect("first glyph must remain available to Double Alt");
+                runs.iter().map(|run| run.text.as_str()).collect::<String>()
+            });
+            assert_eq!(text, format!("{first}{rest}"));
+        }
+    }
+
+    #[test]
+    fn foreground_switch_new_control_with_same_caret_owner_starts_empty() {
+        let _guard = test_guard();
+        invalidate();
+        test_switch_foreground_control(1001, 11, 21, 10, 1_000);
+        push_run(test_run("source-must-stay", LayoutTag::En));
+
+        test_switch_foreground_control(1001, 12, 21, 10, 1_001);
+        assert!(runs_snapshot().is_empty());
+        push_run(test_run("destination", LayoutTag::En));
+
+        test_switch_foreground_control(1001, 11, 21, 10, 1_002);
+        let text = runs_snapshot()
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "source-must-stay");
+    }
+
+    #[test]
+    fn native_input_tab_navigation_discards_previous_field() {
+        let _guard = test_guard();
+        invalidate();
+        push_run(test_run("source-must-stay", LayoutTag::En));
+
+        // Browser DOM fields can share a focused native HWND. Tab is therefore a
+        // journal boundary even when a later GetGUIThreadInfo snapshot is equal.
+        let key = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(VK_TAB.0),
+            scanCode: 0x0f,
+            ..Default::default()
+        };
+        assert_eq!(record_keydown(&key, u32::from(VK_TAB.0)), None);
+        assert!(runs_snapshot().is_empty());
+
+        push_run(test_run(".ghbdtn", LayoutTag::En));
+        let text = with_journal_mut(|journal| {
+            let (runs, _) = journal
+                .take_last_sequence_with_suffix()
+                .expect("new field text should be available");
+            runs.iter().map(|run| run.text.as_str()).collect::<String>()
+        });
+        assert_eq!(text, ".ghbdtn");
     }
 
     #[test]
