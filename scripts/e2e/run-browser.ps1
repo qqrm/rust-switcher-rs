@@ -265,10 +265,23 @@ try {
         $expectedUrl = if ($id -eq 'a') { $fixtureUrl } else { "$fixtureUrl#second" }
         $target = $null
         Wait-Browser {
-            $script:browserTargets = @(Invoke-RestMethod -Uri "$endpoint/json/list" -TimeoutSec 5)
-            @($script:browserTargets | Where-Object { $_.type -eq 'page' -and $_.url -eq $expectedUrl }).Count -eq 1
+            # Invoke-RestMethod emits a JSON array as one pipeline object. The
+            # parentheses enumerate it before filtering the individual pages.
+            $script:browserTargets = @((Invoke-RestMethod -Uri "$endpoint/json/list" -TimeoutSec 5) |
+                Where-Object { $_.type -eq 'page' -and $_.url -eq $expectedUrl })
+            $script:browserTargets.Count -eq 1
         } "owned browser page $id" 15000
-        $target = $script:browserTargets | Where-Object { $_.type -eq 'page' -and $_.url -eq $expectedUrl }
+        $target = $script:browserTargets[0]
+        if ($target -is [array] -or $target.webSocketDebuggerUrl -isnot [string]) {
+            throw "Browser page $id must resolve to one debugging endpoint"
+        }
+        $socketUri = [Uri]$target.webSocketDebuggerUrl
+        if ($socketUri.Scheme -ne 'ws' -or -not $socketUri.IsLoopback -or $socketUri.Port -ne $port -or
+            $socketUri.AbsolutePath -ne "/devtools/page/$($target.id)") {
+            throw "Browser page $id returned an unexpected debugging endpoint"
+        }
+        [ordered]@{browserSession = $id; targetId = $target.id; url = $target.url;
+            webSocket = $socketUri.AbsoluteUri} | ConvertTo-Json -Compress | Write-Output
         $connection = [BrowserSocket]::new($target.webSocketDebuggerUrl)
         $connections.Add($connection)
         Invoke-Cdp $connection 'Page.bringToFront' | Out-Null
