@@ -13,6 +13,10 @@
 
 pub use rust_switcher_core as core;
 
+#[cfg(windows)]
+#[path = "input/keyboard_desktop.rs"]
+mod keyboard_desktop;
+
 // Compatibility shim for existing unit tests that still refer to
 // `crate::domain::text::mapping::*`.
 pub mod domain {

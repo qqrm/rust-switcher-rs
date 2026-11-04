@@ -13,6 +13,9 @@ mod input;
 #[cfg(windows)]
 mod input_journal;
 #[cfg(windows)]
+#[path = "input/keyboard_desktop.rs"]
+mod keyboard_desktop;
+#[cfg(windows)]
 mod platform;
 #[cfg(windows)]
 mod utils;

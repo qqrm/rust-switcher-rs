@@ -108,6 +108,13 @@ jobs:
         with:
           tool: cargo-nextest
           fallback: none
+      - name: Verify native model download and offline cache
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
+          cargo +nightly test --lib ranking::model_cache::tests::hosted_native_model_download_verifies_cache_and_reuses_it_offline --locked -- --ignored --exact --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native model download/cache regression failed' }
       - name: Cargo nextest --locked
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
@@ -122,20 +129,13 @@ jobs:
         run: |
           cargo +nightly test --locked --bin rust-switcher native_planner_ -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Multilingual planning regressions failed' }
-          cargo +nightly test --locked --bin rust-switcher native_public_layout_catalog_refreshes_after_add_and_remove -- --ignored --test-threads=1
+          cargo +nightly test --locked --bin rust-switcher native_public_layout_ -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Live keyboard catalog regression failed' }
       - name: Prepare English and Russian desktop fixtures
         shell: pwsh
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: ./scripts/e2e/initialize-layouts.ps1 -Mode Pair
-      - name: Verify native model download and offline cache
-        shell: pwsh
-        env:
-          RUST_SWITCHER_HOSTED_E2E: '1'
-        run: |
-          cargo +nightly test --lib ranking::model_cache::tests::hosted_native_model_download_verifies_cache_and_reuses_it_offline --locked -- --ignored --exact --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw 'Native model download/cache regression failed' }
       - name: Build desktop test and release applications
         shell: pwsh
         run: |

@@ -320,7 +320,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_conversion_preserves_leading_punctuation_and_exact_target() {
+    #[ignore = "requires installed EN/RU layouts in the hosted planner fixture"]
+    fn native_planner_explicit_conversion_preserves_leading_punctuation_and_exact_target() {
         let _guard = layouts::test_guard();
         let installed = test_layouts();
         let plan =
@@ -333,7 +334,8 @@ mod tests {
     }
 
     #[test]
-    fn changed_layout_set_is_respected_without_cached_target_fallback() {
+    #[ignore = "requires installed EN/RU layouts in the hosted planner fixture"]
+    fn native_planner_changed_layout_set_is_respected_without_cached_target_fallback() {
         let _guard = layouts::test_guard();
         let installed = test_layouts();
         assert!(
@@ -350,7 +352,8 @@ mod tests {
     }
 
     #[test]
-    fn converted_runs_keep_exact_target_for_the_next_command() {
+    #[ignore = "requires installed EN/RU layouts in the hosted planner fixture"]
+    fn native_planner_converted_runs_keep_exact_target_for_the_next_command() {
         let _guard = layouts::test_guard();
         let installed = test_layouts();
         let runs = vec![InputRun {

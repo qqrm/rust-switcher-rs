@@ -1,7 +1,7 @@
-//! Decode physical input on a thread with its own keyboard composition state.
+//! Decode physical input on a worker with an isolated keyboard desktop.
 //!
-//! `ToUnicodeEx` with state changes enabled is required for dead keys. Keeping it
-//! away from the hook/UI thread avoids consuming another window's pending accent.
+//! `ToUnicodeEx` with state changes enabled is required for exact dead-key replay.
+//! A separate thread on the input desktop is not sufficient isolation.
 
 use std::{
     sync::{
@@ -16,6 +16,8 @@ use std::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HKL, MAPVK_VK_TO_VSC, MapVirtualKeyExW, ToUnicodeEx, VK_SPACE,
 };
+
+use crate::keyboard_desktop::KeyboardDesktop;
 
 const DECODE_TIMEOUT: Duration = Duration::from_millis(100);
 const UTF16_CAPACITY: usize = 16;
@@ -89,7 +91,11 @@ impl Decoder {
         thread::Builder::new()
             .name("input-composition".to_owned())
             .spawn(move || {
-                // This thread never attaches its input queue to another thread.
+                // Establish isolation before any translation or buffer clearing.
+                // Failure disconnects the worker, so callers receive Unavailable.
+                let Ok(_desktop) = KeyboardDesktop::enter() else {
+                    return;
+                };
                 let mut context: Option<Context> = None;
                 while let Ok(request) = receiver.recv() {
                     if request.deadline <= Instant::now()
@@ -309,6 +315,25 @@ mod tests {
         assert_eq!(
             decoder.decode(u32::from(b'Q'), 0x10, state, german, (1, 2)),
             DecodeResult::Text("@".to_owned())
+        );
+    }
+
+    #[test]
+    fn native_decoder_workers_keep_independent_pending_accents() {
+        let first = Decoder::start().unwrap();
+        let second = Decoder::start().unwrap();
+        let german = german_layout();
+        assert_eq!(
+            decode_scan(&first, 0x29, german, (1, 2)),
+            DecodeResult::PendingDeadKey
+        );
+        assert_eq!(
+            decode_scan(&second, 0x12, german, (1, 2)),
+            DecodeResult::Text("e".to_owned())
+        );
+        assert_eq!(
+            decode_scan(&first, 0x12, german, (1, 2)),
+            DecodeResult::Text("ê".to_owned())
         );
     }
 

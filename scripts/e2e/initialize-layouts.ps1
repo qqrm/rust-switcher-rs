@@ -116,14 +116,14 @@ $form.add_Shown({
             $handle = [LayoutSetupNative]::LoadKeyboardLayout($name, 1)
             if ($handle -eq [IntPtr]::Zero) { throw "Keyboard layout $name could not be loaded" }
             [LayoutSetupNative]::ActivateKeyboardLayout($handle, 0) | Out-Null
-            if ([LayoutSetupNative]::CurrentName() -ine $name) {
+            if ([LayoutSetupNative]::CurrentName() -ne $name) {
                 throw "Windows substituted keyboard layout $name with $([LayoutSetupNative]::CurrentName())"
             }
             $handles.Add($handle)
         }
 
         [LayoutSetupNative]::ActivateKeyboardLayout($handles[0], 0) | Out-Null
-        if ([LayoutSetupNative]::CurrentName() -ine '00000409') {
+        if ([LayoutSetupNative]::CurrentName() -ne '00000409') {
             throw 'English US could not be restored as the initial test layout'
         }
         foreach ($loaded in [LayoutSetupNative]::Loaded()) {

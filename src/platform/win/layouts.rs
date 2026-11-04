@@ -2,8 +2,8 @@
 //!
 //! The inverse tables retain physical scan codes, not virtual-key names: for
 //! example, the same position is Y in US QWERTY and Z in German QWERTZ.
-//! Stateful dead-key translation runs only on a worker whose input queue is never
-//! attached to the hook, UI or foreground threads.
+//! Stateful dead-key translation runs only on a worker with a never-activated
+//! private desktop and input queue, separate from the user's input desktop.
 
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
@@ -28,7 +28,7 @@ use windows::Win32::{
     },
 };
 
-use crate::utils::bounded_worker::BoundedWorker;
+use crate::{keyboard_desktop::KeyboardDesktop, utils::bounded_worker::BoundedWorker};
 
 const SHIFT: u8 = 1;
 const CONTROL: u8 = 2;
@@ -187,13 +187,21 @@ fn worker() -> Option<&'static Worker> {
     WORKER
         .get_or_init(|| {
             Worker::start("layout-conversion", || {
+                let desktop = KeyboardDesktop::enter().ok();
                 let mut converter = Converter::default();
-                for layout in installed_layouts() {
-                    if let Some(table) = LayoutTable::build(layout) {
-                        converter.tables.insert(layout, table);
+                if desktop.is_some() {
+                    for layout in installed_layouts() {
+                        if let Some(table) = LayoutTable::build(layout) {
+                            converter.tables.insert(layout, table);
+                        }
                     }
                 }
-                move |request| converter.convert(request)
+                move |request| {
+                    // Retain isolation for the worker's complete lifetime. If
+                    // setup failed, never translate on the inherited desktop.
+                    let _desktop = desktop.as_ref()?;
+                    converter.convert(request)
+                }
             })
             .ok()
         })
@@ -554,6 +562,7 @@ mod tests {
         // Each test uses a private translation thread and never touches the
         // production worker or another test's pending composition.
         std::thread::spawn(move || {
+            let _desktop = KeyboardDesktop::enter().ok()?;
             let source = load_layout(&source);
             let target = load_layout(&target);
             let table = LayoutTable::build(source)?;
@@ -561,6 +570,41 @@ mod tests {
         })
         .join()
         .expect("native conversion thread must not panic")
+    }
+
+    #[test]
+    #[ignore = "requires the installed-layout fixture on a disposable hosted Windows desktop"]
+    fn native_public_layout_worker_preserves_callers_pending_dead_key() {
+        let _guard = test_guard();
+        let german = load_layout("00000407");
+        let english = load_layout("00000409");
+        assert!(clear_dead_keys(german));
+        let dead_vk = unsafe { MapVirtualKeyExW(0x29, MAPVK_VSC_TO_VK_EX, Some(german.hkl())) };
+        let mut output = [0u16; UTF16_CAPACITY];
+        assert!(
+            unsafe { ToUnicodeEx(dead_vk, 0x29, &[0; 256], &mut output, 0, Some(german.hkl())) }
+                < 0
+        );
+
+        // Creating and dropping a private worker, warming the public worker,
+        // and replaying compositions must all preserve the pending circumflex.
+        let private_converted = convert_native("ê", "00000407", "00000409");
+        let converted = convert_text("ê", german, english);
+        let count = unsafe {
+            ToUnicodeEx(
+                u32::from(b'E'),
+                0x12,
+                &[0; 256],
+                &mut output,
+                0,
+                Some(german.hkl()),
+            )
+        };
+        assert!(clear_dead_keys(german));
+        assert_eq!(private_converted, Some("`e".to_owned()));
+        assert_eq!(converted, Some("`e".to_owned()));
+        assert_eq!(count, 1);
+        assert_eq!(output[0], 'ê' as u16);
     }
 
     struct TestDesktop {
