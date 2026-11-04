@@ -109,22 +109,34 @@ jobs:
         with:
           tool: cargo-nextest
           fallback: none
+      - name: Prepare installed-layout fixture
+        id: layout_fixture
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/initialize-layouts.ps1 -Mode All
       - name: Cargo nextest --locked
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: |
-          ./scripts/e2e/initialize-layouts.ps1 -Mode All
           cargo +nightly nextest run --locked --no-fail-fast
           if ($LASTEXITCODE -ne 0) { throw 'Windows unit tests failed' }
-      - name: Verify multilingual planning and live keyboard catalog changes
+      - name: Verify multilingual planning
+        if: ${{ !cancelled() && steps.layout_fixture.outcome == 'success' }}
         shell: pwsh
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: |
           cargo +nightly test --locked --bin rust-switcher native_planner_ -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Multilingual planning regressions failed' }
+      - name: Compare native tables and live keyboard catalog changes
+        if: ${{ !cancelled() && steps.layout_fixture.outcome == 'success' }}
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
           cargo +nightly test --locked --bin rust-switcher native_public_layout_ -- --ignored --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw 'Live keyboard catalog regression failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Native keyboard tables/catalog regressions failed' }
       - name: Prepare English and Russian desktop fixtures
         shell: pwsh
         env:

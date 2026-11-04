@@ -17,7 +17,7 @@ const WCH_DEAD: u16 = 0xf001;
 const WCH_LGTR: u16 = 0xf002;
 const CAPLOK: u8 = 0x01;
 const CAPLOKALTGR: u8 = 0x04;
-const SHFT_INVALID: u8 = 0x0f;
+const INVALID_SHIFT: u8 = 0x0f;
 const SHIFT: u8 = 1;
 const CONTROL: u8 = 2;
 const ALT: u8 = 4;
@@ -145,7 +145,7 @@ impl KeyboardTables {
         )?;
         if modification_numbers
             .iter()
-            .any(|&n| n > 9 && n != SHFT_INVALID)
+            .any(|&n| n > 9 && n != INVALID_SHIFT)
         {
             return None;
         }
@@ -224,7 +224,7 @@ impl KeyboardTables {
         let Some(&column) = self.modification_numbers.get(usize::from(bits)) else {
             return Some(Translation::NoText);
         };
-        if column == SHFT_INVALID {
+        if column == INVALID_SHIFT {
             return Some(Translation::NoText);
         }
         let Some(output) = row.columns.get(usize::from(column)) else {
@@ -512,10 +512,10 @@ mod tests {
             modifiers.extend_from_slice(&[
                 0,
                 1,
-                SHFT_INVALID,
-                SHFT_INVALID,
-                SHFT_INVALID,
-                SHFT_INVALID,
+                INVALID_SHIFT,
+                INVALID_SHIFT,
+                INVALID_SHIFT,
+                INVALID_SHIFT,
                 2,
                 3,
             ]);

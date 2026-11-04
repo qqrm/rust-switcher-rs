@@ -75,51 +75,95 @@ impl KeyboardLibrary {
     /// conversion; the decoder supplies the actual foreground HKL. A worker's
     /// own catalog need not include handles loaded by a different thread.
     pub(crate) fn load(hkl: usize) -> Option<Self> {
-        let canonical = canonical_hkl(hkl)?;
-        if unsafe { ImmIsIME(HKL(hkl as *mut _)) }.as_bool() {
-            return None;
+        macro_rules! required {
+            ($stage:literal, $value:expr) => {
+                match $value {
+                    Some(value) => value,
+                    None => {
+                        #[cfg(test)]
+                        eprintln!(
+                            "native keyboard loader hkl={hkl:#x} stage={} error={}",
+                            $stage,
+                            std::io::Error::last_os_error()
+                        );
+                        return None;
+                    }
+                }
+            };
         }
-        let registry = open_key(
-            HKEY_LOCAL_MACHINE,
-            LAYOUTS_KEY,
-            KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS,
-        )?;
-        let klid = resolve_klid(canonical, &registry)?;
+        let canonical = required!("canonical HKL", canonical_hkl(hkl));
+        required!(
+            "non-IME HKL",
+            (!unsafe { ImmIsIME(HKL(hkl as *mut _)) }.as_bool()).then_some(())
+        );
+        let registry = required!(
+            "layout registry",
+            open_key(
+                HKEY_LOCAL_MACHINE,
+                LAYOUTS_KEY,
+                KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS,
+            )
+        );
+        let klid = required!(
+            "physical KLID resolution",
+            resolve_klid(canonical, &registry)
+        );
         let klid = wide(&klid);
-        let layout = open_key(registry.0, PCWSTR(klid.as_ptr()), KEY_QUERY_VALUE)?;
-        if registry_string(&layout, w!("Ime File"))?.is_some() {
-            return None;
-        }
-        let filename = registry_string(&layout, w!("Layout File"))??;
-        if !valid_dll_basename(&filename) {
-            return None;
-        }
-        let path = format!("{}\\{}", system_directory()?, filename);
+        let layout = required!(
+            "physical layout registration",
+            open_key(registry.0, PCWSTR(klid.as_ptr()), KEY_QUERY_VALUE)
+        );
+        let ime = required!(
+            "IME registry value",
+            registry_string(&layout, w!("Ime File"))
+        );
+        required!("non-IME registration", ime.is_none().then_some(()));
+        let filename = required!(
+            "Layout File value",
+            registry_string(&layout, w!("Layout File")).flatten()
+        );
+        required!("DLL basename", valid_dll_basename(&filename).then_some(()));
+        let directory = required!("system directory", system_directory());
+        let path = format!("{directory}\\{filename}");
         let path_wide = wide(&path);
         // Use an absolute system path for the DLL and System32 only for its
         // dependencies. Do not search the application, working directory or PATH.
-        let module = Module(unsafe {
+        let loaded = unsafe {
             LoadLibraryExW(
                 PCWSTR(path_wide.as_ptr()),
                 None,
                 LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_REQUIRE_SIGNED_TARGET,
             )
-            .ok()?
-        });
-        if !module_path(module.0)?.eq_ignore_ascii_case(&path) {
-            return None;
+        };
+        #[cfg(test)]
+        if let Err(error) = &loaded {
+            eprintln!("native keyboard loader path={path:?} LoadLibraryExW error={error:?}");
         }
+        let module = Module(required!("signed System32 load", loaded.ok()));
+        let actual_path = required!("loaded module path", module_path(module.0));
+        required!(
+            "matching module path",
+            actual_path.eq_ignore_ascii_case(&path).then_some(())
+        );
         let mut library = Self {
             module,
             descriptor: std::ptr::null(),
         };
-        let entry = unsafe { GetProcAddress(library.module.0, s!("KbdLayerDescriptor")) }?;
+        let entry = required!("KbdLayerDescriptor export", unsafe {
+            GetProcAddress(library.module.0, s!("KbdLayerDescriptor"))
+        });
         // Reject forwarded exports and data addresses before calling the WDK ABI.
-        library.validate_range(entry as usize, 1, true)?;
+        required!(
+            "descriptor executable code",
+            library.validate_range(entry as usize, 1, true)
+        );
         let descriptor: unsafe extern "system" fn() -> *const c_void =
             unsafe { std::mem::transmute(entry) };
         library.descriptor = unsafe { descriptor() };
-        library.validate_range(library.descriptor as usize, 1, false)?;
+        required!(
+            "descriptor readable image",
+            library.validate_range(library.descriptor as usize, 1, false)
+        );
         Some(library)
     }
 
