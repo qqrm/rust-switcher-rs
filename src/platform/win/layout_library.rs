@@ -14,13 +14,33 @@ use std::{ffi::c_void, mem::size_of};
 use windows::{
     Win32::{
         Foundation::{
-            ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FreeLibrary, HMODULE,
+            CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FreeLibrary,
+            GENERIC_READ, HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE,
+        },
+        Security::{
+            Cryptography::Catalog::{
+                CATALOG_INFO, CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
+                CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseCatalogContext,
+                CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext,
+            },
+            WinTrust::{
+                DRIVER_ACTION_VERIFY, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_CATALOG_INFO,
+                WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_DATA_UNION_CHOICE, WINTRUST_FILE_INFO,
+                WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_CATALOG, WTD_CHOICE_FILE,
+                WTD_DISABLE_MD2_MD4, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+                WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
+            },
+        },
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BEGIN,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GetFileInformationByHandle,
+            OPEN_EXISTING, SetFilePointerEx,
         },
         System::{
             Diagnostics::Debug::ReadProcessMemory,
             LibraryLoader::{
-                GetModuleFileNameW, GetProcAddress, LOAD_LIBRARY_REQUIRE_SIGNED_TARGET,
-                LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+                GetModuleFileNameW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
             },
             Memory::{
                 MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
@@ -42,6 +62,9 @@ const LAYOUTS_KEY: PCWSTR = w!("SYSTEM\\CurrentControlSet\\Control\\Keyboard Lay
 const MAX_LAYOUTS: usize = 4096;
 const MAX_STRING_BYTES: usize = 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const MAX_KEYBOARD_DLL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CATALOG_HASH_BYTES: usize = 64;
+const MAX_CATALOGS_PER_HASH: usize = 16;
 
 struct RegistryKey(HKEY);
 
@@ -59,11 +82,248 @@ impl Drop for Module {
     }
 }
 
+struct ReadFile(HANDLE);
+
+impl Drop for ReadFile {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+impl ReadFile {
+    fn open(path: PCWSTR) -> Option<Self> {
+        // Do not share write or delete access: verification and loading must use
+        // the same bytes. Reject a final-component reparse point rather than
+        // following a keyboard DLL outside its registered System32 location.
+        let file = Self(unsafe {
+            CreateFileW(
+                path,
+                GENERIC_READ.0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+            .ok()?
+        });
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(file.0, &mut info).ok()? };
+        let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+        if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0)
+            != 0
+            || size == 0
+            || size > MAX_KEYBOARD_DLL_BYTES
+        {
+            return None;
+        }
+        Some(file)
+    }
+
+    fn rewind(&self) -> Option<()> {
+        unsafe { SetFilePointerEx(self.0, 0, None, FILE_BEGIN).ok() }
+    }
+}
+
+struct CatalogAdmin(isize);
+
+impl Drop for CatalogAdmin {
+    fn drop(&mut self) {
+        let _ = unsafe { CryptCATAdminReleaseContext(self.0, 0) };
+    }
+}
+
+struct CatalogSearch<'a> {
+    admin: &'a CatalogAdmin,
+    current: isize,
+}
+
+impl CatalogSearch<'_> {
+    fn next(&mut self, hash: &[u8]) -> Option<isize> {
+        // EnumCatalogFromHash advances/releases the previous enumeration
+        // context. Release only the current context when stopping early, as in
+        // Microsoft's Windows-classic-samples Security/CodeSigning sample.
+        let previous = (self.current != 0).then_some(&mut self.current as *mut _);
+        self.current =
+            unsafe { CryptCATAdminEnumCatalogFromHash(self.admin.0, hash, None, previous) };
+        (self.current != 0).then_some(self.current)
+    }
+}
+
+impl Drop for CatalogSearch<'_> {
+    fn drop(&mut self) {
+        if self.current != 0 {
+            let _ = unsafe { CryptCATAdminReleaseCatalogContext(self.admin.0, self.current, 0) };
+        }
+    }
+}
+
+fn verify_subject(choice: WINTRUST_DATA_UNION_CHOICE, subject: WINTRUST_DATA_0) -> i32 {
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let mut data = WINTRUST_DATA {
+        cbStruct: size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: choice,
+        Anonymous: subject,
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        // No network retrieval, UI, hash-only mode or disabled usage policy.
+        // Keep the normal Authenticode chain/publisher policy. The worker's
+        // request deadline remains unchanged.
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_DISABLE_MD2_MD4,
+        ..Default::default()
+    };
+    let status = unsafe {
+        WinVerifyTrust(
+            HWND(INVALID_HANDLE_VALUE.0),
+            &mut action,
+            (&mut data as *mut WINTRUST_DATA).cast(),
+        )
+    };
+    // CLOSE is required after every VERIFY, including a failed verification.
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    let _ = unsafe {
+        WinVerifyTrust(
+            HWND(INVALID_HANDLE_VALUE.0),
+            &mut action,
+            (&mut data as *mut WINTRUST_DATA).cast(),
+        )
+    };
+    // This is a LONG trust-provider status, not an HRESULT: only zero succeeds.
+    status
+}
+
+fn verify_file_signature(file: &ReadFile, path: PCWSTR) -> bool {
+    if file.rewind().is_none() {
+        return false;
+    }
+    let mut info = WINTRUST_FILE_INFO {
+        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: path,
+        hFile: file.0,
+        ..Default::default()
+    };
+    let status = verify_subject(WTD_CHOICE_FILE, WINTRUST_DATA_0 { pFile: &mut info });
+    #[cfg(test)]
+    eprintln!("native keyboard trust embedded status={:#x}", status as u32);
+    if status == 0 {
+        return true;
+    }
+    // System DLLs can be catalog signed without an embedded PE signature:
+    // https://learn.microsoft.com/windows/win32/seccrypto/using-signtool-to-verify-a-file-signature
+    // Use the system default catalog hash policy, then SHA-256 for catalogs
+    // indexed with that algorithm on systems whose default remains SHA-1.
+    [PCWSTR::null(), w!("SHA256")]
+        .into_iter()
+        .any(|algorithm| verify_catalog_signature(file, path, algorithm).is_some())
+}
+
+fn verify_catalog_signature(file: &ReadFile, path: PCWSTR, algorithm: PCWSTR) -> Option<()> {
+    let mut raw_admin = 0;
+    unsafe {
+        CryptCATAdminAcquireContext2(
+            &mut raw_admin,
+            Some(&DRIVER_ACTION_VERIFY),
+            algorithm,
+            None,
+            None,
+        )
+        .ok()?;
+    }
+    if raw_admin == 0 {
+        return None;
+    }
+    let admin = CatalogAdmin(raw_admin);
+    file.rewind()?;
+    let mut length = 0;
+    unsafe {
+        CryptCATAdminCalcHashFromFileHandle2(admin.0, file.0, &mut length, None, None).ok()?;
+    }
+    let capacity = usize::try_from(length).ok()?;
+    if capacity == 0 || capacity > MAX_CATALOG_HASH_BYTES {
+        return None;
+    }
+    let mut hash = vec![0; capacity];
+    file.rewind()?;
+    unsafe {
+        CryptCATAdminCalcHashFromFileHandle2(
+            admin.0,
+            file.0,
+            &mut length,
+            Some(hash.as_mut_ptr()),
+            None,
+        )
+        .ok()?;
+    }
+    if usize::try_from(length).ok()? != capacity {
+        return None;
+    }
+    let member_tag = catalog_member_tag(&hash);
+    let mut search = CatalogSearch {
+        admin: &admin,
+        current: 0,
+    };
+    for _ in 0..MAX_CATALOGS_PER_HASH {
+        let catalog = search.next(&hash)?;
+        let mut info = CATALOG_INFO {
+            cbStruct: size_of::<CATALOG_INFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { CryptCATCatalogInfoFromContext(catalog, &mut info, 0) }.is_err()
+            || !info.wszCatalogFile.contains(&0)
+            || info.wszCatalogFile[0] == 0
+        {
+            continue;
+        }
+        let mut subject = WINTRUST_CATALOG_INFO {
+            cbStruct: size_of::<WINTRUST_CATALOG_INFO>() as u32,
+            pcwszCatalogFilePath: PCWSTR(info.wszCatalogFile.as_ptr()),
+            pcwszMemberTag: PCWSTR(member_tag.as_ptr()),
+            pcwszMemberFilePath: path,
+            hMemberFile: file.0,
+            pbCalculatedFileHash: hash.as_mut_ptr(),
+            cbCalculatedFileHash: length,
+            hCatAdmin: admin.0,
+            ..Default::default()
+        };
+        file.rewind()?;
+        let status = verify_subject(
+            WTD_CHOICE_CATALOG,
+            WINTRUST_DATA_0 {
+                pCatalog: &mut subject,
+            },
+        );
+        #[cfg(test)]
+        eprintln!(
+            "native keyboard trust catalog hash_bytes={length} status={:#x}",
+            status as u32
+        );
+        if status == 0 {
+            return Some(());
+        }
+    }
+    None
+}
+
+fn catalog_member_tag(hash: &[u8]) -> Vec<u16> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    hash.iter()
+        .flat_map(|byte| {
+            [
+                u16::from(HEX[(byte >> 4) as usize]),
+                u16::from(HEX[(byte & 0x0f) as usize]),
+            ]
+        })
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 /// Keeps a trusted keyboard DLL mapped until the caller has copied its tables.
 /// This object stays on the parsing thread; only the resulting owned tables
 /// should be sent to other workers.
 pub(crate) struct KeyboardLibrary {
     module: Module,
+    _verified_file: ReadFile,
     descriptor: *const c_void,
 }
 
@@ -126,20 +386,31 @@ impl KeyboardLibrary {
         let directory = required!("system directory", system_directory());
         let path = format!("{directory}\\{filename}");
         let path_wide = wide(&path);
+        let file = required!(
+            "bounded read-only keyboard file",
+            ReadFile::open(PCWSTR(path_wide.as_ptr()))
+        );
+        required!(
+            "trusted embedded or catalog signature",
+            verify_file_signature(&file, PCWSTR(path_wide.as_ptr())).then_some(())
+        );
         // Use an absolute system path for the DLL and System32 only for its
         // dependencies. Do not search the application, working directory or PATH.
+        // REQUIRE_SIGNED_TARGET rejects the inbox keyboard DLLs on the native
+        // runner. The exact open file has already passed embedded or catalog
+        // Authenticode verification above, before any DLL code is executed.
         let loaded = unsafe {
             LoadLibraryExW(
                 PCWSTR(path_wide.as_ptr()),
                 None,
-                LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_REQUIRE_SIGNED_TARGET,
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
             )
         };
         #[cfg(test)]
         if let Err(error) = &loaded {
             eprintln!("native keyboard loader path={path:?} LoadLibraryExW error={error:?}");
         }
-        let module = Module(required!("signed System32 load", loaded.ok()));
+        let module = Module(required!("verified System32 load", loaded.ok()));
         let actual_path = required!("loaded module path", module_path(module.0));
         required!(
             "matching module path",
@@ -147,6 +418,7 @@ impl KeyboardLibrary {
         );
         let mut library = Self {
             module,
+            _verified_file: file,
             descriptor: std::ptr::null(),
         };
         let entry = required!("KbdLayerDescriptor export", unsafe {
@@ -516,6 +788,25 @@ mod tests {
     }
 
     #[test]
+    fn native_layout_library_rejects_unsigned_files_and_locks_signature_input() {
+        let Ok(directory) = tempfile::tempdir() else {
+            panic!("create isolated signature fixture directory");
+        };
+        let path = directory.path().join("unsigned.dll");
+        assert!(std::fs::write(&path, b"MZ unsigned keyboard table fixture").is_ok());
+        let path_wide = wide(&path.to_string_lossy());
+        let Some(file) = ReadFile::open(PCWSTR(path_wide.as_ptr())) else {
+            panic!("open isolated signature fixture");
+        };
+        assert!(!verify_file_signature(&file, PCWSTR(path_wide.as_ptr())));
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(file);
+        assert!(std::fs::remove_file(&path).is_ok());
+        assert_eq!(catalog_member_tag(&[0x00, 0xab, 0xff]), wide("00ABFF"));
+    }
+
+    #[test]
     fn native_layout_library_reads_installed_table_without_changing_active_layout() {
         use windows::Win32::UI::Input::{
             Ime::{ImmGetIMEFileNameW, ImmIsIME},
@@ -528,9 +819,14 @@ mod tests {
             unsafe { ImmIsIME(before) }.0,
             unsafe { ImmGetIMEFileNameW(before, None) },
         );
+        let started = std::time::Instant::now();
         let Some(library) = KeyboardLibrary::load(before.0 as usize) else {
             panic!("the Windows test runner's active ordinary layout must expose keyboard tables");
         };
+        eprintln!(
+            "native keyboard loader elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         assert!(
             library
                 .read_bytes(library.descriptor() as usize, size_of::<usize>())

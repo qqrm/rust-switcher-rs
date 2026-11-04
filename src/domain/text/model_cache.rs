@@ -27,6 +27,78 @@ pub(super) type ProbabilityModel = Map<Cow<'static, [u8]>>;
 
 const RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 
+#[cfg(any(windows, test))]
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(any(windows, test))]
+const MIN_RETRY_BUDGET: Duration = Duration::from_secs(10);
+
+#[cfg(any(windows, test))]
+enum DownloadFailure {
+    ResponseTimeout(io::Error),
+    Other(io::Error),
+}
+
+#[cfg(any(windows, test))]
+impl From<io::Error> for DownloadFailure {
+    fn from(error: io::Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl DownloadFailure {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::ResponseTimeout(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+// A stalled response-header wait has been observed after a successful send.
+// Retry that one failure with fresh handles, never a status or integrity error.
+// Both attempts share their original time budget, checked at API boundaries.
+// Synchronous WinHTTP phase timeouts do not provide hard wall-clock cancellation.
+#[cfg(any(windows, test))]
+fn retry_response_timeout<T>(
+    started: Instant,
+    mut attempt: impl FnMut() -> Result<T, DownloadFailure>,
+) -> io::Result<T> {
+    match attempt() {
+        Ok(value) => Ok(value),
+        Err(DownloadFailure::ResponseTimeout(error))
+            if DOWNLOAD_TIMEOUT.saturating_sub(started.elapsed()) >= MIN_RETRY_BUDGET =>
+        {
+            tracing::debug!(error = %error, "retrying model response with a fresh request");
+            #[cfg(test)]
+            let _ = writeln!(
+                io::stderr(),
+                "WinHTTP model download: retrying once after {error}"
+            );
+            attempt().map_err(DownloadFailure::into_io)
+        }
+        Err(error) => Err(error.into_io()),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn download_timeouts(started: Instant) -> io::Result<[i32; 4]> {
+    let remaining_ms = DOWNLOAD_TIMEOUT
+        .saturating_sub(started.elapsed())
+        .as_millis();
+    // WinHTTP treats zero as infinite. Reserve at least one millisecond for
+    // each of the resolve/connect/send phases within WinHttpSendRequest.
+    if remaining_ms < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "model download exhausted its shared 45-second budget",
+        ));
+    }
+    let short = (remaining_ms / 4).clamp(1, 5_000) as i32;
+    let send = (remaining_ms - 2 * short as u128).min(10_000) as i32;
+    let receive = remaining_ms.min(10_000) as i32;
+    Ok([short, short, send, receive])
+}
+
 #[derive(Default)]
 struct CacheState {
     ready: HashMap<&'static str, Arc<ProbabilityModel>>,
@@ -215,6 +287,13 @@ fn download_model(_spec: &ModelSpec) -> io::Result<Vec<u8>> {
 
 #[cfg(windows)]
 fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
+    validate_size(spec)?;
+    let started = Instant::now();
+    retry_response_timeout(started, || download_model_attempt(spec, started))
+}
+
+#[cfg(windows)]
+fn download_model_attempt(spec: &ModelSpec, started: Instant) -> Result<Vec<u8>, DownloadFailure> {
     use std::{ffi::c_void, ptr};
 
     use windows::{
@@ -249,8 +328,6 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
         }
     }
 
-    validate_size(spec)?;
-    let started = Instant::now();
     let windows_error = |operation: &str, error: windows::core::Error| {
         let kind = if error.code() == windows::core::HRESULT::from_win32(ERROR_WINHTTP_TIMEOUT) {
             io::ErrorKind::TimedOut
@@ -261,6 +338,11 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
             kind,
             format!("{operation} after {:?}: {error}", started.elapsed()),
         )
+    };
+    let set_timeouts = |handle: *mut c_void| -> io::Result<()> {
+        let [resolve, connect, send, receive] = download_timeouts(started)?;
+        unsafe { WinHttpSetTimeouts(handle, resolve, connect, send, receive) }
+            .map_err(|error| windows_error("WinHttpSetTimeouts", error))
     };
     let agent: Vec<u16> = concat!("RustSwitcher/", env!("CARGO_PKG_VERSION"))
         .encode_utf16()
@@ -282,8 +364,7 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
     #[cfg(test)]
     install_network_diagnostics(session.0)
         .map_err(|error| windows_error("WinHttpSetStatusCallback", error))?;
-    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 10_000) }
-        .map_err(|error| windows_error("WinHttpSetTimeouts", error))?;
+    set_timeouts(session.0)?;
     let protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2.to_ne_bytes();
     unsafe {
         WinHttpSetOption(
@@ -318,10 +399,18 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
         )
     }
     .map_err(|error| windows_error("WinHttpSetOption(redirect policy)", error))?;
+    set_timeouts(request.0)?;
     unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }
         .map_err(|error| windows_error("WinHttpSendRequest", error))?;
-    unsafe { WinHttpReceiveResponse(request.0, ptr::null_mut()) }
-        .map_err(|error| windows_error("WinHttpReceiveResponse", error))?;
+    set_timeouts(request.0)?;
+    unsafe { WinHttpReceiveResponse(request.0, ptr::null_mut()) }.map_err(|error| {
+        let error = windows_error("WinHttpReceiveResponse", error);
+        if error.kind() == io::ErrorKind::TimedOut {
+            DownloadFailure::ResponseTimeout(error)
+        } else {
+            DownloadFailure::Other(error)
+        }
+    })?;
     let mut status = 0u32;
     let mut status_len = size_of::<u32>() as u32;
     unsafe {
@@ -336,19 +425,12 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
     }
     .map_err(|error| windows_error("WinHttpQueryHeaders(status)", error))?;
     if status != 200 {
-        return Err(io::Error::other(format!(
-            "model server returned HTTP {status}"
-        )));
+        return Err(io::Error::other(format!("model server returned HTTP {status}")).into());
     }
 
     let mut bytes = Vec::with_capacity(spec.byte_len);
     loop {
-        if started.elapsed() > Duration::from_secs(45) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "model download timed out",
-            ));
-        }
+        set_timeouts(request.0)?;
         let mut buffer = [0u8; 8192];
         let mut received = 0u32;
         unsafe {
@@ -365,10 +447,11 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
         }
         let received = received as usize;
         if received > buffer.len() || received > spec.byte_len.saturating_sub(bytes.len()) {
-            return Err(invalid_data("model response exceeds the manifest length"));
+            return Err(invalid_data("model response exceeds the manifest length").into());
         }
         bytes.extend_from_slice(&buffer[..received]);
     }
+    download_timeouts(started)?;
     verify_payload(spec, &bytes)?;
     Ok(bytes)
 }
@@ -390,7 +473,7 @@ fn install_network_diagnostics(handle: *mut std::ffi::c_void) -> windows::core::
     };
 
     // A response can trigger these notifications for every small body read.
-    // The hosted test only needs the first observation of each phase.
+    // The hosted test only needs the first observation of each phase per attempt.
     static SEEN_PHASES: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "system" fn callback(
@@ -420,6 +503,7 @@ fn install_network_diagnostics(handle: *mut std::ffi::c_void) -> windows::core::
         let _ = writeln!(io::stderr(), "WinHTTP model download: {phase}");
     }
 
+    SEEN_PHASES.store(0, Ordering::Relaxed);
     let previous = unsafe {
         WinHttpSetStatusCallback(
             handle,
@@ -596,6 +680,90 @@ mod tests {
             panic!("A valid cached model must not trigger a download");
         })?;
         assert!(loaded.contains_key("hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn response_header_timeout_can_recover_with_one_fresh_attempt() -> io::Result<()> {
+        let mut attempts = 0;
+        let bytes = retry_response_timeout(Instant::now(), || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(DownloadFailure::ResponseTimeout(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "WinHttpReceiveResponse timed out",
+                )))
+            } else {
+                Ok(vec![1, 2, 3])
+            }
+        })?;
+        assert_eq!(attempts, 2);
+        assert_eq!(bytes, [1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_response_header_timeouts_stop_after_two_attempts() {
+        let mut attempts = 0;
+        let result: io::Result<()> = retry_response_timeout(Instant::now(), || {
+            attempts += 1;
+            Err(DownloadFailure::ResponseTimeout(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WinHttpReceiveResponse timed out",
+            )))
+        });
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn status_integrity_and_other_transport_failures_are_never_retried() {
+        for (kind, message) in [
+            (io::ErrorKind::Other, "model server returned HTTP 503"),
+            (io::ErrorKind::InvalidData, "model SHA-256 mismatch"),
+            (io::ErrorKind::InvalidData, "truncated model response"),
+            (io::ErrorKind::TimedOut, "WinHttpSendRequest timed out"),
+            (io::ErrorKind::TimedOut, "WinHttpReadData timed out"),
+        ] {
+            let mut attempts = 0;
+            let result: io::Result<()> = retry_response_timeout(Instant::now(), || {
+                attempts += 1;
+                Err(io::Error::new(kind, message).into())
+            });
+            assert!(matches!(result, Err(error) if error.kind() == kind));
+            assert_eq!(attempts, 1, "{message}");
+        }
+    }
+
+    #[test]
+    fn response_retry_does_not_reset_an_almost_exhausted_shared_budget() {
+        let started = Instant::now() - DOWNLOAD_TIMEOUT + Duration::from_secs(9);
+        let mut attempts = 0;
+        let result: io::Result<()> = retry_response_timeout(started, || {
+            attempts += 1;
+            Err(DownloadFailure::ResponseTimeout(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WinHttpReceiveResponse timed out",
+            )))
+        });
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn network_timeouts_shrink_with_the_budget_and_never_become_infinite() -> io::Result<()> {
+        let started = Instant::now() - DOWNLOAD_TIMEOUT + Duration::from_secs(2);
+        let timeouts = download_timeouts(started)?;
+        assert!(
+            timeouts
+                .into_iter()
+                .all(|timeout| (1..=2_000).contains(&timeout))
+        );
+        assert!(timeouts[..3].iter().sum::<i32>() <= 2_000);
+        assert!(matches!(
+            download_timeouts(Instant::now() - DOWNLOAD_TIMEOUT),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut
+        ));
         Ok(())
     }
 

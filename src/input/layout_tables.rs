@@ -112,9 +112,14 @@ impl KeyboardTables {
             return None;
         }
         let library = KeyboardLibrary::load(hkl)?;
-        Self::parse(library.descriptor() as usize, |address, length| {
+        let parsed = Self::parse(library.descriptor() as usize, |address, length| {
             library.read_bytes(address, length)
-        })
+        });
+        #[cfg(test)]
+        if parsed.is_none() {
+            eprintln!("native keyboard table parser rejected hkl={hkl:#x}");
+        }
+        parsed
     }
 
     fn parse(descriptor: usize, read: impl FnMut(usize, usize) -> Option<Vec<u8>>) -> Option<Self> {
@@ -128,6 +133,8 @@ impl KeyboardTables {
         // modifier synthesis, which the caller supplies explicitly. SHIFTLOCK,
         // LRM/RLM and unknown locale processing need additional stateful APIs.
         if flags >> 16 != 1 || flags as u16 & !0x0001 != 0 {
+            #[cfg(test)]
+            eprintln!("native keyboard table parser unsupported locale flags={flags:#010x}");
             return None;
         }
         let modifiers_address = read_pointer(&raw, offset_of!(RawTables, modifiers))?;
@@ -135,6 +142,8 @@ impl KeyboardTables {
         let modifier_bits_address = read_pointer(&modifier_header, 0)?;
         let max_bits = usize::from(read_u16(&modifier_header, size_of::<usize>())?);
         if max_bits > 255 {
+            #[cfg(test)]
+            eprintln!("native keyboard table parser modifier bound={max_bits}");
             return None;
         }
         // MODIFIERS.ModNumber is a flexible array immediately after the WORD,
@@ -147,6 +156,10 @@ impl KeyboardTables {
             .iter()
             .any(|&n| n > 9 && n != INVALID_SHIFT)
         {
+            #[cfg(test)]
+            eprintln!(
+                "native keyboard table parser invalid modifier numbers={modification_numbers:?}"
+            );
             return None;
         }
         let mut modifiers = Vec::new();
@@ -162,6 +175,11 @@ impl KeyboardTables {
                 || bits[1] & !(SHIFT | CONTROL | ALT) != 0
                 || modifiers.iter().any(|&(previous, _)| previous == vk)
             {
+                #[cfg(test)]
+                eprintln!(
+                    "native keyboard table parser invalid modifier vk={vk:#x} bits={:#x}",
+                    bits[1]
+                );
                 return None;
             }
             modifiers.push((vk, bits[1]));
@@ -170,16 +188,31 @@ impl KeyboardTables {
             return None;
         }
 
-        let ligatures = parse_ligatures(&raw, &mut reader)?;
+        let ligatures = parse_ligatures(&raw, &mut reader);
+        #[cfg(test)]
+        if ligatures.is_none() {
+            eprintln!("native keyboard table parser rejected ligatures");
+        }
+        let ligatures = ligatures?;
         let rows = parse_character_tables(
             read_pointer(&raw, offset_of!(RawTables, characters))?,
             &ligatures,
             &mut reader,
-        )?;
+        );
+        #[cfg(test)]
+        if rows.is_none() {
+            eprintln!("native keyboard table parser rejected character rows");
+        }
+        let rows = rows?;
         let dead_keys = parse_dead_keys(
             read_pointer(&raw, offset_of!(RawTables, dead_keys))?,
             &mut reader,
-        )?;
+        );
+        #[cfg(test)]
+        if dead_keys.is_none() {
+            eprintln!("native keyboard table parser rejected dead-key transitions");
+        }
+        let dead_keys = dead_keys?;
         Some(Self {
             modifiers,
             modification_numbers,
@@ -281,7 +314,12 @@ impl<F: FnMut(usize, usize) -> Option<Vec<u8>>> Reader<F> {
         }
         address.checked_add(length)?;
         self.remaining = self.remaining.checked_sub(length)?;
-        let bytes = (self.read)(address, length)?;
+        let bytes = (self.read)(address, length);
+        #[cfg(test)]
+        if bytes.is_none() {
+            eprintln!("native keyboard table parser could not snapshot {length} bytes");
+        }
+        let bytes = bytes?;
         (bytes.len() == length).then_some(bytes)
     }
 
@@ -325,6 +363,8 @@ fn parse_ligatures<F: FnMut(usize, usize) -> Option<Vec<u8>>>(
         return Some(entries);
     }
     if !(1..=16).contains(&length) || stride != 4 + 2 * length || address == 0 {
+        #[cfg(test)]
+        eprintln!("native keyboard table parser invalid ligature length={length} stride={stride}");
         return None;
     }
     for index in 0..MAX_LIGATURES {
@@ -374,6 +414,10 @@ fn parse_character_tables<F: FnMut(usize, usize) -> Option<Vec<u8>>>(
         let columns = usize::from(table[offset_of!(RawCharacterTable, columns)]);
         let stride = usize::from(table[offset_of!(RawCharacterTable, stride)]);
         if !(1..=10).contains(&columns) || stride != 2 + 2 * columns {
+            #[cfg(test)]
+            eprintln!(
+                "native keyboard table parser invalid character table columns={columns} stride={stride}"
+            );
             return None;
         }
         let mut row_index = 0;
@@ -392,6 +436,12 @@ fn parse_character_tables<F: FnMut(usize, usize) -> Option<Vec<u8>>>(
                 || row[1] & !(CAPLOK | CAPLOKALTGR) != 0
                 || rows[usize::from(vk)].is_some()
             {
+                #[cfg(test)]
+                eprintln!(
+                    "native keyboard table parser invalid character row vk={vk:#x} attributes={:#x} duplicate={}",
+                    row[1],
+                    rows[usize::from(vk)].is_some()
+                );
                 return None;
             }
             let has_dead =
