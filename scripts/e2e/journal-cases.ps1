@@ -94,11 +94,11 @@ foreach ($modifier in @(@{ Name = 'ctrl-release'; Key = 0xA2 }, @{ Name = 'alt-r
         }
     }
 }
-# These characterize the unchanged 100-character policy separately from short
-# first-character failures. They do not claim that converting only a tail is ideal.
+# A previous 100-character cap left the first glyph unchanged at 101 characters.
+$cases.Add(@{ Mode = 'capacity-99'; Text = 'a' * 99; Expected = 'ф' * 99; Modifier = 0; Delay = 0; Repeat = 1 })
 $cases.Add(@{ Mode = 'capacity-100'; Text = 'a' * 100; Expected = 'ф' * 100; Modifier = 0; Delay = 0; Repeat = 1 })
-$cases.Add(@{ Mode = 'capacity-101'; Text = 'a' * 101; Expected = 'a' + ('ф' * 100); Modifier = 0; Delay = 0; Repeat = 1 })
-$cases.Add(@{ Mode = 'capacity-leading-dot'; Text = '.' + ('a' * 100); Expected = '.' + ('ф' * 100); Modifier = 0; Delay = 0; Repeat = 1 })
+$cases.Add(@{ Mode = 'capacity-101'; Text = 'a' * 101; Expected = 'ф' * 101; Modifier = 0; Delay = 0; Repeat = 1 })
+$cases.Add(@{ Mode = 'capacity-leading-dot'; Text = '.' + ('a' * 100); Expected = 'ю' + ('ф' * 100); Modifier = 0; Delay = 0; Repeat = 1 })
 
 $appHandle = [IntPtr]$AppWindow.Current.NativeWindowHandle
 $appValue = Get-Pattern $AppPlayground ([System.Windows.Automation.ValuePattern]::Pattern)

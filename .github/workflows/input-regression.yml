@@ -38,6 +38,11 @@ jobs:
           }
           cargo +nightly test --locked --bin rust-switcher native_input_ -- --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native input regression tests failed' }
+      - name: Keep the first glyph across caret recreation and isolate focus changes
+        shell: pwsh
+        run: |
+          cargo +nightly test --locked --bin rust-switcher foreground_switch_ -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Editor focus regression tests failed' }
       - name: Report exact formatting changes
         if: always()
         shell: pwsh

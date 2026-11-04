@@ -40,13 +40,13 @@ fields, including password fields, are excluded from keyboard processing.
 
 ## Memory and retention
 
-- The active input journal keeps up to 100 Unicode characters, together with
+- The active input journal keeps up to 4096 Unicode characters, together with
   layout and editing context. Older text is dropped as the journal reaches
   its limit. The active journal has no two-minute expiry timer.
 - When the editing focus changes, the application may cache a copy of that
   context's journal so recent text can be restored when you return. Each
-  cached journal has the same 100-character limit; multiple contexts can
-  retain more than 100 characters in total.
+  cached journal has the same 4096-character limit; multiple contexts can
+  retain more than 4096 characters in total.
 - Cached entries expire after two minutes from caching. Expiry is checked
   when the application processes a relevant focus change, not by a background
   deletion timer. Expired entries may therefore remain in memory until that

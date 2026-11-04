@@ -26,6 +26,7 @@ use windows::Win32::{
 };
 
 static JOURNAL: OnceLock<Mutex<InputJournal>> = OnceLock::new();
+const DEFAULT_CAPACITY_CHARS: usize = 4096;
 #[cfg(windows)]
 static JOURNAL_CACHE: OnceLock<Mutex<HashMap<FocusCacheKey, CachedJournal>>> = OnceLock::new();
 
@@ -41,7 +42,7 @@ fn allow_injected_input_for_e2e() -> bool {
 }
 
 fn journal() -> &'static Mutex<InputJournal> {
-    JOURNAL.get_or_init(|| Mutex::new(InputJournal::new(100)))
+    JOURNAL.get_or_init(|| Mutex::new(InputJournal::new(DEFAULT_CAPACITY_CHARS)))
 }
 
 #[cfg(test)]
@@ -160,9 +161,10 @@ struct CachedJournal {
 
 #[cfg(windows)]
 fn same_focus_identity(a: FocusCacheKey, b: FocusCacheKey) -> bool {
-    a.foreground_hwnd == b.foreground_hwnd
-        && a.focus_hwnd == b.focus_hwnd
-        && a.caret_hwnd == b.caret_hwnd
+    // A caret can be recreated after the first glyph without moving keyboard focus.
+    // Treating its owner as a new editor discards that glyph from the live journal.
+    // The complete caret signature still guards restoration after a focus switch.
+    a.foreground_hwnd == b.foreground_hwnd && a.focus_hwnd == b.focus_hwnd
 }
 
 #[derive(Clone, Debug, Default)]
@@ -172,6 +174,8 @@ struct InputJournal {
     total_chars: usize,
     caret_from_end: usize,
     last_token_autoconverted: bool,
+    // Shrinking the buffer later cannot make a discarded prefix known again.
+    prefix_truncated: bool,
     #[cfg(windows)]
     last_fg_hwnd: isize,
     #[cfg(windows)]
@@ -186,6 +190,7 @@ impl InputJournal {
             total_chars: 0,
             caret_from_end: 0,
             last_token_autoconverted: false,
+            prefix_truncated: false,
             #[cfg(windows)]
             last_fg_hwnd: 0,
             #[cfg(windows)]
@@ -199,6 +204,7 @@ impl InputJournal {
         self.total_chars = 0;
         self.caret_from_end = 0;
         self.last_token_autoconverted = false;
+        self.prefix_truncated = false;
     }
 
     fn append_segment_end(
@@ -318,6 +324,7 @@ impl InputJournal {
             let mut remove_front_run = false;
 
             if let Some(front) = self.runs.front_mut() {
+                self.prefix_truncated = true;
                 if let Some((idx, _)) = front.text.char_indices().nth(1) {
                     front.text.drain(..idx);
                 } else {
@@ -512,7 +519,9 @@ impl InputJournal {
 
         let mut suffix_runs = self.pop_suffix_whitespace();
 
-        let result = if self.runs.back().is_none_or(|run| run.kind != RunKind::Text) {
+        let result = if self.runs.back().is_none_or(|run| run.kind != RunKind::Text)
+            || (self.prefix_truncated && self.runs.len() == 1)
+        {
             self.restore_suffix(&mut suffix_runs);
             None
         } else if let Some(run) = self.runs.pop_back() {
@@ -559,7 +568,8 @@ impl InputJournal {
                 seq_rev.push(run);
             }
 
-            if seq_rev.is_empty() {
+            if seq_rev.is_empty() || (self.prefix_truncated && self.runs.is_empty()) {
+                self.restore_suffix(&mut seq_rev);
                 self.restore_suffix(&mut suffix_runs);
                 None
             } else {
@@ -603,7 +613,8 @@ impl InputJournal {
                 seq_rev.push(run);
             }
 
-            if seq_rev.is_empty() {
+            if seq_rev.is_empty() || (self.prefix_truncated && self.runs.is_empty()) {
+                self.restore_suffix(&mut seq_rev);
                 self.restore_suffix(&mut suffix_runs);
                 None
             } else {
@@ -670,7 +681,10 @@ impl InputJournal {
             }
         }
 
-        if seq_rev.is_empty() {
+        if seq_rev.is_empty() || (self.prefix_truncated && self.runs.is_empty()) {
+            // A retained tail is not the full typed sequence. Leave both the
+            // document and journal intact instead of converting only its suffix.
+            self.restore_suffix(&mut seq_rev);
             self.restore_suffix(&mut suffix_runs);
             return None;
         }
@@ -958,7 +972,8 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
     let mut output: Option<String> = None;
 
     match vk {
-        VK_ESCAPE | VK_DELETE | VK_INSERT | VK_UP | VK_DOWN | VK_HOME | VK_PRIOR | VK_NEXT => {
+        VK_ESCAPE | VK_DELETE | VK_INSERT | VK_UP | VK_DOWN | VK_HOME | VK_PRIOR | VK_NEXT
+        | VK_TAB => {
             action = Some(JournalAction::Clear);
         }
         VK_LEFT => action = Some(JournalAction::MoveCaretLeft),
@@ -970,15 +985,6 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
             output = Some("\n".to_string());
             action = Some(JournalAction::PushText {
                 text: "\n".to_string(),
-                layout,
-                origin: RunOrigin::Physical,
-            });
-        }
-        VK_TAB => {
-            let layout = current_foreground_layout_tag();
-            output = Some("\t".to_string());
-            action = Some(JournalAction::PushText {
-                text: "\t".to_string(),
                 layout,
                 origin: RunOrigin::Physical,
             });
@@ -1200,6 +1206,126 @@ pub fn last_char_triggers_autoconvert() -> bool {
 
         false
     })
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    fn captured_text(text: &str, origin: RunOrigin, capacity: usize) -> InputJournal {
+        let mut journal = InputJournal::new(capacity);
+        for ch in text.chars() {
+            journal.push_text_internal(&ch.to_string(), LayoutTag::En, origin);
+        }
+        journal
+    }
+
+    #[test]
+    fn native_input_journal_capacity_keeps_the_first_glyph_through_4096_characters() {
+        for length in [99, 100, 101, DEFAULT_CAPACITY_CHARS] {
+            let text = format!(".{}", "a".repeat(length - 1));
+            let mut journal = captured_text(&text, RunOrigin::Physical, DEFAULT_CAPACITY_CHARS);
+            let (runs, suffix) = journal
+                .take_last_sequence_with_suffix()
+                .expect("the complete sequence must remain convertible");
+            assert!(suffix.is_empty());
+            assert_eq!(
+                runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                text,
+                "journal input length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_input_journal_overflow_refuses_partial_word_and_sequence_without_mutation() {
+        for origin in [RunOrigin::Physical, RunOrigin::Programmatic] {
+            for trailing in ["", " "] {
+                let text = format!(".{}{trailing}", "a".repeat(DEFAULT_CAPACITY_CHARS));
+                let mut journal = captured_text(&text, origin, DEFAULT_CAPACITY_CHARS);
+                let before = journal.runs.clone();
+                assert_eq!(journal.total_chars, DEFAULT_CAPACITY_CHARS);
+
+                assert!(journal.take_last_layout_run_with_suffix().is_none());
+                assert_eq!(journal.runs, before);
+                assert!(journal.take_last_sequence_with_suffix().is_none());
+                assert_eq!(journal.runs, before);
+                assert!(journal.take_last_layout_sequence_with_suffix().is_none());
+                assert_eq!(journal.runs, before);
+                assert!(
+                    journal
+                        .take_last_programmatic_sequence_with_suffix()
+                        .is_none()
+                );
+                assert_eq!(journal.runs, before);
+                assert_eq!(journal.total_chars, DEFAULT_CAPACITY_CHARS);
+            }
+        }
+    }
+
+    #[test]
+    fn native_input_journal_overflow_keeps_complete_last_word_after_a_retained_boundary() {
+        let mut journal = captured_text("overlongoldprefix ghbdtn ", RunOrigin::Physical, 10);
+        let before = journal.runs.clone();
+        assert!(journal.take_last_sequence_with_suffix().is_none());
+        assert_eq!(journal.runs, before);
+
+        let (word, suffix) = journal
+            .take_last_layout_run_with_suffix()
+            .expect("the final word has a known whitespace boundary");
+        assert_eq!(word.text, "ghbdtn");
+        assert_eq!(
+            suffix
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            " "
+        );
+        journal.push_run(word);
+        journal.push_runs(suffix);
+        assert_eq!(journal.runs, before);
+        assert!(journal.take_last_sequence_with_suffix().is_none());
+        assert_eq!(journal.runs, before);
+    }
+
+    #[test]
+    fn native_input_journal_overflow_rejection_preserves_the_caret() {
+        let mut journal = captured_text(".abcdefgh ", RunOrigin::Programmatic, 8);
+        journal.move_caret_left();
+        journal.move_caret_left();
+        journal.move_caret_left();
+        let before = journal.runs.clone();
+
+        assert!(journal.take_last_layout_run_with_suffix().is_none());
+        assert_eq!(journal.runs, before);
+        assert_eq!(journal.caret_from_end, 3);
+        assert!(journal.take_last_layout_sequence_with_suffix().is_none());
+        assert_eq!(journal.runs, before);
+        assert_eq!(journal.caret_from_end, 3);
+        assert!(
+            journal
+                .take_last_programmatic_sequence_with_suffix()
+                .is_none()
+        );
+        assert_eq!(journal.runs, before);
+        assert_eq!(journal.caret_from_end, 3);
+    }
+
+    #[test]
+    fn native_input_journal_overflow_recovers_after_clear() {
+        let mut journal = captured_text(".abcdefgh", RunOrigin::Physical, 8);
+        assert!(journal.take_last_sequence_with_suffix().is_none());
+        journal.clear();
+        journal.push_text_internal(".ghbdtn", LayoutTag::En, RunOrigin::Physical);
+        let (runs, suffix) = journal
+            .take_last_sequence_with_suffix()
+            .expect("a new input session must recover after overflow");
+        assert!(suffix.is_empty());
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            ".ghbdtn"
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1429,31 +1555,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_input_journal_capacity_preserves_100_characters_and_truncates_the_101st_prefix() {
-        for length in [99, 100, 101] {
-            let text = format!(".{}", "a".repeat(length - 1));
-            let expected = if length == 101 {
-                "a".repeat(100)
-            } else {
-                text.clone()
-            };
-            let mut journal = InputJournal::new(100);
-            for ch in text.chars() {
-                journal.push_text_internal(&ch.to_string(), LayoutTag::En, RunOrigin::Physical);
-            }
-            let (runs, suffix) = journal
-                .take_last_sequence_with_suffix()
-                .expect("the retained tail must remain convertible");
-            assert!(suffix.is_empty());
-            assert_eq!(
-                runs.iter().map(|run| run.text.as_str()).collect::<String>(),
-                expected,
-                "journal input length {length}"
-            );
-        }
-    }
-
     fn test_run(text: &str, layout: LayoutTag) -> InputRun {
         InputRun {
             text: text.to_string(),
@@ -1648,6 +1749,73 @@ mod tests {
                 .collect::<String>(),
             "second"
         );
+    }
+
+    #[test]
+    fn foreground_switch_same_control_caret_recreation_keeps_first_glyph() {
+        let _guard = test_guard();
+        for (first, rest) in [("g", "hbdtn"), (".", "ghbdtn"), (".", "")] {
+            invalidate();
+            test_switch_foreground_control(1001, 11, 21, 10, 1_000);
+            push_run(test_run(first, LayoutTag::En));
+
+            // The application processes the first glyph and replaces the caret owner.
+            // No focus transition or mouse/navigation input occurred in between.
+            test_switch_foreground_control(1001, 11, 22, 20, 1_001);
+            push_run(test_run(rest, LayoutTag::En));
+            let text = with_journal_mut(|journal| {
+                let (runs, _) = journal
+                    .take_last_sequence_with_suffix()
+                    .expect("first glyph must remain available to Double Alt");
+                runs.iter().map(|run| run.text.as_str()).collect::<String>()
+            });
+            assert_eq!(text, format!("{first}{rest}"));
+        }
+    }
+
+    #[test]
+    fn foreground_switch_new_control_with_same_caret_owner_starts_empty() {
+        let _guard = test_guard();
+        invalidate();
+        test_switch_foreground_control(1001, 11, 21, 10, 1_000);
+        push_run(test_run("source-must-stay", LayoutTag::En));
+
+        test_switch_foreground_control(1001, 12, 21, 10, 1_001);
+        assert!(runs_snapshot().is_empty());
+        push_run(test_run("destination", LayoutTag::En));
+
+        test_switch_foreground_control(1001, 11, 21, 10, 1_002);
+        let text = runs_snapshot()
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "source-must-stay");
+    }
+
+    #[test]
+    fn native_input_tab_navigation_discards_previous_field() {
+        let _guard = test_guard();
+        invalidate();
+        push_run(test_run("source-must-stay", LayoutTag::En));
+
+        // Browser DOM fields can share a focused native HWND. Tab is therefore a
+        // journal boundary even when a later GetGUIThreadInfo snapshot is equal.
+        let key = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(VK_TAB.0),
+            scanCode: 0x0f,
+            ..Default::default()
+        };
+        assert_eq!(record_keydown(&key, u32::from(VK_TAB.0)), None);
+        assert!(runs_snapshot().is_empty());
+
+        push_run(test_run(".ghbdtn", LayoutTag::En));
+        let text = with_journal_mut(|journal| {
+            let (runs, _) = journal
+                .take_last_sequence_with_suffix()
+                .expect("new field text should be available");
+            runs.iter().map(|run| run.text.as_str()).collect::<String>()
+        });
+        assert_eq!(text, ".ghbdtn");
     }
 
     #[test]

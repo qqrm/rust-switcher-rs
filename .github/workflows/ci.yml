@@ -124,6 +124,13 @@ jobs:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: ./scripts/e2e/run-hosted.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
 
+      - name: Verify Double Alt in real browser fields
+        timeout-minutes: 8
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/run-browser.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe
+
       - name: Verify real crate packaging and tokenless publisher preflight
         shell: pwsh
         env:
