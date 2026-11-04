@@ -6,7 +6,7 @@
 //! it cannot change the user's pending Windows keyboard composition.
 
 #[cfg(test)]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 use std::{collections::HashMap, sync::OnceLock, time::Duration};
 
 use windows::Win32::{
@@ -54,13 +54,10 @@ const CONVERSION_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct LayoutId(pub usize);
 
-/// Public-provider tests share its deliberately bounded production worker.
+/// Native fixtures share Windows keyboard state and journal invalidation.
 #[cfg(test)]
 pub(crate) fn test_guard() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::input::ring_buffer::test_guard()
 }
 
 impl LayoutId {

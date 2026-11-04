@@ -114,9 +114,36 @@ fn native_planner_full_catalog_selects_ukrainian_french_and_german() {
 fn native_planner_automatic_abstains_between_valid_russian_and_ukrainian_words() {
     let _guard = layouts::test_guard();
     let catalog = catalog();
-    // The same keys give Ukrainian "привіт" and the valid Russian "привит".
-    // Their evidence clears the manual margin but not the automatic margin.
-    assert!(plan_text("ghbdsn", Some(catalog.english), Policy::Automatic).is_none());
+    // Both interpretations are valid words: Russian "вырыть" and Ukrainian
+    // "віріть". Verify the physical premise through the native provider before
+    // testing the ranking policy, rather than assuming the two mappings.
+    for (target, expected) in [(catalog.russian, "вырыть"), (catalog.ukrainian, "віріть")]
+    {
+        assert_eq!(
+            layouts::convert_text("dshsnm", catalog.english, target).as_deref(),
+            Some(expected)
+        );
+    }
+    assert!(plan_text("dshsnm", Some(catalog.english), Policy::Automatic).is_none());
+}
+
+#[test]
+#[ignore = "requires the seven-layout fixture on a disposable hosted Windows desktop"]
+fn native_planner_automatic_recovers_ukrainian_when_russian_keys_produce_gibberish() {
+    let _guard = layouts::test_guard();
+    let catalog = catalog();
+    // US s maps to Russian ы, so this does not compete with Russian "привит".
+    for (target, expected) in [(catalog.russian, "привыт"), (catalog.ukrainian, "привіт")]
+    {
+        assert_eq!(
+            layouts::convert_text("ghbdsn", catalog.english, target).as_deref(),
+            Some(expected)
+        );
+    }
+    let plan = plan_text("ghbdsn", Some(catalog.english), Policy::Automatic)
+        .expect("unambiguous Ukrainian input must retain automatic recovery");
+    assert_eq!(plan.text, "привіт");
+    assert_eq!(plan.target, catalog.ukrainian);
 }
 
 #[test]

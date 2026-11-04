@@ -453,6 +453,39 @@ mod tests {
     }
 
     #[test]
+    fn automatic_ranking_distinguishes_real_russian_ukrainian_physical_candidates() {
+        // The hosted native planner tests independently verify these physical
+        // outputs against the installed Windows layouts. In particular, US s
+        // is Russian ы and Ukrainian і: ghbdsn does not produce Russian привит.
+        for (source, russian, ukrainian, french, manual, automatic) in [
+            (
+                "ghbdsn",
+                "привыт",
+                "привіт",
+                "ghbdsn",
+                "привіт",
+                Some("привіт"),
+            ),
+            ("dshsnm", "вырыть", "віріть", "dshsn,", "вырыть", None),
+        ] {
+            let mut candidates = vec![
+                candidate(russian, "ru-RU"),
+                candidate(ukrainian, "uk-UA"),
+                candidate(french, "fr-FR"),
+            ];
+            for language in ["en-US", "ru-RU", "uk-UA", "de-DE", "fr-FR", "pl-PL"] {
+                candidates.push(candidate(source, language));
+            }
+            let chosen = |mode| {
+                rank_candidates(source, &candidates, mode)
+                    .map(|index| candidates[index].text.as_str())
+            };
+            assert_eq!(chosen(RankingMode::Manual), Some(manual), "{source}");
+            assert_eq!(chosen(RankingMode::Automatic), automatic, "{source}");
+        }
+    }
+
+    #[test]
     fn automatic_ranking_abstains_when_original_script_has_no_model() {
         let candidates = [candidate("你好世界", "zz-ZZ"), candidate("привет", "ru-RU")];
         assert_eq!(

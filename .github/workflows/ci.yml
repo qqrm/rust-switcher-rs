@@ -121,6 +121,12 @@ jobs:
         run: |
           cargo +nightly nextest run --locked --no-fail-fast
           if ($LASTEXITCODE -ne 0) { throw 'Windows unit tests failed' }
+      - name: Verify the release workflow's parallel test mode
+        if: ${{ !cancelled() && steps.app_build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          cargo +nightly test --workspace --all-features --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Release-mode unit test isolation failed' }
       - name: Verify multilingual planning
         if: ${{ !cancelled() && steps.layout_fixture.outcome == 'success' }}
         shell: pwsh

@@ -812,6 +812,7 @@ mod tests {
             Ime::{ImmGetIMEFileNameW, ImmIsIME},
             KeyboardAndMouse::GetKeyboardLayout,
         };
+        let _guard = crate::input::ring_buffer::test_guard();
         let before = unsafe { GetKeyboardLayout(0) };
         eprintln!(
             "native keyboard loader hkl={:#x} ImmIsIME={} IME filename length={}",

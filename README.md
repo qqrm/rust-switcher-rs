@@ -67,8 +67,11 @@ Conversions use the physical key positions and the corresponding Windows layout
 drivers. This preserves distinctions such as QWERTY, QWERTZ, AZERTY, and variants
 sharing a language. Shift, Caps Lock, AltGr, and ordinary dead-key combinations
 use the character and accent tables supplied by the installed keyboard driver.
-Composition is tracked inside Rust Switcher. IMEs and unsupported multi-stage
-composition are excluded; a transformation that cannot be completed is left unchanged.
+Composition is tracked inside Rust Switcher. Legacy IME registrations and
+unsupported keyboard-table formats are rejected; a transformation that cannot
+be completed is left unchanged. Modern TSF composition and custom text services
+are unsupported: a foreground keyboard-layout handle alone does not reliably
+identify their composition state.
 
 With several layouts installed, local character n-gram models rank possible
 results. The model catalog covers 75 languages; only models relevant to installed

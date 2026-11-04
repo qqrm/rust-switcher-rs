@@ -142,6 +142,14 @@ guarded test adds and removes Swedish after the provider starts and verifies
 that a removed layout cannot remain a target through its cached table. Ordinary
 developer test runs do not require changing the user's installed language list.
 
+The public-provider gate also compares the pure keyboard-table interpreter with
+the native `ToUnicodeEx` API across all seven layouts: 49 printable key positions
+and eight Shift/Caps Lock/AltGr states give 2,744 initial combinations. Every
+discovered dead-key stroke is paired with every printable stroke and followed
+by neutral probes to check remaining composition state. These guarded oracle
+calls run only in the disposable test process; production decoding uses owned
+driver tables and never calls the stateful translation API.
+
 The native model-download test calls the production WinHTTP path for a pinned
 German model, verifies its size and SHA-256, and then proves that the temporary
 cache loads without another download. The other model tests use published model

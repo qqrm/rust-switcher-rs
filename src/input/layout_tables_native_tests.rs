@@ -271,6 +271,7 @@ fn compare_sequence(
 #[test]
 #[ignore = "requires the All-seven-layout fixture on a disposable hosted Windows desktop"]
 fn native_public_layout_table_oracle_matches_printable_keys_and_modifiers() {
+    let _guard = crate::input::ring_buffer::test_guard();
     let mut compared = 0;
     for fixture in fixtures() {
         let tables = KeyboardTables::load(fixture.hkl.0 as usize)
@@ -294,6 +295,7 @@ fn native_public_layout_table_oracle_matches_printable_keys_and_modifiers() {
 #[test]
 #[ignore = "requires the All-seven-layout fixture on a disposable hosted Windows desktop"]
 fn native_public_layout_table_oracle_matches_dead_key_sequences() {
+    let _guard = crate::input::ring_buffer::test_guard();
     let mut sequences = 0;
     for fixture in fixtures() {
         let tables = KeyboardTables::load(fixture.hkl.0 as usize)

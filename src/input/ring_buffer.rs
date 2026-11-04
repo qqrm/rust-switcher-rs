@@ -1479,9 +1479,17 @@ mod tests {
     }
 
     fn load_native_test_layout(name: PCWSTR) -> HKL {
+        let _guard = test_guard();
         // No activation flag: decoding uses this explicit layout without requiring foreground focus.
-        unsafe { LoadKeyboardLayoutW(name, Default::default()) }
-            .expect("the native test keyboard layout must load")
+        let layout = unsafe { LoadKeyboardLayoutW(name, Default::default()) }
+            .expect("the native test keyboard layout must load");
+        // Match startup preparation before the hook is installed. No keystroke
+        // is consumed here: the following assertion still checks the first one.
+        assert!(
+            layout_decode::prepare_layout(layout.0 as usize),
+            "the native test layout must be prepared before input capture"
+        );
+        layout
     }
 
     fn native_text_after_overrides(
@@ -1490,6 +1498,7 @@ mod tests {
         stale_keys: &[VIRTUAL_KEY],
         overrides: KeyboardStateOverrides,
     ) -> String {
+        let _guard = test_guard();
         let mut state = [0u8; 256];
         for key in stale_keys {
             state[usize::from(key.0)] = 0x80;
@@ -1504,9 +1513,8 @@ mod tests {
         let count = usize::try_from(count).expect("the test keys must not be dead keys");
         let native_text =
             String::from_utf16(&buf[..count]).expect("native decoding must produce valid UTF-16");
-        layout_decode::reset();
         assert_eq!(
-            layout_decode::decode(u32::from(vk.0), scan, state, layout.0 as usize, (1, 1)),
+            layout_decode::decode_probe(u32::from(vk.0), scan, state, layout.0 as usize, (1, 1)),
             layout_decode::DecodeResult::Text(native_text.clone()),
             "the production decoder must agree with the native first-character oracle"
         );
