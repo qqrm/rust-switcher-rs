@@ -66,8 +66,9 @@ picked up when the next conversion is requested, without restarting Rust Switche
 Conversions use the physical key positions and the corresponding Windows layout
 drivers. This preserves distinctions such as QWERTY, QWERTZ, AZERTY, and variants
 sharing a language. Shift, Caps Lock, AltGr, and ordinary dead-key combinations
-are handled through the layout APIs. IMEs and unsupported multi-stage composition
-are excluded; a transformation that cannot be completed is left unchanged.
+use the character and accent tables supplied by the installed keyboard driver.
+Composition is tracked inside Rust Switcher. IMEs and unsupported multi-stage
+composition are excluded; a transformation that cannot be completed is left unchanged.
 
 With several layouts installed, local character n-gram models rank possible
 results. The model catalog covers 75 languages; only models relevant to installed

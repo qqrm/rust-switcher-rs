@@ -51,10 +51,11 @@ rows without a hosted assertion remain coverage gaps even when CI is green.
 
 The dedicated **Windows Input Regression** workflow runs the
 `native_input_` regression tests on a Windows runner, separately from the larger
-GUI suite. The decoding cases call the real Win32 `ToUnicodeEx` API with a controlled stale
-modifier snapshot on the first character, then feed decoded input through the
-journal. This makes normalization defects reproducible without asking anyone to
-type on a working desktop. The group also verifies the 4096-character capacity,
+GUI suite. The decoding cases compare the production decoder with the real Win32
+`ToUnicodeEx` API using a controlled stale modifier snapshot on the first character,
+then feed decoded input through the journal. This makes normalization defects
+reproducible without asking anyone to type on a working desktop. The group also
+verifies the 4096-character capacity,
 rejection of truncated prefixes, and recovery after clearing the journal.
 A controlled native-API reproduction establishes the tested
 decoder behavior; it does not establish that a particular Telegram window

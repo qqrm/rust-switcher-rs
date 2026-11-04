@@ -14,8 +14,11 @@
 pub use rust_switcher_core as core;
 
 #[cfg(windows)]
-#[path = "input/keyboard_desktop.rs"]
-mod keyboard_desktop;
+#[path = "platform/win/layout_library.rs"]
+mod layout_library;
+#[cfg(windows)]
+#[path = "input/layout_tables.rs"]
+mod layout_tables;
 
 // Compatibility shim for existing unit tests that still refer to
 // `crate::domain::text::mapping::*`.

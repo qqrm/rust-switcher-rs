@@ -378,6 +378,8 @@ fn download_model(spec: &ModelSpec) -> io::Result<Vec<u8>> {
 // callback or stderr output is installed in production builds.
 #[cfg(all(windows, test))]
 fn install_network_diagnostics(handle: *mut std::ffi::c_void) -> windows::core::Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use windows::Win32::Networking::WinHttp::{
         WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER,
         WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER, WINHTTP_CALLBACK_STATUS_DETECTING_PROXY,
@@ -386,6 +388,10 @@ fn install_network_diagnostics(handle: *mut std::ffi::c_void) -> windows::core::
         WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED, WINHTTP_CALLBACK_STATUS_SECURE_FAILURE,
         WINHTTP_CALLBACK_STATUS_SENDING_REQUEST, WinHttpSetStatusCallback,
     };
+
+    // A response can trigger these notifications for every small body read.
+    // The hosted test only needs the first observation of each phase.
+    static SEEN_PHASES: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "system" fn callback(
         _handle: *mut std::ffi::c_void,
@@ -407,6 +413,9 @@ fn install_network_diagnostics(handle: *mut std::ffi::c_void) -> windows::core::
             WINHTTP_CALLBACK_STATUS_SECURE_FAILURE => "secure connection failed",
             _ => return,
         };
+        if SEEN_PHASES.fetch_or(status, Ordering::Relaxed) & status != 0 {
+            return;
+        }
         // Writing must not panic across the FFI callback boundary.
         let _ = writeln!(io::stderr(), "WinHTTP model download: {phase}");
     }

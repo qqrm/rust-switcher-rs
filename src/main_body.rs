@@ -13,8 +13,11 @@ mod input;
 #[cfg(windows)]
 mod input_journal;
 #[cfg(windows)]
-#[path = "input/keyboard_desktop.rs"]
-mod keyboard_desktop;
+#[path = "platform/win/layout_library.rs"]
+mod layout_library;
+#[cfg(windows)]
+#[path = "input/layout_tables.rs"]
+mod layout_tables;
 #[cfg(windows)]
 mod platform;
 #[cfg(windows)]

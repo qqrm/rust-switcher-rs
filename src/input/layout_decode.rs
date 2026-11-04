@@ -1,9 +1,10 @@
-//! Decode physical input on a worker with an isolated keyboard desktop.
+//! Decode physical input from immutable driver tables on a bounded worker.
 //!
-//! `ToUnicodeEx` with state changes enabled is required for exact dead-key replay.
-//! A separate thread on the input desktop is not sufficient isolation.
+//! Composition belongs to this worker and focus context. No translation or
+//! reset can consume a dead key from the real Windows keyboard buffer.
 
 use std::{
+    collections::HashMap,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -13,13 +14,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HKL, MAPVK_VK_TO_VSC, MapVirtualKeyExW, ToUnicodeEx, VK_SPACE,
 };
 
-use crate::keyboard_desktop::KeyboardDesktop;
+use crate::layout_tables::{Composition, KeyboardTables, Translation};
 
 const DECODE_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(test)]
 const UTF16_CAPACITY: usize = 16;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -91,39 +94,46 @@ impl Decoder {
         thread::Builder::new()
             .name("input-composition".to_owned())
             .spawn(move || {
-                // Establish isolation before any translation or buffer clearing.
-                // Failure disconnects the worker, so callers receive Unavailable.
-                let Ok(_desktop) = KeyboardDesktop::enter() else {
-                    return;
-                };
                 let mut context: Option<Context> = None;
+                let mut composition = Composition::default();
+                let mut tables = HashMap::new();
                 while let Ok(request) = receiver.recv() {
                     if request.deadline <= Instant::now()
                         || request.context.generation != worker_generation.load(Ordering::Acquire)
                     {
-                        clear_context(&mut context);
+                        context = None;
+                        composition = Composition::default();
                         continue;
                     }
 
                     if context != Some(request.context) {
-                        let old_cleared = clear_context(&mut context);
-                        if !old_cleared || !clear_dead_keys(request.context.layout) {
-                            let _ = request.reply.send(DecodeResult::Unavailable);
-                            continue;
-                        }
+                        composition = Composition::default();
                         context = Some(request.context);
                     }
 
-                    let result = translate(&request);
+                    let table = tables
+                        .entry(request.context.layout)
+                        .or_insert_with(|| KeyboardTables::load(request.context.layout));
+                    let result = match table.as_ref().and_then(|table| {
+                        table.translate(request.vk, request.scan, &request.state, &mut composition)
+                    }) {
+                        Some(Translation::Text(text)) => DecodeResult::Text(text),
+                        Some(Translation::PendingDeadKey) => {
+                            debug_assert!(composition.is_pending());
+                            DecodeResult::PendingDeadKey
+                        }
+                        Some(Translation::NoText) => DecodeResult::NoText,
+                        None => DecodeResult::Unavailable,
+                    };
                     if request.deadline > Instant::now()
                         && request.context.generation == worker_generation.load(Ordering::Acquire)
                     {
                         let _ = request.reply.send(result);
                     } else {
-                        clear_context(&mut context);
+                        context = None;
+                        composition = Composition::default();
                     }
                 }
-                clear_context(&mut context);
             })?;
         Ok(Self { sender, generation })
     }
@@ -171,40 +181,7 @@ impl Decoder {
     }
 }
 
-fn translate(request: &Request) -> DecodeResult {
-    let mut output = [0u16; UTF16_CAPACITY];
-    let count = unsafe {
-        ToUnicodeEx(
-            request.vk,
-            request.scan,
-            &request.state,
-            &mut output,
-            0,
-            Some(HKL(request.context.layout as *mut _)),
-        )
-    };
-    if count < 0 {
-        return DecodeResult::PendingDeadKey;
-    }
-    if count == 0 {
-        return DecodeResult::NoText;
-    }
-    let Ok(count) = usize::try_from(count) else {
-        return DecodeResult::Unavailable;
-    };
-    let Some(units) = output.get(..count) else {
-        return DecodeResult::Unavailable;
-    };
-    match String::from_utf16(units) {
-        Ok(text) => DecodeResult::Text(text),
-        Err(_) => DecodeResult::Unavailable,
-    }
-}
-
-fn clear_context(context: &mut Option<Context>) -> bool {
-    context.take().is_none_or(|old| clear_dead_keys(old.layout))
-}
-
+#[cfg(test)]
 fn clear_dead_keys(layout: usize) -> bool {
     if layout == 0 {
         return true;

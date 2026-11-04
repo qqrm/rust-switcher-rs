@@ -922,7 +922,7 @@ fn current_keyboard_state_overrides() -> KeyboardStateOverrides {
 fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStateOverrides) {
     // LL-hook decoding runs before the target thread's keyboard state is fully reflected in our
     // thread-local `GetKeyboardState` snapshot. Patch in the physical modifier/toggle state that
-    // affects character case before calling `ToUnicodeEx`.
+    // affects character case before interpreting the layout's character tables.
     set_key_down_state(state, VK_SHIFT, overrides.shift_down);
     set_key_down_state(state, VK_LSHIFT, overrides.left_shift_down);
     set_key_down_state(state, VK_RSHIFT, overrides.right_shift_down);
@@ -930,7 +930,7 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
 
     // record_keydown filters physically held Ctrl/Alt shortcuts before decoding printable input.
     // Our thread's snapshot can still contain an old shortcut from a previously focused window.
-    // Leaving those bits set makes ToUnicodeEx return a control character or no character at all.
+    // Leaving those bits set can select a control character or no character at all.
     for vk in [
         VK_CONTROL,
         VK_LCONTROL,
@@ -1502,7 +1502,15 @@ mod tests {
         let count =
             unsafe { ToUnicodeEx(u32::from(vk.0), scan, &state, &mut buf, 0, Some(layout)) };
         let count = usize::try_from(count).expect("the test keys must not be dead keys");
-        String::from_utf16(&buf[..count]).expect("native decoding must produce valid UTF-16")
+        let native_text =
+            String::from_utf16(&buf[..count]).expect("native decoding must produce valid UTF-16");
+        layout_decode::reset();
+        assert_eq!(
+            layout_decode::decode(u32::from(vk.0), scan, state, layout.0 as usize, (1, 1)),
+            layout_decode::DecodeResult::Text(native_text.clone()),
+            "the production decoder must agree with the native first-character oracle"
+        );
+        native_text
     }
 
     fn assert_native_character_ignores_stale_shortcuts(

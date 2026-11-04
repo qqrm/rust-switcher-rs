@@ -2,8 +2,8 @@
 //!
 //! The inverse tables retain physical scan codes, not virtual-key names: for
 //! example, the same position is Y in US QWERTY and Z in German QWERTZ.
-//! Stateful dead-key translation runs only on a worker with a never-activated
-//! private desktop and input queue, separate from the user's input desktop.
+//! Dead-key translation uses immutable driver tables and Rust-owned composition;
+//! it cannot change the user's pending Windows keyboard composition.
 
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
@@ -17,8 +17,8 @@ use windows::Win32::{
             Ime::ImmIsIME,
             KeyboardAndMouse::{
                 GetKeyboardLayout, GetKeyboardLayoutList, HKL, MAPVK_VK_TO_VSC_EX,
-                MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, ToUnicodeEx, VK_CAPITAL, VK_CONTROL,
-                VK_LCONTROL, VK_LSHIFT, VK_MENU, VK_RMENU, VK_SHIFT, VK_SPACE, VkKeyScanExW,
+                MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, VK_CAPITAL, VK_CONTROL, VK_LCONTROL,
+                VK_LSHIFT, VK_MENU, VK_RMENU, VK_SHIFT, VK_SPACE, VkKeyScanExW,
             },
         },
         WindowsAndMessaging::{
@@ -28,7 +28,10 @@ use windows::Win32::{
     },
 };
 
-use crate::{keyboard_desktop::KeyboardDesktop, utils::bounded_worker::BoundedWorker};
+use crate::{
+    layout_tables::{Composition, KeyboardTables, Translation as Decoded},
+    utils::bounded_worker::BoundedWorker,
+};
 
 const SHIFT: u8 = 1;
 const CONTROL: u8 = 2;
@@ -45,8 +48,6 @@ const KEY_STATES: [u8; 8] = [
     CAPS_LOCK | ALT_GR,
     CAPS_LOCK | ALT_GR | SHIFT,
 ];
-const UTF16_CAPACITY: usize = 16;
-const NO_STATE_CHANGE: u32 = 4;
 const CONVERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A complete HKL, including its keyboard variant, valid for this Windows session.
@@ -187,21 +188,13 @@ fn worker() -> Option<&'static Worker> {
     WORKER
         .get_or_init(|| {
             Worker::start("layout-conversion", || {
-                let desktop = KeyboardDesktop::enter().ok();
                 let mut converter = Converter::default();
-                if desktop.is_some() {
-                    for layout in installed_layouts() {
-                        if let Some(table) = LayoutTable::build(layout) {
-                            converter.tables.insert(layout, table);
-                        }
+                for layout in installed_layouts() {
+                    if let Some(table) = LayoutTable::build(layout) {
+                        converter.tables.insert(layout, table);
                     }
                 }
-                move |request| {
-                    // Retain isolation for the worker's complete lifetime. If
-                    // setup failed, never translate on the inherited desktop.
-                    let _desktop = desktop.as_ref()?;
-                    converter.convert(request)
-                }
+                move |request| converter.convert(request)
             })
             .ok()
         })
@@ -217,14 +210,15 @@ impl Converter {
     fn convert(&mut self, request: ConversionRequest) -> Option<String> {
         self.tables
             .retain(|layout, _| request.available.contains(layout));
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.tables.entry(request.source)
-        {
-            let table = LayoutTable::build(request.source)?;
-            entry.insert(table);
+        for layout in [request.source, request.target] {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.tables.entry(layout) {
+                entry.insert(LayoutTable::build(layout)?);
+            }
         }
         let source = self.tables.get(&request.source)?;
         let input = source.encode(&request.text)?;
-        translate_sequence(&input, request.target)
+        let target = self.tables.get(&request.target)?;
+        translate_sequence(&input, request.target, &target.keyboard)
     }
 }
 
@@ -261,14 +255,13 @@ struct Mapping {
 }
 
 struct LayoutTable {
+    keyboard: KeyboardTables,
     by_first_char: HashMap<char, Vec<Mapping>>,
 }
 
 impl LayoutTable {
     fn build(layout: LayoutId) -> Option<Self> {
-        if !clear_dead_keys(layout) {
-            return None;
-        }
+        let keyboard = KeyboardTables::load(layout.0)?;
         let mut mappings: HashMap<String, Vec<KeyStroke>> = HashMap::new();
         let mut keys = Vec::new();
         let mut dead_keys = Vec::new();
@@ -283,7 +276,7 @@ impl LayoutTable {
                 let Some(key) = KeyStroke::from_vk(vk, modifiers, layout) else {
                     continue;
                 };
-                match translate_key(layout, key, NO_STATE_CHANGE)? {
+                match translate_key(layout, key, &keyboard, &mut Composition::default())? {
                     Translation::Text(text) => {
                         if is_printable(&text) {
                             insert_mapping(&mut mappings, text, vec![key]);
@@ -307,18 +300,21 @@ impl LayoutTable {
         // normalization reproduces its dead-key rules.
         for &dead in &dead_keys {
             for &key in &keys {
-                if !clear_dead_keys(layout) {
+                let mut composition = Composition::default();
+                if !matches!(
+                    translate_key(layout, dead, &keyboard, &mut composition)?,
+                    Translation::Dead(_)
+                ) {
                     return None;
                 }
-                if !matches!(translate_key(layout, dead, 0)?, Translation::Dead(_)) {
-                    return None;
-                }
-                if let Translation::Text(text) = translate_key(layout, key, 0)? {
+                if let Translation::Text(text) =
+                    translate_key(layout, key, &keyboard, &mut composition)?
+                {
                     insert_mapping(&mut mappings, text, vec![dead, key]);
                 }
             }
         }
-        if !clear_dead_keys(layout) || mappings.is_empty() {
+        if mappings.is_empty() {
             return None;
         }
 
@@ -344,7 +340,7 @@ impl LayoutTable {
             let Some(key) = KeyStroke::from_vk(u32::from(encoded & 0xff), modifiers, layout) else {
                 continue;
             };
-            if matches!(translate_key(layout, key, NO_STATE_CHANGE), Some(Translation::Text(ref candidate) | Translation::Dead(ref candidate)) if candidate == text)
+            if matches!(translate_key(layout, key, &keyboard, &mut Composition::default()), Some(Translation::Text(ref candidate) | Translation::Dead(ref candidate)) if candidate == text)
             {
                 *keys = vec![key];
             }
@@ -368,7 +364,10 @@ impl LayoutTable {
                     .then_with(|| left.text.cmp(&right.text))
             });
         }
-        Some(Self { by_first_char })
+        Some(Self {
+            keyboard,
+            by_first_char,
+        })
     }
 
     fn encode(&self, text: &str) -> Option<Vec<InputUnit>> {
@@ -433,7 +432,12 @@ enum Translation {
     Empty,
 }
 
-fn translate_key(layout: LayoutId, key: KeyStroke, flags: u32) -> Option<Translation> {
+fn translate_key(
+    layout: LayoutId,
+    key: KeyStroke,
+    keyboard: &KeyboardTables,
+    composition: &mut Composition,
+) -> Option<Translation> {
     let vk = unsafe { MapVirtualKeyExW(key.scan, MAPVK_VSC_TO_VK_EX, Some(layout.hkl())) };
     if vk == 0 || vk > 255 {
         return Some(Translation::Empty);
@@ -453,77 +457,53 @@ fn translate_key(layout: LayoutId, key: KeyStroke, flags: u32) -> Option<Transla
         state[usize::from(VK_RMENU.0)] = 0x80;
     }
     state[usize::from(VK_CAPITAL.0)] = u8::from(key.modifiers & CAPS_LOCK != 0);
-    let mut output = [0u16; UTF16_CAPACITY];
-    let count =
-        unsafe { ToUnicodeEx(vk, key.scan, &state, &mut output, flags, Some(layout.hkl())) };
-    if count == 0 {
-        return Some(Translation::Empty);
-    }
-    let length = usize::try_from(count.unsigned_abs()).ok()?;
-    let text = String::from_utf16(output.get(..length)?).ok()?;
-    Some(if count < 0 {
-        Translation::Dead(text)
-    } else {
-        Translation::Text(text)
-    })
+    Some(
+        match keyboard.translate(vk, key.scan, &state, composition)? {
+            Decoded::Text(text) => Translation::Text(text),
+            Decoded::PendingDeadKey => Translation::Dead(composition.spacing_accent()?),
+            Decoded::NoText => Translation::Empty,
+        },
+    )
 }
 
-fn clear_dead_keys(layout: LayoutId) -> bool {
-    let Some(space) = KeyStroke::from_vk(u32::from(VK_SPACE.0), 0, layout) else {
-        return false;
-    };
-    for _ in 0..8 {
-        match translate_key(layout, space, 0) {
-            Some(Translation::Dead(_)) => {}
-            Some(_) => return true,
-            None => return false,
-        }
-    }
-    false
-}
-
-fn translate_sequence(input: &[InputUnit], target: LayoutId) -> Option<String> {
-    if !clear_dead_keys(target) {
-        return None;
-    }
-    let result = translate_sequence_inner(input, target);
-    // A rejected conversion must not leak pending composition into the next one.
-    let clean = clear_dead_keys(target);
-    clean.then_some(result).flatten()
-}
-
-fn translate_sequence_inner(input: &[InputUnit], target: LayoutId) -> Option<String> {
+fn translate_sequence(
+    input: &[InputUnit],
+    target: LayoutId,
+    keyboard: &KeyboardTables,
+) -> Option<String> {
     let mut output = String::new();
-    let mut pending = false;
+    let mut composition = Composition::default();
     for unit in input {
         match unit {
-            InputUnit::Key(key) => match translate_key(target, *key, 0)? {
+            InputUnit::Key(key) => match translate_key(target, *key, keyboard, &mut composition)? {
                 Translation::Text(text) if is_printable(&text) => {
                     output.push_str(&text);
-                    pending = false;
                 }
-                Translation::Dead(_) => pending = true,
+                Translation::Dead(_) => {}
                 Translation::Text(_) | Translation::Empty => return None,
             },
             InputUnit::Literal(ch) => {
-                if pending {
-                    output.push_str(&finish_dead_key(target)?);
-                    pending = false;
+                if composition.is_pending() {
+                    output.push_str(&finish_dead_key(target, keyboard, &mut composition)?);
                 }
                 output.push(*ch);
             }
         }
     }
-    if pending {
-        output.push_str(&finish_dead_key(target)?);
+    if composition.is_pending() {
+        output.push_str(&finish_dead_key(target, keyboard, &mut composition)?);
     }
     Some(output)
 }
 
-fn finish_dead_key(layout: LayoutId) -> Option<String> {
+fn finish_dead_key(
+    layout: LayoutId,
+    keyboard: &KeyboardTables,
+    composition: &mut Composition,
+) -> Option<String> {
     let space = KeyStroke::from_vk(u32::from(VK_SPACE.0), 0, layout)?;
-    match translate_key(layout, space, 0)? {
-        Translation::Text(text) if is_printable(&text) => Some(text),
+    match translate_key(layout, space, keyboard, composition)? {
+        Translation::Text(text) if is_printable(&text) && !composition.is_pending() => Some(text),
         _ => None,
     }
 }
@@ -536,7 +516,7 @@ mod tests {
         Win32::UI::{
             Input::KeyboardAndMouse::{
                 ActivateKeyboardLayout, KLF_ACTIVATE, KLF_NOTELLSHELL, LoadKeyboardLayoutW,
-                SetFocus, UnloadKeyboardLayout,
+                SetFocus, ToUnicodeEx, UnloadKeyboardLayout,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DestroyWindow, SetForegroundWindow, WINDOW_EX_STYLE,
@@ -547,6 +527,31 @@ mod tests {
     };
 
     use super::*;
+
+    const UTF16_CAPACITY: usize = 16;
+
+    fn clear_dead_keys(layout: LayoutId) -> bool {
+        let Some(space) = KeyStroke::from_vk(u32::from(VK_SPACE.0), 0, layout) else {
+            return false;
+        };
+        let mut output = [0; UTF16_CAPACITY];
+        for _ in 0..8 {
+            if unsafe {
+                ToUnicodeEx(
+                    u32::from(VK_SPACE.0),
+                    space.scan,
+                    &[0; 256],
+                    &mut output,
+                    0,
+                    Some(layout.hkl()),
+                )
+            } >= 0
+            {
+                return true;
+            }
+        }
+        false
+    }
 
     fn load_layout(klid: &str) -> LayoutId {
         let name: Vec<u16> = klid.encode_utf16().chain(Some(0)).collect();
@@ -559,14 +564,14 @@ mod tests {
         let text = text.to_owned();
         let source = source.to_owned();
         let target = target.to_owned();
-        // Each test uses a private translation thread and never touches the
-        // production worker or another test's pending composition.
+        // Exercise a cold parser and conversion independently of the public
+        // worker. Composition is owned Rust data, even on this ordinary thread.
         std::thread::spawn(move || {
-            let _desktop = KeyboardDesktop::enter().ok()?;
             let source = load_layout(&source);
             let target = load_layout(&target);
             let table = LayoutTable::build(source)?;
-            translate_sequence(&table.encode(&text)?, target)
+            let keyboard = KeyboardTables::load(target.0)?;
+            translate_sequence(&table.encode(&text)?, target, &keyboard)
         })
         .join()
         .expect("native conversion thread must not panic")
