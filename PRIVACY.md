@@ -92,6 +92,17 @@ stops it from being a conversion target; it does not delete previously cached
 model files. Download failures leave explicit conversion with its deterministic
 layout fallback, while automatic correction requires sufficient local evidence.
 
+## Application updates
+
+**Check for updates** in the tray menu contacts GitHub over HTTPS to read the
+latest stable release metadata and, when a newer release exists, downloads its
+Windows executable. The download is verified against the SHA-256 digest and
+size in GitHub's release metadata before installation. An isolated PowerShell
+helper updates the existing executable after Rust Switcher exits and restarts it.
+The update log is stored in
+`%LOCALAPPDATA%\RustSwitcher\updater.log` and contains only update events
+and errors, not typed text or input history. Update checks are user-initiated.
+
 ## Saved settings and autostart
 
 Preferences such as hotkeys, conversion options, timing, theme, and startup

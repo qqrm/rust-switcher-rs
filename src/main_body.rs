@@ -25,6 +25,11 @@ mod utils;
 
 #[cfg(windows)]
 fn main() -> windows::core::Result<()> {
+    if std::env::args().any(|arg| arg == "--quit-for-update") {
+        let _ = platform::win::request_running_instance_exit();
+        return Ok(());
+    }
+
     utils::tracing::init_tracing();
     utils::helpers::init_app_user_model_id()?;
 
