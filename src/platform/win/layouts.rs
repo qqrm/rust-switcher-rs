@@ -14,7 +14,7 @@ use windows::Win32::{
     Globalization::LCIDToLocaleName,
     UI::{
         Input::{
-            Ime::ImmIsIME,
+            Ime::ImmGetIMEFileNameW,
             KeyboardAndMouse::{
                 GetKeyboardLayout, GetKeyboardLayoutList, HKL, MAPVK_VK_TO_VSC_EX,
                 MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, VK_CAPITAL, VK_CONTROL, VK_LCONTROL,
@@ -70,7 +70,9 @@ impl LayoutId {
 }
 
 /// Query every time a conversion is planned, so Windows remains the only list of
-/// enabled layouts. IMEs require composition APIs rather than key substitution.
+/// enabled layouts. Legacy IME handles are excluded; unsupported table formats
+/// are rejected by the converter. An active TSF processor is a separate concern
+/// from this physical-layout catalog.
 pub(crate) fn installed_layouts() -> Vec<LayoutId> {
     let count = unsafe { GetKeyboardLayoutList(None) };
     let Ok(count) = usize::try_from(count) else {
@@ -86,7 +88,7 @@ pub(crate) fn installed_layouts() -> Vec<LayoutId> {
     };
     let mut layouts = Vec::with_capacity(copied.min(count));
     for hkl in handles.into_iter().take(copied) {
-        if hkl.0.is_null() || unsafe { ImmIsIME(hkl) }.as_bool() {
+        if hkl.0.is_null() || is_legacy_ime(hkl) {
             continue;
         }
         let layout = LayoutId(hkl.0 as usize);
@@ -107,10 +109,19 @@ pub(crate) fn foreground_layout() -> Option<LayoutId> {
         return None;
     }
     let hkl = unsafe { GetKeyboardLayout(thread_id) };
-    if hkl.0.is_null() || unsafe { ImmIsIME(hkl) }.as_bool() {
+    if hkl.0.is_null() || is_legacy_ime(hkl) {
         return None;
     }
     Some(LayoutId(hkl.0 as usize))
+}
+
+fn is_legacy_ime(hkl: HKL) -> bool {
+    let device = ((hkl.0 as usize >> 16) & 0xffff) as u16;
+    // ImmIsIME can report true for ordinary layouts under modern text services.
+    // The registered IME filename identifies an IMM32 keyboard more precisely.
+    // See Chromium's IMM32Manager::SetInputLanguage and Microsoft's
+    // https://learn.microsoft.com/windows/win32/api/imm/nf-imm-immgetimefilenamew
+    device & 0xf000 == 0xe000 || unsafe { ImmGetIMEFileNameW(hkl, None) } != 0
 }
 
 /// The locale is used only to select a language model. It never identifies the

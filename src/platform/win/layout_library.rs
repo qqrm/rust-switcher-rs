@@ -34,7 +34,6 @@ use windows::{
             SystemInformation::GetSystemDirectoryW,
             Threading::GetCurrentProcess,
         },
-        UI::Input::{Ime::ImmIsIME, KeyboardAndMouse::HKL},
     },
     core::{PCWSTR, PWSTR, s, w},
 };
@@ -92,10 +91,11 @@ impl KeyboardLibrary {
             };
         }
         let canonical = required!("canonical HKL", canonical_hkl(hkl));
-        required!(
-            "non-IME HKL",
-            (!unsafe { ImmIsIME(HKL(hkl as *mut _)) }.as_bool()).then_some(())
-        );
+        // ImmIsIME reports IME capability for ordinary layouts on modern Windows
+        // too. Resolve the physical registration and reject its actual IME file
+        // below instead of treating that broad capability as an IME identity.
+        // Chromium documents the same distinction in imm32_manager.cc:
+        // https://chromium.googlesource.com/chromium/src/+/5e16d46c92747ae76914b9a5db114a19cdb00bde/ui/base/ime/win/imm32_manager.cc
         let registry = required!(
             "layout registry",
             open_key(
@@ -517,8 +517,17 @@ mod tests {
 
     #[test]
     fn native_layout_library_reads_installed_table_without_changing_active_layout() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+        use windows::Win32::UI::Input::{
+            Ime::{ImmGetIMEFileNameW, ImmIsIME},
+            KeyboardAndMouse::GetKeyboardLayout,
+        };
         let before = unsafe { GetKeyboardLayout(0) };
+        eprintln!(
+            "native keyboard loader hkl={:#x} ImmIsIME={} IME filename length={}",
+            before.0 as usize,
+            unsafe { ImmIsIME(before) }.0,
+            unsafe { ImmGetIMEFileNameW(before, None) },
+        );
         let Some(library) = KeyboardLibrary::load(before.0 as usize) else {
             panic!("the Windows test runner's active ordinary layout must expose keyboard tables");
         };
