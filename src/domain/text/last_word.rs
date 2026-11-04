@@ -7,24 +7,21 @@ use std::{
     time::Duration,
 };
 
-use windows::Win32::UI::{
-    Input::KeyboardAndMouse::VIRTUAL_KEY, WindowsAndMessaging::GetForegroundWindow,
-};
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use super::{
     convert::expected_direction_for_foreground_window,
     mapping::{ConversionDirection, conversion_direction_for_text, convert_ru_en_with_direction},
-    smart,
-    switch_keyboard_layout, wait_shift_released,
+    multilang::{self, Policy},
+    selection_probe::FocusTarget,
+    smart, switch_keyboard_layout, wait_shift_released,
 };
 use crate::{
     app::AppState,
-    conversion::input::{send_text_unicode, tap_key},
+    conversion::input::replace_before_caret,
     input_journal::{InputRun, LayoutTag, RunKind, RunOrigin},
+    platform::win::layouts,
 };
-const VK_BACKSPACE_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x08);
-const VK_LEFT_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x25);
-const VK_RIGHT_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x27);
 const MIN_WORD_LEN: usize = 4;
 const MIN_CONVERTED_CONFIDENCE: f64 = 0.70;
 const MIN_CONFIDENCE_GAIN: f64 = 0.25;
@@ -40,7 +37,7 @@ fn direction_for_layout(layout: &LayoutTag) -> Option<ConversionDirection> {
     match layout {
         LayoutTag::Ru => Some(ConversionDirection::RuToEn),
         LayoutTag::En => Some(ConversionDirection::EnToRu),
-        LayoutTag::Other(_) | LayoutTag::Unknown => None,
+        LayoutTag::Native(_) | LayoutTag::Unknown => None,
     }
 }
 
@@ -111,11 +108,43 @@ pub fn autoconvert_last_word(state: &mut AppState) {
         }
     };
     sleep_before_convert(state);
+    let target = FocusTarget::capture();
     let Some(payload) = take_last_word_payload() else {
         tracing::trace!("journal: no last word");
         return;
     };
-    let mut restore = JournalRestore::new(&payload);
+    let mut restore = JournalRestore::new(&payload, target);
+    if matches!(payload.run.layout, LayoutTag::Native(_)) {
+        if payload.suffix_has_newline
+            || payload
+                .run
+                .text
+                .chars()
+                .filter(|ch| ch.is_alphabetic())
+                .count()
+                < MIN_WORD_LEN
+        {
+            return;
+        }
+        let Some(plan) =
+            multilang::plan_runs(std::slice::from_ref(&payload.run), Policy::Automatic)
+        else {
+            return;
+        };
+        if plan.text == payload.run.text || !restore.target_is_current() {
+            return;
+        }
+        if apply_last_word_replacement(&payload, &plan.text, restore.target).is_ok() {
+            crate::input_journal::push_runs(plan.runs);
+            crate::input_journal::push_runs(payload.suffix_runs.iter().cloned());
+            crate::input_journal::mark_last_token_autoconverted();
+            restore.commit();
+            if let Some(target) = restore.target.filter(|target| target.is_current()) {
+                let _ = layouts::activate_layout_for_window(plan.target, target.foreground_hwnd());
+            }
+        }
+        return;
+    }
     let converted = match autoconvert_candidate(&payload) {
         Ok(v) => v,
         Err(reason) => {
@@ -129,7 +158,7 @@ pub fn autoconvert_last_word(state: &mut AppState) {
         return;
     }
     tracing::trace!(word = %payload.run.text, converted = %converted, "autoconvert decision");
-    if let Err(err) = apply_last_word_replacement(&payload, &converted) {
+    if let Err(err) = apply_last_word_replacement(&payload, &converted, restore.target) {
         tracing::warn!(error = %err.as_str(), "autoconvert apply failed");
         return;
     }
@@ -160,21 +189,30 @@ impl Drop for AutoconvertGuard {
 struct JournalRestore<'a> {
     payload: &'a LastRunPayload,
     committed: bool,
+    target: Option<FocusTarget>,
 }
 impl<'a> JournalRestore<'a> {
-    fn new(payload: &'a LastRunPayload) -> Self {
+    fn new(payload: &'a LastRunPayload, target: Option<FocusTarget>) -> Self {
         Self {
             payload,
             committed: false,
+            target,
         }
     }
     fn commit(&mut self) {
         self.committed = true;
     }
+    fn target_is_current(&self) -> bool {
+        self.target.is_some_and(FocusTarget::is_current)
+    }
 }
 impl Drop for JournalRestore<'_> {
     fn drop(&mut self) {
         if self.committed {
+            return;
+        }
+        if self.target.is_some() && !self.target_is_current() {
+            crate::input::ring_buffer::invalidate();
             return;
         }
         restore_journal_original(self.payload);
@@ -186,21 +224,30 @@ impl Drop for JournalRestore<'_> {
 struct JournalRestoreSequence<'a> {
     payload: &'a LastSequencePayload,
     committed: bool,
+    target: Option<FocusTarget>,
 }
 impl<'a> JournalRestoreSequence<'a> {
-    fn new(payload: &'a LastSequencePayload) -> Self {
+    fn new(payload: &'a LastSequencePayload, target: Option<FocusTarget>) -> Self {
         Self {
             payload,
             committed: false,
+            target,
         }
     }
     fn commit(&mut self) {
         self.committed = true;
     }
+    fn target_is_current(&self) -> bool {
+        self.target.is_some_and(FocusTarget::is_current)
+    }
 }
 impl Drop for JournalRestoreSequence<'_> {
     fn drop(&mut self) {
         if self.committed {
+            return;
+        }
+        if self.target.is_some() && !self.target_is_current() {
+            crate::input::ring_buffer::invalidate();
             return;
         }
         restore_journal_original_sequence(self.payload);
@@ -480,8 +527,12 @@ fn looks_like_cyrillic_word(s: &str) -> bool {
 fn is_cyrillic(ch: char) -> bool {
     ('\u{0400}'..='\u{04FF}').contains(&ch) || ('\u{0500}'..='\u{052F}').contains(&ch)
 }
-fn apply_last_word_replacement(p: &LastRunPayload, converted: &str) -> Result<(), ApplyError> {
-    if apply_last_word_conversion(p, converted) {
+fn apply_last_word_replacement(
+    p: &LastRunPayload,
+    converted: &str,
+    target: Option<FocusTarget>,
+) -> Result<(), ApplyError> {
+    if apply_last_word_conversion(p, converted, target) {
         Ok(())
     } else {
         Err(ApplyError::KeyInjectionFailed)
@@ -499,14 +550,40 @@ fn convert_last_word_impl(state: &mut AppState, switch_layout: bool, mode: Direc
         return true;
     }
     sleep_before_convert(state);
+    let target = FocusTarget::capture();
     let Some(payload) = take_last_word_payload() else {
         tracing::info!("journal: no last word");
         return false;
     };
-    let mut restore = JournalRestore::new(&payload);
+    let mut restore = JournalRestore::new(&payload, target);
     if payload.suffix_has_newline {
         tracing::trace!("newline present, skipping convert_last_word");
         return false;
+    }
+    if matches!(payload.run.layout, LayoutTag::Native(_)) {
+        let policy = match mode {
+            DirectionMode::LayoutFirst => Policy::Manual,
+            DirectionMode::TextFirst => Policy::Smart,
+        };
+        let Some(plan) = multilang::plan_runs(std::slice::from_ref(&payload.run), policy) else {
+            return true;
+        };
+        if !restore.target_is_current() {
+            return true;
+        }
+        if plan.text == payload.run.text
+            || apply_last_word_conversion(&payload, &plan.text, restore.target)
+        {
+            crate::input_journal::push_runs(plan.runs);
+            crate::input_journal::push_runs(payload.suffix_runs.iter().cloned());
+            restore.commit();
+            if switch_layout
+                && let Some(target) = restore.target.filter(|target| target.is_current())
+            {
+                let _ = layouts::activate_layout_for_window(plan.target, target.foreground_hwnd());
+            }
+        }
+        return true;
     }
     if matches!(mode, DirectionMode::TextFirst) && smart::text_looks_correct(&payload.run.text) {
         tracing::trace!(text = %payload.run.text, "smart convert skipped: text already looks correct");
@@ -514,7 +591,7 @@ fn convert_last_word_impl(state: &mut AppState, switch_layout: bool, mode: Direc
     }
     let converted = convert_with_mode(&payload.run.text, &payload.run.layout, mode);
     tracing::trace!(%converted, "converted");
-    if apply_last_word_conversion(&payload, &converted) {
+    if apply_last_word_conversion(&payload, &converted, restore.target) {
         update_journal(&payload, &converted);
         restore.commit();
         if switch_layout {
@@ -541,13 +618,44 @@ fn convert_last_sequence_impl(state: &mut AppState, switch_layout: bool, mode: D
         return;
     }
     sleep_before_convert(state);
+    let target = FocusTarget::capture();
     let Some(payload) = take_last_sequence_payload() else {
         tracing::info!("journal: no last sequence");
         return;
     };
-    let mut restore = JournalRestoreSequence::new(&payload);
+    let mut restore = JournalRestoreSequence::new(&payload, target);
     if payload.suffix_has_newline || payload.seq_has_newline {
         tracing::trace!("newline present, skipping convert_last_sequence");
+        return;
+    }
+    if payload
+        .runs
+        .iter()
+        .any(|run| matches!(run.layout, LayoutTag::Native(_)))
+    {
+        let policy = match mode {
+            DirectionMode::LayoutFirst => Policy::Manual,
+            DirectionMode::TextFirst => Policy::Smart,
+        };
+        let Some(plan) = multilang::plan_runs(&payload.runs, policy) else {
+            return;
+        };
+        if !restore.target_is_current() {
+            return;
+        }
+        if plan.text == payload.seq_text
+            || apply_last_sequence_conversion(&payload, &plan.text, restore.target)
+        {
+            crate::input_journal::push_runs(payload.prefix_runs.iter().cloned());
+            crate::input_journal::push_runs(plan.runs);
+            crate::input_journal::push_runs(payload.suffix_runs.iter().cloned());
+            restore.commit();
+            if switch_layout
+                && let Some(target) = restore.target.filter(|target| target.is_current())
+            {
+                let _ = layouts::activate_layout_for_window(plan.target, target.foreground_hwnd());
+            }
+        }
         return;
     }
     if matches!(mode, DirectionMode::TextFirst) && smart::text_looks_correct(&payload.seq_text) {
@@ -556,7 +664,7 @@ fn convert_last_sequence_impl(state: &mut AppState, switch_layout: bool, mode: D
     }
     let converted = convert_sequence_runs(&payload.runs, mode);
     tracing::trace!(%converted, "converted");
-    if apply_last_sequence_conversion(&payload, &converted) {
+    if apply_last_sequence_conversion(&payload, &converted, restore.target) {
         update_journal_sequence(&payload, &converted, mode);
         restore.commit();
         if switch_layout {
@@ -692,42 +800,48 @@ fn apply_conversion(
     suffix_spaces_only: bool,
     suffix_text: &str,
     converted: &str,
+    target: Option<FocusTarget>,
 ) -> bool {
-    const MAX_TAPS: usize = 4096;
-
-    let core_len = core_len.min(MAX_TAPS);
-    let suffix_len = suffix_len.min(MAX_TAPS);
-
-    if suffix_spaces_only {
-        move_caret_left(suffix_len)
-            && delete_with_backspace(core_len)
-            && send_text_unicode(converted)
-            && move_caret_right(suffix_len)
-    } else {
-        let delete_count = core_len.saturating_add(suffix_len).min(MAX_TAPS);
-        delete_with_backspace(delete_count)
-            && send_text_unicode(converted)
-            && (suffix_text.is_empty() || send_text_unicode(suffix_text))
-    }
+    let Some(target) = target else {
+        return false;
+    };
+    replace_before_caret(
+        core_len,
+        suffix_len,
+        suffix_spaces_only,
+        suffix_text,
+        converted,
+        || target.is_current(),
+    )
 }
 
-fn apply_last_word_conversion(p: &LastRunPayload, converted: &str) -> bool {
+fn apply_last_word_conversion(
+    p: &LastRunPayload,
+    converted: &str,
+    target: Option<FocusTarget>,
+) -> bool {
     apply_conversion(
         p.run_len,
         p.suffix_len,
         p.suffix_spaces_only,
         &p.suffix_text,
         converted,
+        target,
     )
 }
 
-fn apply_last_sequence_conversion(p: &LastSequencePayload, converted: &str) -> bool {
+fn apply_last_sequence_conversion(
+    p: &LastSequencePayload,
+    converted: &str,
+    target: Option<FocusTarget>,
+) -> bool {
     apply_conversion(
         p.seq_len,
         p.suffix_len,
         p.suffix_spaces_only,
         &p.suffix_text,
         converted,
+        target,
     )
 }
 
@@ -784,24 +898,6 @@ fn update_journal(p: &LastRunPayload, converted: &str) {
     });
     crate::input_journal::push_runs(p.suffix_runs.iter().cloned());
     tracing::trace!("journal updated");
-}
-fn delete_with_backspace(count: usize) -> bool {
-    repeat_tap(VK_BACKSPACE_KEY, count, "backspace tap failed")
-}
-fn move_caret_left(count: usize) -> bool {
-    repeat_tap(VK_LEFT_KEY, count, "left arrow tap failed")
-}
-fn move_caret_right(count: usize) -> bool {
-    repeat_tap(VK_RIGHT_KEY, count, "right arrow tap failed")
-}
-fn repeat_tap(vk: VIRTUAL_KEY, count: usize, err_msg: &'static str) -> bool {
-    match (0..count).try_for_each(|i| tap_key(vk).then_some(()).ok_or(i)) {
-        Ok(()) => true,
-        Err(i) => {
-            tracing::error!(i, count, %err_msg);
-            false
-        }
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -986,7 +1082,7 @@ mod tests {
         ]);
         let payload = take_last_word_payload().expect("payload expected");
         {
-            let _restore = JournalRestore::new(&payload);
+            let _restore = JournalRestore::new(&payload, None);
         }
         let (restored, restored_suffix) =
             ring_buffer::take_last_layout_run_with_suffix().expect("restored payload expected");

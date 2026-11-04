@@ -3,16 +3,18 @@ mod capture;
 pub(crate) mod debug_timers;
 #[cfg(debug_assertions)]
 mod e2e_scope;
-mod keydown;
-mod keyup;
 #[cfg(test)]
 pub(crate) mod isolated_env;
+mod keydown;
+mod keyup;
 pub(crate) mod mods;
 pub(crate) mod sequence;
 pub(crate) mod vk;
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
+#[cfg(debug_assertions)]
+use windows::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetForegroundWindow, GetWindow, IsChild};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::SystemInformation::GetTickCount64,
@@ -20,10 +22,6 @@ use windows::Win32::{
         CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, PostMessageW, SetWindowsHookExW,
         WH_KEYBOARD_LL,
     },
-};
-#[cfg(debug_assertions)]
-use windows::Win32::UI::WindowsAndMessaging::{
-    GW_OWNER, GetForegroundWindow, GetWindow, IsChild,
 };
 
 use self::vk::{is_keydown_msg, is_keyup_msg, mod_bit_for_vk, normalize_vk};
@@ -58,9 +56,12 @@ fn foreground_is_owned_by_main() -> bool {
         return false;
     }
 
-    foreground_matches_owner(main, fg, |parent, child| unsafe {
-        IsChild(parent, child).as_bool()
-    }, |hwnd| unsafe { GetWindow(hwnd, GW_OWNER).ok() })
+    foreground_matches_owner(
+        main,
+        fg,
+        |parent, child| unsafe { IsChild(parent, child).as_bool() },
+        |hwnd| unsafe { GetWindow(hwnd, GW_OWNER).ok() },
+    )
 }
 
 #[cfg(debug_assertions)]
@@ -187,6 +188,8 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 /// On failure, the error is routed through the UI error notifier. This keeps the
 /// release build observable even without logs.
 pub fn install(hwnd: HWND, state: &mut crate::app::AppState) {
+    crate::input::ring_buffer::warm_decoder();
+    crate::domain::text::multilang::warm();
     MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
 
     if HOOK_HANDLE.load(Ordering::Relaxed) != 0 {

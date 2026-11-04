@@ -4,6 +4,10 @@ pub mod convert;
 pub mod last_word;
 pub mod mapping;
 #[cfg(windows)]
+pub(crate) mod multilang;
+#[cfg(windows)]
+mod ranking;
+#[cfg(windows)]
 mod selection_probe;
 #[cfg(windows)]
 mod smart;

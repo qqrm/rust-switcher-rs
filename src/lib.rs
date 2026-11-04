@@ -34,3 +34,8 @@ pub mod input {
 
 #[cfg(test)]
 mod core_tests;
+
+// Exercise the real model and cache fixtures in the cross-platform test jobs.
+#[cfg(test)]
+#[path = "domain/text/ranking.rs"]
+mod ranking;

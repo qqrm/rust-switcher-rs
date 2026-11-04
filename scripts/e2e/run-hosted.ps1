@@ -287,6 +287,10 @@ try {
     $playground.SetFocus()
     $value = Get-Pattern $playground ([System.Windows.Automation.ValuePattern]::Pattern)
     $english = [HostedInput]::LoadKeyboardLayout('00000409', 0)
+    $russian = [HostedInput]::LoadKeyboardLayout('00000419', 0)
+    if ($english -eq [IntPtr]::Zero -or $russian -eq [IntPtr]::Zero) {
+        throw 'Required English/Russian test layouts could not be loaded'
+    }
     if ($english -eq [IntPtr]::Zero) { throw 'English keyboard layout unavailable' }
     [HostedInput]::PostMessage([IntPtr]$window.Current.NativeWindowHandle, 0x50, [UIntPtr]::Zero, $english) | Out-Null
     Start-Sleep -Milliseconds 300
