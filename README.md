@@ -41,6 +41,22 @@ cargo install rust-switcher
 
 Download `rust-switcher.exe` from Releases.
 
+### Updating
+
+Right-click the tray icon and select **Check for updates**. When a newer stable
+GitHub Release is available, Rust Switcher downloads `rust-switcher.exe`,
+verifies its size and GitHub-published SHA-256 digest, then gracefully exits.
+A detached PowerShell helper replaces the executable and restarts the app.
+The previous executable is kept for rollback until the replacement launches.
+This also works for installations made through Cargo, without running Cargo.
+
+Updates require Windows PowerShell 5.1, HTTPS access to GitHub, and write access
+to the installation directory. The update log is saved to
+`%LOCALAPPDATA%\RustSwitcher\updater.log`. Debug builds cannot self-update.
+
+External `cargo install rust-switcher --force` still cannot replace a running
+executable. Exit Rust Switcher first when installing through Cargo.
+
 ## Configuration
 
 The config file is stored at:

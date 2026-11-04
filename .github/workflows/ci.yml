@@ -99,6 +99,15 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Cargo fmt --check
         run: cargo +nightly fmt --check
+      - name: Validate Windows updater PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/windows-updater.ps1), [ref]$tokens, [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors) { throw ($parseErrors | Out-String) }
       - name: Cargo clippy
         run: cargo +nightly clippy --all-targets --all-features -- -D warnings
       - name: Cargo build (debug-tracing)
