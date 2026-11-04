@@ -744,6 +744,7 @@ mod tests {
 
     #[test]
     fn native_layout_preserves_leading_punctuation_and_case() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native(".Ghbdtn", "00000409", "00000419"),
             Some("юПривет".to_owned())
@@ -756,6 +757,7 @@ mod tests {
 
     #[test]
     fn native_layout_uses_physical_positions_for_qwertz() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native("zZyY", "00000407", "00000409"),
             Some("yYzZ".to_owned())
@@ -764,6 +766,7 @@ mod tests {
 
     #[test]
     fn native_layout_supports_ukrainian_without_a_language_allowlist() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native("привіт", "00000422", "00000409"),
             Some("ghbdsn".to_owned())
@@ -772,6 +775,7 @@ mod tests {
 
     #[test]
     fn native_layout_uses_french_number_row_and_azerty_positions() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native("azé&", "0000040c", "00000409"),
             Some("qw21".to_owned())
@@ -780,6 +784,7 @@ mod tests {
 
     #[test]
     fn native_layout_recovers_composed_dead_key_as_a_key_sequence() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native("ê", "00000407", "00000409"),
             Some("`e".to_owned())
@@ -792,6 +797,7 @@ mod tests {
 
     #[test]
     fn native_layout_keeps_english_keyboard_variants_distinct() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native("ê", "00020409", "00000409"),
             Some("^e".to_owned())
@@ -800,6 +806,7 @@ mod tests {
 
     #[test]
     fn native_layout_flushes_a_trailing_dead_key_as_visible_text() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native("`", "00000409", "00000407"),
             Some("^".to_owned())
@@ -808,6 +815,7 @@ mod tests {
 
     #[test]
     fn native_layout_preserves_unicode_symbols_and_line_breaks() {
+        let _guard = test_guard();
         assert_eq!(
             convert_native("🙂 ghbdtn\n", "00000409", "00000419"),
             Some("🙂 привет\n".to_owned())
@@ -816,11 +824,13 @@ mod tests {
 
     #[test]
     fn native_layout_rejects_unsupported_source_letters() {
+        let _guard = test_guard();
         assert_eq!(convert_native("helloЖ", "00000409", "00000407"), None);
     }
 
     #[test]
     fn native_layout_does_not_turn_altgr_into_control_characters() {
+        let _guard = test_guard();
         assert_eq!(convert_native("ą", "00000415", "00000409"), None);
     }
 }
