@@ -77,7 +77,8 @@ public static class BrowserInput {
         public RECT caretRect;
     }
     public sealed class FocusSnapshot {
-        public long foreground, focus, caret;
+        public long foreground, focus, caret, menuOwner;
+        public uint guiFlags;
         public long windowLayout, focusLayout;
         public int left, top, right, bottom, error;
     }
@@ -132,6 +133,7 @@ public static class BrowserInput {
         var info = new GUI_THREAD_INFO(); info.size = checked((uint)Marshal.SizeOf<GUI_THREAD_INFO>());
         if (!GetGUIThreadInfo(thread, ref info)) { result.error = Marshal.GetLastWin32Error(); return result; }
         result.focus = info.focus.ToInt64(); result.caret = info.caret.ToInt64();
+        result.menuOwner = info.menuOwner.ToInt64(); result.guiFlags = info.flags;
         result.left = info.caretRect.left; result.top = info.caretRect.top;
         result.right = info.caretRect.right; result.bottom = info.caretRect.bottom;
         if (info.focus != IntPtr.Zero) {
@@ -223,6 +225,11 @@ function Set-BrowserEnglish($Session) {
 }
 function Focus-BrowserEditor($Session, [string]$Id) {
     Focus-Browser $Session
+    # A prior failed hotkey may leave the browser's toolbar focused. Start each
+    # independent case with a real click; CDP element.focus() cannot leave native
+    # browser chrome. No focus is restored after the tested hotkey.
+    $point = Read-Browser $Session "fixture.point('$Id')"
+    [BrowserInput]::Click($Session.Handle, $point.x, $point.y)
     Read-Browser $Session "fixture.focus('$Id')" | Out-Null
     Wait-Browser { Read-Browser $Session "fixture.focused('$Id')" } "browser field $Id focus"
 }
@@ -359,7 +366,8 @@ smarter_hotkeys_enabled = true
     foreach ($case in $cases) {
         $name = "browser $($case.Kind) $($case.Mode) '$($case.Text)' firstGap=$($case.Gap) repeat=$($case.Repeat)"
         $record = [ordered]@{name = $name; input = $case.Text; expected = $case.Expected; actualBefore = $null;
-            actualAfter = $null; inputTrace = $null; focusAfterInput = $null; otherFieldsUnchanged = $null; error = $null}
+            actualAfter = $null; inputTrace = $null; focusAfterInput = $null; firstAltFocus = $null;
+            secondAltFocus = $null; finalFocus = $null; otherFieldsUnchanged = $null; error = $null}
         $heldModifier = [ushort]0
         $destination = $sessions.a
         $targetField = 'a'
@@ -417,16 +425,27 @@ smarter_hotkeys_enabled = true
             }
             Tap-BrowserKey 0xA4
             Start-Sleep -Milliseconds 100
+            $record.firstAltFocus = @{native = [BrowserInput]::Snapshot($destination.Handle);
+                dom = Read-Browser $destination 'fixture.diagnostics()'}
             Tap-BrowserKey 0xA4
+            $record.secondAltFocus = @{native = [BrowserInput]::Snapshot($destination.Handle);
+                dom = Read-Browser $destination 'fixture.diagnostics()'}
             Wait-Browser { (Read-Browser $destination 'fixture.values()').$targetField -eq $case.Expected } 'exact Double Alt browser result' 4000
             Start-Sleep -Milliseconds 75
             $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField
             if ($record.actualAfter -ne $case.Expected) { throw 'Browser conversion did not remain stable' }
+            if (-not (Read-Browser $destination "fixture.focused('$targetField')")) {
+                throw 'Double Alt moved focus away from the target editor'
+            }
         } catch {
             $record.error = $_.Exception.Message
             try { $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField } catch { }
         } finally {
             if ($heldModifier -ne 0) { [BrowserInput]::Key($heldModifier, $true) }
+            try {
+                $record.finalFocus = @{native = [BrowserInput]::Snapshot($destination.Handle);
+                    dom = Read-Browser $destination 'fixture.diagnostics()'}
+            } catch { }
             if ($null -ne $expectedOther) {
                 try {
                     $record.otherFieldsUnchanged = $true
