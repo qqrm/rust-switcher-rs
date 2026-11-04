@@ -72,6 +72,8 @@ unsupported keyboard-table formats are rejected; a transformation that cannot
 be completed is left unchanged. Modern TSF composition and custom text services
 are unsupported: a foreground keyboard-layout handle alone does not reliably
 identify their composition state.
+Custom keyboard drivers need a locally verifiable embedded or Windows catalog
+signature to be loaded.
 
 With several layouts installed, local character n-gram models rank possible
 results. The model catalog covers 75 languages; only models relevant to installed

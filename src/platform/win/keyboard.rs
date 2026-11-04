@@ -214,13 +214,14 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 /// On failure, the error is routed through the UI error notifier. This keeps the
 /// release build observable even without logs.
 pub fn install(hwnd: HWND, state: &mut crate::app::AppState) {
-    crate::input::ring_buffer::warm_decoder();
-    crate::domain::text::multilang::warm();
     MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
 
     if HOOK_HANDLE.load(Ordering::Relaxed) != 0 {
         return;
     }
+
+    crate::input::ring_buffer::warm_decoder();
+    crate::domain::text::multilang::warm();
 
     match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(proc), None, 0) } {
         Ok(h) => {
