@@ -1974,6 +1974,9 @@ mod tests {
         let _guard = test_guard();
         invalidate();
         push_run(test_run("source-must-stay", LayoutTag::En));
+
+        // Browser DOM fields can share a focused native HWND. Tab is therefore a
+        // journal boundary even when a later GetGUIThreadInfo snapshot is equal.
         let key = KBDLLHOOKSTRUCT {
             vkCode: u32::from(VK_TAB.0),
             scanCode: 0x0f,
@@ -1984,7 +1987,9 @@ mod tests {
 
         push_run(test_run(".ghbdtn", LayoutTag::En));
         let text = with_journal_mut(|journal| {
-            let (runs, _) = journal.take_last_sequence_with_suffix().unwrap();
+            let (runs, _) = journal
+                .take_last_sequence_with_suffix()
+                .expect("new field text should be available");
             runs.iter().map(|run| run.text.as_str()).collect::<String>()
         });
         assert_eq!(text, ".ghbdtn");
