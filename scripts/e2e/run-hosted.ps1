@@ -19,6 +19,7 @@ $runRoot = Join-Path $env:RUNNER_TEMP ('switcher-desktop-' + [guid]::NewGuid().T
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 $checks = [System.Collections.Generic.List[string]]::new()
 $scenarioFailures = [System.Collections.Generic.List[string]]::new()
+$journalCases = [System.Collections.Generic.List[object]]::new()
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $failure = $null
 
@@ -40,9 +41,21 @@ public static class HostedInput {
     [StructLayout(LayoutKind.Sequential)] public struct MOUSE {
         public int x, y; public uint data, flags, time; public UIntPtr extra;
     }
+    [StructLayout(LayoutKind.Sequential)] private struct RECT {
+        public int left, top, right, bottom;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct GUI_THREAD_INFO {
+        public uint size, flags;
+        public IntPtr active, focus, capture, menuOwner, moveSize, caret;
+        public RECT caretRect;
+    }
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint thread);
+    [DllImport("user32.dll", SetLastError=true)] private static extern bool GetGUIThreadInfo(uint thread, ref GUI_THREAD_INFO info);
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string title);
@@ -55,6 +68,56 @@ public static class HostedInput {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "SendInput did not inject one event");
     }
     public static int InputSize() { return Marshal.SizeOf<INPUT>(); }
+    private static void ReleaseAfterIncompleteBatch(ushort modifier, ushort firstKey) {
+        try { Key(firstKey, true); } catch { }
+        try { Key(modifier, true); } catch { }
+    }
+    public static double ReleaseThenFirstKey(ushort modifier, ushort firstKey, int delayMs) {
+        var release = new INPUT(); release.type = 1;
+        release.data.keyboard.key = modifier; release.data.keyboard.flags = 2;
+        var down = new INPUT(); down.type = 1; down.data.keyboard.key = firstKey;
+        var up = down; up.data.keyboard.flags = 2;
+        if (delayMs == 0) {
+            if (SendInput(3, new[] {release, down, up}, Marshal.SizeOf<INPUT>()) != 3) {
+                int error = Marshal.GetLastWin32Error();
+                ReleaseAfterIncompleteBatch(modifier, firstKey);
+                throw new Win32Exception(error, "Modifier/first-key batch was incomplete");
+            }
+            return 0;
+        }
+        Key(modifier, true);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        System.Threading.Thread.Sleep(delayMs);
+        double elapsed = clock.Elapsed.TotalMilliseconds;
+        if (SendInput(2, new[] {down, up}, Marshal.SizeOf<INPUT>()) != 2) {
+            int error = Marshal.GetLastWin32Error();
+            ReleaseAfterIncompleteBatch(modifier, firstKey);
+            throw new Win32Exception(error, "First-key batch was incomplete");
+        }
+        return elapsed;
+    }
+    public static IntPtr WindowLayout(IntPtr window) {
+        uint process;
+        uint thread = GetWindowThreadProcessId(window, out process);
+        if (thread == 0) throw new InvalidOperationException("Window has no GUI thread");
+        return GetKeyboardLayout(thread);
+    }
+    public static uint WindowProcess(IntPtr window) {
+        uint process;
+        if (GetWindowThreadProcessId(window, out process) == 0)
+            throw new InvalidOperationException("Window has no process");
+        return process;
+    }
+    public static IntPtr WindowFocus(IntPtr window) {
+        uint process;
+        uint thread = GetWindowThreadProcessId(window, out process);
+        if (thread == 0) throw new InvalidOperationException("Focus target has no GUI thread");
+        var info = new GUI_THREAD_INFO();
+        info.size = checked((uint)Marshal.SizeOf<GUI_THREAD_INFO>());
+        if (!GetGUIThreadInfo(thread, ref info))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Source focus snapshot failed");
+        return info.focus;
+    }
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)] static extern IntPtr SendMessageTimeout(
         IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
@@ -86,6 +149,12 @@ public static class HostedInput {
         if (SendMessageTimeout(window, 0x8011, new UIntPtr(mode), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture trap setup failed");
     }
+    public static int ResetJournalFixture(IntPtr window) {
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0x8012, UIntPtr.Zero, IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Journal fixture reset failed");
+        return checked((int)result.ToUInt64());
+    }
 }
 '@
 if ([HostedInput]::InputSize() -ne $(if ([IntPtr]::Size -eq 8) {40} else {28})) {
@@ -107,13 +176,18 @@ function Get-AutostartCommand {
     try { return $key.GetValue('RustSwitcher', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
     finally { $key.Dispose() }
 }
-function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode) {
+function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode, [uint]$JournalFixturePid = 0) {
     $info = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.WorkingDirectory = $runRoot
     $info.Environment['APPDATA'] = $ProfilePath
     $info.Environment['RUST_LOG'] = 'warn'
+    $info.Environment.Remove('RUST_SWITCHER_E2E_TARGET_PID') | Out-Null
+    if ($JournalFixturePid -ne 0) {
+        if (-not $DebugMode) { throw 'Only the debug app can allow a journal fixture PID' }
+        $info.Environment['RUST_SWITCHER_E2E_TARGET_PID'] = $JournalFixturePid.ToString()
+    }
     if ($DebugMode) {
         $info.Environment['RUST_SWITCHER_E2E_PLAYGROUND'] = '1'
         $info.Environment['RUST_SWITCHER_E2E_ALLOW_INJECTED'] = '1'
@@ -193,6 +267,8 @@ function Quit-Owned($Process, $Window) {
 
 $fixtureStdout = $null
 $fixtureStderr = $null
+$journalFixtureStdout = $null
+$journalFixtureStderr = $null
 try {
     [ordered]@{
         os = (Get-CimInstance Win32_OperatingSystem).Caption
@@ -245,6 +321,39 @@ try {
         }
         Quit-Owned $debug $window
     }
+
+    $journalManifest = Join-Path $runRoot 'journal-fixture.json'
+    $journalInfo = [System.Diagnostics.ProcessStartInfo]::new('powershell.exe')
+    $journalInfo.UseShellExecute = $false
+    $journalInfo.CreateNoWindow = $true
+    $journalInfo.RedirectStandardOutput = $true
+    $journalInfo.RedirectStandardError = $true
+    foreach ($argument in @('-NoProfile', '-STA', '-File', (Join-Path $PSScriptRoot 'journal-fixture.ps1'),
+        '-ManifestPath', $journalManifest)) {
+        $journalInfo.ArgumentList.Add($argument)
+    }
+    $journalFixture = [System.Diagnostics.Process]::Start($journalInfo)
+    $ownedProcesses.Add($journalFixture)
+    $journalFixtureStdout = $journalFixture.StandardOutput.ReadToEndAsync()
+    $journalFixtureStderr = $journalFixture.StandardError.ReadToEndAsync()
+    Wait-Condition {
+        if ($journalFixture.HasExited) { throw "Journal fixture exited before opening: $($journalFixture.ExitCode)" }
+        if (-not (Test-Path -LiteralPath $journalManifest)) { return $false }
+        try { return (Get-Content -LiteralPath $journalManifest -Raw | ConvertFrom-Json).generation -gt 0 }
+        catch { return $false }
+    } 'unowned journal fixture windows' 30000
+    $debug = Start-Switcher $DebugExe (Join-Path $runRoot 'journal-profile') $true -JournalFixturePid $journalFixture.Id
+    Wait-Condition { $null -ne (Find-AppWindow $debug) } 'debug journal matrix startup'
+    $window = Find-AppWindow $debug
+    Focus-App $window
+    Toggle-Control $window 'Smarter hotkeys' $true
+    Apply-Settings $window
+    $playground = Find-Playground $window
+    & (Join-Path $PSScriptRoot 'journal-cases.ps1') -DebugProcess $debug -AppWindow $window `
+        -AppPlayground $playground -EnglishLayout $english -FixtureProcess $journalFixture `
+        -ManifestPath $journalManifest -Failures $scenarioFailures -Results $journalCases
+    Quit-Owned $debug $window
+    Record-Pass 'debug external journal fixture cleanup and exit'
 
     $releaseProfile = Join-Path $runRoot 'release-profile'
     $release = Start-Switcher $ReleaseExe $releaseProfile $false
@@ -418,10 +527,10 @@ try {
             Remove-ItemProperty -LiteralPath $ownedRunKey -Name RustSwitcher
         }
     } catch { $cleanupErrors.Add($_.Exception.Message) }
-    foreach ($outputTask in @($fixtureStdout, $fixtureStderr)) {
+    foreach ($outputTask in @($fixtureStdout, $fixtureStderr, $journalFixtureStdout, $journalFixtureStderr)) {
         if ($null -ne $outputTask -and $outputTask.Wait(1000)) { Write-Output $outputTask.Result }
     }
-    $result = [ordered]@{ passed = $checks.ToArray(); failures = $scenarioFailures.ToArray(); failure = $failure; cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
+    $result = [ordered]@{ passed = $checks.ToArray(); journalCases = $journalCases.ToArray(); failures = $scenarioFailures.ToArray(); failure = $failure; cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
     $result | ConvertTo-Json -Depth 5 | Write-Output
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')
     if ($cleanupErrors.Count -gt 0 -and $null -eq $failure) { throw ($cleanupErrors -join '; ') }

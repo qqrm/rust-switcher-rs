@@ -1,0 +1,48 @@
+name: Windows Input Regression
+
+on:
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-input-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-input:
+    name: native-input
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Decode first characters through native Windows APIs
+        shell: pwsh
+        run: |
+          $tests = @(cargo +nightly test --locked --bin rust-switcher native_input_ -- --list)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate native input tests' }
+          if (@($tests | Where-Object { $_ -match '::native_input_.*: test$' }).Count -lt 8) {
+            throw 'The native input regression tests were not discovered'
+          }
+          cargo +nightly test --locked --bin rust-switcher native_input_ -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native input regression tests failed' }
+      - name: Report exact formatting changes
+        if: always()
+        shell: pwsh
+        run: |
+          cargo +nightly fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'Rustfmt failed' }
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'Commit the formatting changes shown above' }

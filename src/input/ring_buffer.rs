@@ -13,9 +13,10 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState, HKL, ToUnicodeEx,
-            VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-            VK_INSERT, VK_LEFT, VK_LSHIFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RSHIFT,
-            VK_SHIFT, VK_TAB, VK_UP,
+            VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+            VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NEXT,
+            VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_TAB,
+            VK_UP,
         },
         WindowsAndMessaging::{
             GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
@@ -874,6 +875,20 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
     set_key_down_state(state, VK_LSHIFT, overrides.left_shift_down);
     set_key_down_state(state, VK_RSHIFT, overrides.right_shift_down);
     set_key_toggle_state(state, VK_CAPITAL, overrides.caps_lock_on);
+
+    // record_keydown filters physically held Ctrl/Alt shortcuts before decoding printable input.
+    // Our thread's snapshot can still contain an old shortcut from a previously focused window.
+    // Leaving those bits set makes ToUnicodeEx return a control character or no character at all.
+    for vk in [
+        VK_CONTROL,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_MENU,
+        VK_LMENU,
+        VK_RMENU,
+    ] {
+        set_key_down_state(state, vk, false);
+    }
 }
 
 #[cfg(windows)]
@@ -1189,7 +1204,255 @@ pub fn last_char_triggers_autoconvert() -> bool {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use windows::{
+        Win32::UI::Input::KeyboardAndMouse::{
+            LoadKeyboardLayoutW, MAPVK_VK_TO_VSC, MapVirtualKeyExW, VK_CONTROL, VK_LCONTROL,
+            VK_LMENU, VK_MENU, VK_OEM_2, VK_OEM_PERIOD, VK_RCONTROL, VK_RMENU,
+        },
+        core::{PCWSTR, w},
+    };
+
     use super::*;
+
+    fn released_keyboard_state_overrides() -> KeyboardStateOverrides {
+        KeyboardStateOverrides {
+            shift_down: false,
+            left_shift_down: false,
+            right_shift_down: false,
+            caps_lock_on: false,
+        }
+    }
+
+    fn load_native_test_layout(name: PCWSTR) -> HKL {
+        // No activation flag: decoding uses this explicit layout without requiring foreground focus.
+        unsafe { LoadKeyboardLayoutW(name, Default::default()) }
+            .expect("the native test keyboard layout must load")
+    }
+
+    fn native_text_after_overrides(
+        layout: HKL,
+        vk: VIRTUAL_KEY,
+        stale_keys: &[VIRTUAL_KEY],
+        overrides: KeyboardStateOverrides,
+    ) -> String {
+        let mut state = [0u8; 256];
+        for key in stale_keys {
+            state[usize::from(key.0)] = 0x80;
+        }
+        apply_keyboard_state_overrides(&mut state, overrides);
+
+        let scan = unsafe { MapVirtualKeyExW(u32::from(vk.0), MAPVK_VK_TO_VSC, Some(layout)) };
+        assert_ne!(scan, 0, "the test key must have a native scan code");
+        let mut buf = [0u16; 8];
+        let count =
+            unsafe { ToUnicodeEx(u32::from(vk.0), scan, &state, &mut buf, 0, Some(layout)) };
+        let count = usize::try_from(count).expect("the test keys must not be dead keys");
+        String::from_utf16(&buf[..count]).expect("native decoding must produce valid UTF-16")
+    }
+
+    fn assert_native_character_ignores_stale_shortcuts(
+        layout: HKL,
+        vk: VIRTUAL_KEY,
+        expected: &str,
+    ) {
+        assert_eq!(
+            native_text_after_overrides(layout, vk, &[], released_keyboard_state_overrides()),
+            expected,
+            "the explicit layout must decode the clean baseline"
+        );
+
+        let stale_snapshots: [(&str, &[VIRTUAL_KEY]); 6] = [
+            ("left Control", &[VK_CONTROL, VK_LCONTROL]),
+            ("right Control", &[VK_CONTROL, VK_RCONTROL]),
+            ("left Alt", &[VK_MENU, VK_LMENU]),
+            ("right Alt", &[VK_MENU, VK_RMENU]),
+            ("Control+Alt", &[VK_CONTROL, VK_LCONTROL, VK_MENU, VK_LMENU]),
+            ("AltGr", &[VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RMENU]),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, stale_keys) in stale_snapshots {
+            let actual = native_text_after_overrides(
+                layout,
+                vk,
+                stale_keys,
+                released_keyboard_state_overrides(),
+            );
+            if actual != expected {
+                mismatches.push(format!("{name}: got {actual:?}, expected {expected:?}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "released physical modifiers must override stale thread state: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn native_input_first_english_letter_survives_stale_shortcut_state() {
+        let layout = load_native_test_layout(w!("00000409"));
+        assert_native_character_ignores_stale_shortcuts(layout, VIRTUAL_KEY(u16::from(b'G')), "g");
+    }
+
+    #[test]
+    fn native_input_first_russian_letter_survives_stale_shortcut_state() {
+        let layout = load_native_test_layout(w!("00000419"));
+        assert_native_character_ignores_stale_shortcuts(layout, VIRTUAL_KEY(u16::from(b'G')), "п");
+    }
+
+    #[test]
+    fn native_input_first_english_dot_survives_stale_shortcut_state() {
+        let layout = load_native_test_layout(w!("00000409"));
+        assert_native_character_ignores_stale_shortcuts(layout, VK_OEM_PERIOD, ".");
+    }
+
+    #[test]
+    fn native_input_first_russian_dot_survives_stale_shortcut_state() {
+        let layout = load_native_test_layout(w!("00000419"));
+        assert_native_character_ignores_stale_shortcuts(layout, VK_OEM_2, ".");
+    }
+
+    #[test]
+    fn native_input_first_stale_snapshot_does_not_shorten_the_journal_sequence() {
+        let sequences: [(PCWSTR, LayoutTag, &[u16], &str); 4] = [
+            (
+                w!("00000409"),
+                LayoutTag::En,
+                &[0x47, 0x48, 0x42, 0x44, 0x54, 0x4E],
+                "ghbdtn",
+            ),
+            (
+                w!("00000409"),
+                LayoutTag::En,
+                &[VK_OEM_PERIOD.0, 0x47, 0x48, 0x42, 0x44, 0x54, 0x4E],
+                ".ghbdtn",
+            ),
+            (
+                w!("00000419"),
+                LayoutTag::Ru,
+                &[0x47, 0x48, 0x42, 0x44, 0x54, 0x4E],
+                "привет",
+            ),
+            (
+                w!("00000419"),
+                LayoutTag::Ru,
+                &[VK_OEM_2.0, 0x47, 0x48, 0x42, 0x44, 0x54, 0x4E],
+                ".привет",
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, layout_tag, keys, expected) in sequences {
+            let layout = load_native_test_layout(name);
+            let mut journal = InputJournal::new(100);
+            for (index, &vk) in keys.iter().enumerate() {
+                let stale_keys: &[VIRTUAL_KEY] = if index == 0 {
+                    &[VK_CONTROL, VK_LCONTROL]
+                } else {
+                    &[]
+                };
+                let decoded = native_text_after_overrides(
+                    layout,
+                    VIRTUAL_KEY(vk),
+                    stale_keys,
+                    released_keyboard_state_overrides(),
+                );
+                // Match decode_typed_text's control-character rejection before journaling.
+                if !decoded.chars().any(char::is_control) {
+                    journal.push_text_internal(&decoded, layout_tag, RunOrigin::Physical);
+                }
+            }
+            let (runs, suffix) = journal
+                .take_last_sequence_with_suffix()
+                .expect("the native key sequence must reach the journal");
+            assert!(suffix.is_empty());
+            let actual = runs.iter().map(|run| run.text.as_str()).collect::<String>();
+            if actual != expected {
+                mismatches.push(format!("got {actual:?}, expected {expected:?}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "a stale snapshot on the first key must not omit that key: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn native_input_letter_case_follows_physical_shift_and_caps_lock() {
+        for (name, lowercase, uppercase) in [(w!("00000409"), "g", "G"), (w!("00000419"), "п", "П")]
+        {
+            let layout = load_native_test_layout(name);
+            for (shift, caps_lock, expected) in [
+                (false, false, lowercase),
+                (true, false, uppercase),
+                (false, true, uppercase),
+                (true, true, lowercase),
+            ] {
+                let overrides = KeyboardStateOverrides {
+                    shift_down: shift,
+                    left_shift_down: shift,
+                    right_shift_down: false,
+                    caps_lock_on: caps_lock,
+                };
+                assert_eq!(
+                    native_text_after_overrides(
+                        layout,
+                        VIRTUAL_KEY(u16::from(b'G')),
+                        &[],
+                        overrides,
+                    ),
+                    expected,
+                    "Shift={shift}, CapsLock={caps_lock}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_input_journal_short_sequence_keeps_leading_dot_and_single_dot() {
+        for (text, layout) in [
+            (".", LayoutTag::En),
+            (".", LayoutTag::Ru),
+            (".ghbdtn", LayoutTag::En),
+            (".руддщ", LayoutTag::Ru),
+        ] {
+            let mut journal = InputJournal::new(100);
+            for ch in text.chars() {
+                journal.push_text_internal(&ch.to_string(), layout, RunOrigin::Physical);
+            }
+            let (runs, suffix) = journal
+                .take_last_sequence_with_suffix()
+                .expect("leading punctuation must remain in a sequence");
+            assert!(suffix.is_empty());
+            assert_eq!(
+                runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn native_input_journal_capacity_preserves_100_characters_and_truncates_the_101st_prefix() {
+        for length in [99, 100, 101] {
+            let text = format!(".{}", "a".repeat(length - 1));
+            let expected = if length == 101 {
+                "a".repeat(100)
+            } else {
+                text.clone()
+            };
+            let mut journal = InputJournal::new(100);
+            for ch in text.chars() {
+                journal.push_text_internal(&ch.to_string(), LayoutTag::En, RunOrigin::Physical);
+            }
+            let (runs, suffix) = journal
+                .take_last_sequence_with_suffix()
+                .expect("the retained tail must remain convertible");
+            assert!(suffix.is_empty());
+            assert_eq!(
+                runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                expected,
+                "journal input length {length}"
+            );
+        }
+    }
 
     fn test_run(text: &str, layout: LayoutTag) -> InputRun {
         InputRun {
@@ -1513,6 +1776,10 @@ mod tests {
             VIRTUAL_KEY(u16::from(b'A')),
             false
         ));
+        for vk in [VIRTUAL_KEY(u16::from(b'G')), VK_OEM_PERIOD, VK_OEM_2] {
+            assert!(should_clear_for_ctrl_alt_combo(vk, true));
+            assert!(!should_clear_for_ctrl_alt_combo(vk, false));
+        }
     }
 
     #[test]
