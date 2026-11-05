@@ -271,26 +271,10 @@ jobs:
           python .github/scripts/release_stages.py publish-crates --source "$env:SOURCE_SHA" --commit "$env:MERGED_SHA" --version "$env:RELEASE_VERSION" --directory "$env:RUNNER_TEMP/publication" --manifest-sha "$env:MANIFEST_SHA" --sterile "$env:RUNNER_TEMP/publication-cargo"
           if ($LASTEXITCODE -ne 0) { throw 'Crates publication failed' }
 
-  winget:
-    needs: [version-pr, publish]
-    if: needs.publish.result == 'success'
-    runs-on: windows-2025
-    timeout-minutes: 15
-    concurrency:
-      group: rust-switcher-winget-manifest
-      cancel-in-progress: false
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout the release source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ needs.version-pr.outputs.merged }}
       - name: Submit verified executable to WinGet
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
           RELEASE_TAG: v${{ needs.version-pr.outputs.version }}
         run: |
           python .github/scripts/winget_release.py
