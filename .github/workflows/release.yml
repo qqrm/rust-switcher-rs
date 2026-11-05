@@ -259,6 +259,14 @@ jobs:
         run: |
           python .github/scripts/release_stages.py publish-github --source "$env:SOURCE_SHA" --commit "$env:MERGED_SHA" --version "$env:RELEASE_VERSION" --directory "$env:RUNNER_TEMP/publication" --manifest-sha "$env:MANIFEST_SHA"
           if ($LASTEXITCODE -ne 0) { throw 'GitHub publication failed' }
+      - name: Submit verified executable to WinGet
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TAG: v${{ env.RELEASE_VERSION }}
+        run: |
+          python .github/scripts/winget_release.py
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet submission failed' }
       - name: Authenticate to crates.io with trusted publishing
         id: crates_auth
         continue-on-error: true
