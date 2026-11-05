@@ -99,6 +99,12 @@ $cases.Add(@{ Mode = 'capacity-99'; Text = 'a' * 99; Expected = 'ф' * 99; Modif
 $cases.Add(@{ Mode = 'capacity-100'; Text = 'a' * 100; Expected = 'ф' * 100; Modifier = 0; Delay = 0; Repeat = 1 })
 $cases.Add(@{ Mode = 'capacity-101'; Text = 'a' * 101; Expected = 'ф' * 101; Modifier = 0; Delay = 0; Repeat = 1 })
 $cases.Add(@{ Mode = 'capacity-leading-dot'; Text = '.' + ('a' * 100); Expected = 'ю' + ('ф' * 100); Modifier = 0; Delay = 0; Repeat = 1 })
+# Double Alt must replace only the captured prefix before the actual caret.
+$cases.Add(@{ Mode = 'caret-in-word'; Text = 'ghbdtn'; Expected = 'приdtn'; CaretLeft = 3; Modifier = 0; Delay = 0; Repeat = 1 })
+$cases.Add(@{ Mode = 'caret-before-word'; Text = 'ghbdtn vbh'; Expected = 'привет vbh'; CaretLeft = 3; Modifier = 0; Delay = 0; Repeat = 1 })
+$cases.Add(@{ Mode = 'caret-at-start'; Text = 'ghbdtn'; Expected = 'ghbdtn'; CaretLeft = 6; Modifier = 0; Delay = 0; Repeat = 1 })
+$cases.Add(@{ Mode = 'selection-delete'; Text = 'ghbdtn'; Expected = 'ghb'; ShiftSelectLeft = 3; Replacement = ''; Modifier = 0; Delay = 0; Repeat = 1 })
+$cases.Add(@{ Mode = 'selection-replace'; Text = 'ghbdtn'; Expected = 'ghbмир'; ShiftSelectLeft = 3; Replacement = 'vbh'; Modifier = 0; Delay = 0; Repeat = 1 })
 
 $appHandle = [IntPtr]$AppWindow.Current.NativeWindowHandle
 $appValue = Get-Pattern $AppPlayground ([System.Windows.Automation.ValuePattern]::Pattern)
@@ -125,6 +131,7 @@ try {
         $value = $null
         $values = @{}
         $target = $null
+        $caretLeft = if ($case.ContainsKey('CaretLeft')) { [int]$case.CaretLeft } else { 0 }
         try {
             if ($DebugProcess.HasExited -or $fixture.HasExited) { throw 'An owned journal process exited' }
             $generation = [HostedInput]::ResetJournalFixture($firstWindow)
@@ -189,11 +196,49 @@ try {
             } finally {
                 $record.actualBefore = $value.Current.Value
             }
+            if ($caretLeft -gt 0) {
+                for ($index = 0; $index -lt $caretLeft; $index++) { Tap-Key 0x25 }
+                $caret = $case.Text.Length - $caretLeft
+                $editHandle = [IntPtr]$edits[$target].Current.NativeWindowHandle
+                Wait-Condition { [HostedInput]::HasSelectionRange($editHandle, $caret, $caret) } 'caret before Double Alt'
+            }
+            if ($case.ContainsKey('ShiftSelectLeft')) {
+                $editHandle = [IntPtr]$edits[$target].Current.NativeWindowHandle
+                $heldModifier = [ushort]0xA0
+                [HostedInput]::Key($heldModifier, $false)
+                for ($index = 0; $index -lt $case.ShiftSelectLeft; $index++) { Tap-Key 0x25 }
+                [HostedInput]::Key($heldModifier, $true)
+                $heldModifier = 0
+                $start = $case.Text.Length - $case.ShiftSelectLeft
+                Wait-Condition { [HostedInput]::HasSelectionRange($editHandle, $start, $case.Text.Length) } 'real Shift selection'
+                if ($case.Replacement.Length -eq 0) {
+                    Tap-Key 0x08
+                } else {
+                    foreach ($character in $case.Replacement.ToCharArray()) { Tap-Key (Get-JournalVirtualKey $character) }
+                }
+                $edited = $case.Text.Substring(0, $start) + $case.Replacement
+                Wait-Condition { $value.Current.Value -eq $edited } 'selection edit before Double Alt'
+                $record.actualBefore = $value.Current.Value
+            }
             Tap-Key 0xA4; Start-Sleep -Milliseconds 100; Tap-Key 0xA4
             Wait-Condition { $value.Current.Value -eq $case.Expected } 'exact journal conversion result' 2000
-            Start-Sleep -Milliseconds 100
+            # No-op cases must wait beyond the hotkey/conversion delay before
+            # asserting that the original text stayed untouched.
+            if ($case.Mode -in @('caret-at-start', 'selection-delete')) {
+                $deadline = [DateTime]::UtcNow.AddSeconds(2)
+                do {
+                    if ($value.Current.Value -ne $case.Expected) { throw 'A delayed conversion changed a rejected journal' }
+                    Start-Sleep -Milliseconds 50
+                } while ([DateTime]::UtcNow -lt $deadline)
+            } else {
+                Start-Sleep -Milliseconds 100
+            }
             $record.actualAfter = $value.Current.Value
             if ($record.actualAfter -ne $case.Expected) { throw 'Journal conversion did not remain stable' }
+            if ($caretLeft -gt 0) {
+                $caret = $case.Expected.Length - $caretLeft
+                Wait-Condition { [HostedInput]::HasSelectionRange($editHandle, $caret, $caret) } 'caret after Double Alt'
+            }
         } catch {
             $record.error = $_.Exception.Message
             # Preserve exact strings even when an assertion times out.
