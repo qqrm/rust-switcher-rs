@@ -11,7 +11,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -239,6 +238,11 @@ def submit(version: str, release: dict, sha256: str) -> None:
     branch = f"manifest/qqrm-rustswitcher-{version}"
     files = manifests(version, release["published_at"], sha256)
     validate_manifests(files, version)
+    # Recheck after download, manifest validation, and duplicate detection so a
+    # release that becomes stale during this run can never open a package PR.
+    latest = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
+    if latest.get("id") != release.get("id") or latest.get("tag_name") != "v" + version:
+        raise ValueError("Release became stale before PR creation")
     current = run_gh("api", f"repos/{WINGET_FORK}/git/ref/heads/master", "--jq", ".object.sha")
     ref_result = subprocess.run(["gh", "api", "--method", "POST", f"repos/{WINGET_FORK}/git/refs",
                                  "-f", f"ref=refs/heads/{branch}", "-f", f"sha={current}"],
