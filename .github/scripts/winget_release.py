@@ -79,16 +79,21 @@ def verify_pe_x64(path: Path) -> None:
 
 
 def release_for_event() -> tuple[dict, str, str]:
-    event = json.loads(Path(os.environ["EVENT_PATH"]).read_text(encoding="utf-8"))
-    release = event.get("release", {})
-    tag = release.get("tag_name", "")
+    requested = os.environ.get("RELEASE_TAG", "").strip()
+    if requested:
+        tag = requested if requested.startswith("v") else "v" + requested
+        semver(tag)
+        release = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{tag}")
+    else:
+        release = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
+        tag = release.get("tag_name", "")
     version = ".".join(map(str, semver(tag)))
     if release.get("draft") or release.get("prerelease") or not release.get("published_at"):
         raise ValueError("Only a published stable release can be submitted")
-    os.environ["RELEASE_TAG"] = tag
     latest = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
     if latest.get("id") != release.get("id") or latest.get("tag_name") != tag:
-        raise ValueError("Release event is stale; it is not the latest stable release")
+        raise ValueError("Requested release is stale; it is not the latest stable release")
+    os.environ["RELEASE_TAG"] = tag
     return release, tag, version
 
 
