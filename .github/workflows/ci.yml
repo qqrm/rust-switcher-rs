@@ -202,6 +202,27 @@ jobs:
           cargo +nightly test --lib ranking::model_cache::tests::hosted_native_model_download_verifies_cache_and_reuses_it_offline --locked -- --ignored --exact --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native model download/cache regression failed' }
 
+  updater-live:
+    name: updater-live
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: nightly
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build native release executable
+        run: cargo +nightly build --release --locked --bin rust-switcher
+      - name: Live upgrade from running binary and no-op behavior
+        shell: pwsh
+        run: ./scripts/e2e/updater-live.ps1 -Application rust-switcher
+
   dependency-security:
     name: dependency-security
     runs-on: ubuntu-latest
@@ -227,7 +248,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [fmt, clippy-lib-tests, test-lib-tests, windows-full, dependency-security]
+    needs: [fmt, clippy-lib-tests, test-lib-tests, windows-full, updater-live, dependency-security]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -238,9 +259,11 @@ jobs:
           RESULT_2: ${{ needs.test-lib-tests.result }}
           RESULT_3: ${{ needs.windows-full.result }}
           RESULT_4: ${{ needs.dependency-security.result }}
+          RESULT_5: ${{ needs.updater-live.result }}
         run: |
           test "$RESULT_0" = success
           test "$RESULT_1" = success
           test "$RESULT_2" = success
           test "$RESULT_3" = success
           test "$RESULT_4" = success
+          test "$RESULT_5" = success
