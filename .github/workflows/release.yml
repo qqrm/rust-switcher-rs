@@ -276,6 +276,9 @@ jobs:
     if: needs.publish.result == 'success'
     runs-on: windows-2025
     timeout-minutes: 15
+    concurrency:
+      group: rust-switcher-winget-manifest
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
