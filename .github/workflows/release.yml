@@ -152,7 +152,7 @@ jobs:
       - name: Create or reuse the protected version PR
         id: writer
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
           SOURCE_SHA: ${{ github.sha }}
         run: python3 .github/scripts/release_stages.py version-pr --source "$SOURCE_SHA" --directory "$RUNNER_TEMP/version-plan"
       - name: Wait for native checks and the exact PR head to merge
