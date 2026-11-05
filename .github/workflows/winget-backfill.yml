@@ -1,0 +1,32 @@
+name: Backfill WinGet manifest
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable release tag to submit (blank selects the latest stable release)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winget-backfill
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: dev
+      - name: Validate latest stable release and submit WinGet update
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 .github/scripts/winget_release.py
