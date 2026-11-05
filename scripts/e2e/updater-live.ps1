@@ -41,11 +41,17 @@ if ($optionalCli) {
 }
 
 function Run-Updater([string]$version, [int]$parent) {
-    $arguments = @('-NoProfile', '-NonInteractive', '-File', $scriptPath,
+    # The production helper deletes its own script directory in finally.
+    # Each test invocation therefore gets an isolated throwaway copy.
+    $helperDir = Join-Path $env:RUNNER_TEMP "helper-$Application-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $helperDir | Out-Null
+    $helperScript = Join-Path $helperDir 'updater.ps1'
+    Copy-Item -LiteralPath $scriptPath -Destination $helperScript
+    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $helperScript,
         '-TargetPath', $target, '-CurrentVersion', $version,
         $parentParameter, [string]$parent, '-LogPath', $logPath)
-    & $windowsPowerShell @arguments
-    return $LASTEXITCODE
+    & $windowsPowerShell @arguments | Out-Host
+    return [int]$LASTEXITCODE
 }
 
 function Assert-Asset([object]$release, [string]$filename) {
