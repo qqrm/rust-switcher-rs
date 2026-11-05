@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -198,6 +199,22 @@ def open_prs() -> list[dict]:
     return [item for item in data.get("items", []) if item.get("pull_request")]
 
 
+def validate_manifests(files: dict[str, str], version: str) -> None:
+    """Run the official WinGet validator on the exact files that will be submitted."""
+    with tempfile.TemporaryDirectory(prefix="rust-switcher-winget-") as temporary:
+        root = Path(temporary)
+        for relative, content in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content.replace("\n", "\r\n").encode("utf-8"))
+        manifest_dir = root / MANIFEST_ROOT / version
+        result = subprocess.run(["winget", "validate", "--manifest", str(manifest_dir)],
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if result.returncode:
+            raise RuntimeError(f"winget validate failed; no PR was created: {result.stdout.strip()}")
+        print(result.stdout.strip())
+
+
 def submit(version: str, release: dict, sha256: str) -> None:
     wanted = semver("v" + version)
     published = current_versions()
@@ -221,6 +238,7 @@ def submit(version: str, release: dict, sha256: str) -> None:
 
     branch = f"manifest/qqrm-rustswitcher-{version}"
     files = manifests(version, release["published_at"], sha256)
+    validate_manifests(files, version)
     current = run_gh("api", f"repos/{WINGET_FORK}/git/ref/heads/master", "--jq", ".object.sha")
     ref_result = subprocess.run(["gh", "api", "--method", "POST", f"repos/{WINGET_FORK}/git/refs",
                                  "-f", f"ref=refs/heads/{branch}", "-f", f"sha={current}"],
