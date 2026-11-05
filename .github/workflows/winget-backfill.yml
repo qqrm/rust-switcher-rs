@@ -30,6 +30,6 @@ jobs:
           ref: dev
       - name: Validate latest stable release and submit WinGet update
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: python .github/scripts/winget_release.py
