@@ -273,7 +273,7 @@ def submit(version: str, release: dict, sha256: str) -> None:
 
 def main() -> None:
     if not os.environ.get("GH_TOKEN"):
-        raise ValueError("GH_TOKEN is required (configure RELEASE_TOKEN with fork write and upstream PR rights)")
+        raise ValueError("GH_TOKEN is required (configure WINGET_TOKEN with fork write and upstream PR rights)")
     release, tag, version = release_for_event()
     sha256 = verify_executable(release, tag)
     submit(version, release, sha256)
