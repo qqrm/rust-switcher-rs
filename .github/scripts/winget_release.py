@@ -2,6 +2,8 @@
 """Submit verified, already-published Rust Switcher EXEs to the WinGet fork."""
 from __future__ import annotations
 
+import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -21,7 +23,7 @@ WINGET_UPSTREAM = "microsoft/winget-pkgs"
 PACKAGE_ID = "QQRM.RustSwitcher"
 MANIFEST_VERSION = "1.28.0"
 MANIFEST_ROOT = "manifests/q/QQRM/RustSwitcher"
-VERSION_RE = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
 
 def api(url: str) -> object:
@@ -88,6 +90,8 @@ def release_for_event() -> tuple[dict, str, str]:
         release = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
         tag = release.get("tag_name", "")
     version = ".".join(map(str, semver(tag)))
+    if release.get("tag_name") != tag:
+        raise ValueError("Release metadata does not match the requested tag")
     if release.get("draft") or release.get("prerelease") or not release.get("published_at"):
         raise ValueError("Only a published stable release can be submitted")
     latest = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
@@ -137,6 +141,10 @@ def run_gh(*args: str) -> str:
 
 
 def manifests(version: str, published_at: str, sha256: str) -> dict[str, str]:
+    semver("v" + version)
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        raise ValueError("Installer SHA-256 must contain exactly 64 hexadecimal characters")
+    sha256 = sha256.upper()
     date = dt.datetime.fromisoformat(published_at.replace("Z", "+00:00")).date().isoformat()
     return {
         f"{MANIFEST_ROOT}/{version}/{PACKAGE_ID}.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.{MANIFEST_VERSION}.schema.json
@@ -195,7 +203,16 @@ ManifestVersion: {MANIFEST_VERSION}
 def open_prs() -> list[dict]:
     query = urllib.parse.quote(f'repo:{WINGET_UPSTREAM} is:pr "{PACKAGE_ID}"')
     data = api(f"https://api.github.com/search/issues?q={query}&per_page=100")
-    return [item for item in data.get("items", []) if item.get("pull_request")]
+    items = data.get("items")
+    if (not isinstance(items, list) or data.get("incomplete_results") is not False
+            or data.get("total_count") != len(items)):
+        raise ValueError("Incomplete or truncated WinGet PR search; refusing a possible duplicate")
+    return [item for item in items if item.get("pull_request")]
+
+
+def manifest_bytes(content: str) -> bytes:
+    """Use identical UTF-8/CRLF bytes for validation and the Contents API."""
+    return content.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8")
 
 
 def validate_manifests(files: dict[str, str], version: str) -> None:
@@ -205,21 +222,23 @@ def validate_manifests(files: dict[str, str], version: str) -> None:
         for relative, content in files.items():
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content.replace("\n", "\r\n").encode("utf-8"))
+            path.write_bytes(manifest_bytes(content))
         manifest_dir = root / MANIFEST_ROOT / version
-        result = subprocess.run(["winget", "validate", "--manifest", str(manifest_dir)],
+        result = subprocess.run(["winget", "validate", "--manifest", str(manifest_dir),
+                                 "--disable-interactivity"],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode:
             raise RuntimeError(f"winget validate failed; no PR was created: {result.stdout.strip()}")
         print(result.stdout.strip())
 
 
-def submit(version: str, release: dict, sha256: str) -> None:
+def publication_needed(version: str) -> bool:
+    """Fail closed on competing submissions, including closed/rejected attempts."""
     wanted = semver("v" + version)
     published = current_versions()
     if published and max(published) >= wanted:
         print(f"WinGet already contains {max(published)} or newer; no action")
-        return
+        return False
     existing = open_prs()
     version_title = re.compile(rf"\b{re.escape(version)}\b")
     exact = [item for item in existing if version_title.search(item.get("title", ""))]
@@ -228,22 +247,27 @@ def submit(version: str, release: dict, sha256: str) -> None:
         raise ValueError("Multiple open WinGet PRs exist for this package/version")
     if open_exact:
         print(f"WinGet PR already exists for {version}: {open_exact[0]['html_url']}")
-        return
+        return False
     if exact:
         raise ValueError(f"A closed PR already exists for {version}; refusing to duplicate it: {exact[0]['html_url']}")
     open_package = [item for item in existing if item.get("state") == "open"]
     if open_package:
         raise ValueError("Another QQRM.RustSwitcher PR is open; refusing overlapping manifest updates")
+    return True
+
+
+def submit(version: str, release: dict, sha256: str) -> None:
+    if not publication_needed(version):
+        return
 
     branch = f"manifest/qqrm-rustswitcher-{version}"
     files = manifests(version, release["published_at"], sha256)
     validate_manifests(files, version)
-    # Recheck after download, manifest validation, and duplicate detection so a
-    # release that becomes stale during this run can never open a package PR.
+    # Reject releases that became stale while their files were being validated.
     latest = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
     if latest.get("id") != release.get("id") or latest.get("tag_name") != "v" + version:
         raise ValueError("Release became stale before PR creation")
-    current = run_gh("api", f"repos/{WINGET_FORK}/git/ref/heads/master", "--jq", ".object.sha")
+    current = run_gh("api", f"repos/{WINGET_UPSTREAM}/git/ref/heads/master", "--jq", ".object.sha")
     ref_result = subprocess.run(["gh", "api", "--method", "POST", f"repos/{WINGET_FORK}/git/refs",
                                  "-f", f"ref=refs/heads/{branch}", "-f", f"sha={current}"],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -252,14 +276,21 @@ def submit(version: str, release: dict, sha256: str) -> None:
             raise RuntimeError(f"Could not create WinGet branch: {ref_result.stdout.strip()}")
         raise ValueError(f"Branch {branch} already exists without a matching open PR; inspect it manually")
     for path, content in files.items():
+        encoded = base64.b64encode(manifest_bytes(content)).decode("ascii")
         run_gh("api", "--method", "PUT", f"repos/{WINGET_FORK}/contents/{path}",
                "-f", f"message=New version: {PACKAGE_ID} version {version}",
-               "-f", f"content={content}", "-f", f"branch={branch}")
+               "-f", f"content={encoded}", "-f", f"branch={branch}")
+    # Other authors can submit or publish while these API writes are in flight.
+    latest = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
+    if latest.get("id") != release.get("id") or latest.get("tag_name") != "v" + version:
+        raise ValueError("Release became stale before PR creation")
+    if not publication_needed(version):
+        return
     body = (f"## 📖 Description\n\nUpdates `{PACKAGE_ID}` to version `{version}` using the published Windows x64 release executable.\n\n"
-            f"The executable was downloaded from the immutable release URL, checked as an x64 Windows PE, and its SHA-256 was verified against GitHub release asset metadata: `{sha256}`.\n\n"
+            f"The executable was downloaded from the version-specific release URL, checked as an x64 Windows PE, and its SHA-256 was verified against GitHub release asset metadata: `{sha256}`.\n\n"
             "## 📦 Manifest Checklist\n\n- [x] One manifest set for this package/version\n"
             "- [x] Installer URL and SHA-256 verified from the published release asset\n"
-            f"- [x] Manifest schema version `{MANIFEST_VERSION}`\n- [ ] Locally validated with `winget validate --manifest`\n"
+            f"- [x] Manifest schema version `{MANIFEST_VERSION}`\n- [x] Validated on Windows with `winget validate --manifest`\n"
             "- [ ] Tested locally with `winget install --manifest`\n")
     pr = subprocess.run(["gh", "api", "--method", "POST", f"repos/{WINGET_UPSTREAM}/pulls",
                          "-f", f"title=New version: {PACKAGE_ID} version {version}",
@@ -271,11 +302,19 @@ def submit(version: str, release: dict, sha256: str) -> None:
     print(f"Created WinGet PR {result['html_url']}")
 
 
-def main() -> None:
-    if not os.environ.get("GH_TOKEN"):
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Verify the release asset and run WinGet validation without GitHub writes")
+    args = parser.parse_args(argv)
+    if not args.validate_only and not os.environ.get("GH_TOKEN"):
         raise ValueError("GH_TOKEN is required (configure WINGET_TOKEN with fork write and upstream PR rights)")
     release, tag, version = release_for_event()
     sha256 = verify_executable(release, tag)
+    if args.validate_only:
+        validate_manifests(manifests(version, release["published_at"], sha256), version)
+        print(f"Validated {PACKAGE_ID} {version}; no GitHub writes requested")
+        return
     submit(version, release, sha256)
 
 

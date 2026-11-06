@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   submit:
+    if: github.ref == 'refs/heads/dev'
     runs-on: windows-2025
     timeout-minutes: 15
     concurrency:
@@ -27,7 +28,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: dev
+          ref: ${{ github.sha }}
+      - name: Install the pinned WinGet validator
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/install_winget.ps1
       - name: Validate latest stable release and submit WinGet update
         env:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}

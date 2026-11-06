@@ -369,7 +369,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("cargo ", writer)
         self.assertNotIn("rust-toolchain@", writer)
         self.assertEqual(workflow.count("secrets.RELEASE_TOKEN"), 1)
-        self.assertEqual(workflow.count("persist-credentials: false"), 4)
+        self.assertEqual(workflow.count("persist-credentials: false"), 5)
         publisher = workflow.split("\n  publish:\n", 1)[1]
         self.assertLess(publisher.index("preflight --"), publisher.index("id: crates_auth"))
         self.assertIn("artifact-ids:", publisher)
