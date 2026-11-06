@@ -1,0 +1,41 @@
+name: Backfill WinGet manifest
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable release tag to submit (blank selects the latest stable release)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winget-backfill
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    concurrency:
+      group: release-dev
+      cancel-in-progress: false
+    steps:
+      - name: Checkout the release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Install the pinned WinGet validator
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/install_winget.ps1
+      - name: Validate latest stable release and submit WinGet update
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python .github/scripts/winget_release.py

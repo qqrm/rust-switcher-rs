@@ -1,0 +1,37 @@
+name: Publish WinGet manifest
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winget-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    if: github.event.release.draft == false && github.event.release.prerelease == false
+    runs-on: windows-2025
+    timeout-minutes: 15
+    concurrency:
+      group: release-dev
+      cancel-in-progress: false
+    steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Install the pinned WinGet validator
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/install_winget.ps1
+      - name: Validate release and submit WinGet update
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: python .github/scripts/winget_release.py
