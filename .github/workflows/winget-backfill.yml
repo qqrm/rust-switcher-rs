@@ -24,17 +24,32 @@ jobs:
       group: release-dev
       cancel-in-progress: false
     steps:
+      - name: Check WinGet publication credentials
+        id: credentials
+        shell: pwsh
+        env:
+          WINGET_TOKEN_CONFIGURED: ${{ secrets.WINGET_TOKEN != '' }}
+        run: |
+          if ($env:WINGET_TOKEN_CONFIGURED -ne 'true') {
+            'available=false' >> $env:GITHUB_OUTPUT
+            'Skipping WinGet publication: WINGET_TOKEN is not configured.' >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          'available=true' >> $env:GITHUB_OUTPUT
       - name: Checkout the release automation
+        if: steps.credentials.outputs.available == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
       - name: Install the pinned WinGet validator
+        if: steps.credentials.outputs.available == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./.github/scripts/install_winget.ps1
       - name: Validate latest stable release and submit WinGet update
+        if: steps.credentials.outputs.available == 'true'
         env:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}

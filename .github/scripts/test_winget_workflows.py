@@ -1,7 +1,11 @@
 """Keep WinGet publication credentials and Windows validation behind CI gates."""
 
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 
@@ -76,9 +80,32 @@ class WinGetWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", prefix)
         self.assertNotIn("continue-on-error:", job)
         self.assertNotIn("secrets.RELEASE_TOKEN", job)
-        secret_steps = [step for step in steps(job) if "secrets." in step]
-        self.assertEqual(len(secret_steps), 1)
-        publish = secret_steps[0]
+        job_steps = steps(job)
+        self.assertGreater(len(job_steps), 1)
+        credentials = job_steps[0]
+        self.assertTrue(credentials.startswith("Check WinGet publication credentials\n"))
+        self.assertRegex(credentials, r"(?m)^        id: credentials$")
+        self.assertRegex(credentials, r"(?m)^        shell: pwsh$")
+        self.assertNotRegex(credentials, r"(?m)^        (if|uses):")
+        self.assertEqual(block(credentials, "env", 8),
+                         ["WINGET_TOKEN_CONFIGURED: ${{ secrets.WINGET_TOKEN != '' }}"])
+        self.assertEqual(re.findall(r"secrets\.([A-Z_]+)", credentials), ["WINGET_TOKEN"])
+        check_script = credentials.split("        run: |\n", 1)[1]
+        self.assertEqual([line.strip() for line in check_script.splitlines() if line.strip()], [
+            "if ($env:WINGET_TOKEN_CONFIGURED -ne 'true') {",
+            "'available=false' >> $env:GITHUB_OUTPUT",
+            "'Skipping WinGet publication: WINGET_TOKEN is not configured.' >> $env:GITHUB_STEP_SUMMARY",
+            "exit 0",
+            "}",
+            "'available=true' >> $env:GITHUB_OUTPUT",
+        ])
+        for step in job_steps[1:]:
+            self.assertEqual(re.findall(r"(?m)^        if: (.+)$", step),
+                             ["steps.credentials.outputs.available == 'true'"])
+        secret_steps = [step for step in job_steps if "secrets." in step]
+        self.assertEqual(len(secret_steps), 2)
+        self.assertEqual(secret_steps[0], credentials)
+        publish = secret_steps[1]
         self.assertEqual(re.findall(r"secrets\.([A-Z_]+)", publish), ["WINGET_TOKEN"])
         self.assertIn("GH_TOKEN: ${{ secrets.WINGET_TOKEN }}", publish)
         self.assertIn("python .github/scripts/winget_release.py", publish)
@@ -103,6 +130,38 @@ class WinGetWorkflowTests(unittest.TestCase):
                 self.assert_release_lock(job, 4)
                 self.assert_checkout(job, "github.sha")
                 self.assert_publisher(job)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is required to execute the credential check")
+    def test_optional_credentials_report_skip_or_enable_publication_in_powershell(self):
+        for name, job_name in (("release.yml", "winget"), ("winget.yml", "submit"),
+                               ("winget-backfill.yml", "submit")):
+            job = jobs(workflow(name))[job_name]
+            # Verify the exact safe check before executing extracted workflow code.
+            self.assert_publisher(job)
+            script = steps(job)[0].split("        run: |\n", 1)[1]
+            for configured in ("false", "true"):
+                with self.subTest(workflow=name, configured=configured), \
+                        tempfile.TemporaryDirectory() as temporary:
+                    output = Path(temporary) / "output"
+                    summary = Path(temporary) / "summary"
+                    environment = {key: value for key, value in os.environ.items() if key.upper() in {
+                        "PATH", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP",
+                        "HOME", "USERPROFILE", "PSMODULEPATH",
+                    }}
+                    environment.update(WINGET_TOKEN_CONFIGURED=configured,
+                                       GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary))
+                    result = subprocess.run(
+                        ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                        cwd=temporary, env=environment, text=True, capture_output=True, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(output.read_text(encoding="utf-8-sig").splitlines(),
+                                     [f"available={configured}"])
+                    if configured == "false":
+                        self.assertEqual(summary.read_text(encoding="utf-8-sig").splitlines(),
+                                         ["Skipping WinGet publication: WINGET_TOKEN is not configured."])
+                    else:
+                        self.assertFalse(summary.exists())
 
     def test_release_event_selects_its_exact_published_stable_tag(self):
         text = workflow("winget.yml")
@@ -144,7 +203,7 @@ class WinGetWorkflowTests(unittest.TestCase):
         self.assertNotIn("WINGET_TOKEN", release_jobs["publish"])
         self.assertEqual(text.count("secrets.RELEASE_TOKEN"), 1)
         self.assertIn("secrets.RELEASE_TOKEN", release_jobs["version-pr"])
-        self.assertEqual(text.count("secrets.WINGET_TOKEN"), 1)
+        self.assertEqual(text.count("secrets.WINGET_TOKEN"), 2)
 
     def test_all_actions_in_publication_and_validation_workflows_are_sha_pinned(self):
         for name in ("winget.yml", "winget-backfill.yml", "release.yml",
