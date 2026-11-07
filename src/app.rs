@@ -241,6 +241,9 @@ pub struct AppState {
     pub autoconvert_feature_enabled: bool,
     pub errors: VecDeque<UiError>,
 
+    /// Last committed settings, kept separate from pending hotkey edits.
+    pub applied_config: config::Config,
+
     /// Temporary hotkeys currently shown in UI. Committed on Apply.
     pub hotkey_values: HotkeyValues,
     pub hotkey_sequence_values: HotkeySequenceValues,
@@ -281,8 +284,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Applies the AutoConvert availability gate immediately, without saving
-    /// the Settings form. `Cancel` restores the persisted configuration.
+    /// Applies the already saved AutoConvert availability gate immediately.
     ///
     /// Returns whether a deferred pause sequence was cancelled and its timer
     /// therefore needs to be stopped by the window layer.
@@ -313,6 +315,54 @@ impl AppState {
         });
 
         cancelled_deferred_pause
+    }
+
+    /// Enables only committed smart bindings and clears pending smart actions.
+    /// Returns whether the deferred sequence timer needs to be stopped.
+    pub fn set_smarter_hotkeys_enabled(&mut self, enabled: bool) -> bool {
+        let cancelled_deferred_smart = self.deferred_sequence_hotkey.is_some_and(|deferred| {
+            matches!(
+                deferred.slot,
+                HotkeySlot::SmartLastWord
+                    | HotkeySlot::SmartLastSequence
+                    | HotkeySlot::SmartSelection
+            )
+        });
+
+        self.active_hotkey_sequences.smart_last_word = if enabled {
+            self.applied_config.smart_hotkey_convert_last_word_sequence
+        } else {
+            None
+        };
+        self.active_hotkey_sequences.smart_last_sequence = if enabled {
+            self.applied_config.smart_hotkey_convert_last_sequence_sequence
+        } else {
+            None
+        };
+        self.active_hotkey_sequences.smart_selection = if enabled {
+            self.applied_config.smart_hotkey_convert_selection_sequence
+        } else {
+            None
+        };
+        self.hotkey_sequence_progress.smart_last_word = SequenceProgress::default();
+        self.hotkey_sequence_progress.smart_last_sequence = SequenceProgress::default();
+        self.hotkey_sequence_progress.smart_selection = SequenceProgress::default();
+
+        if cancelled_deferred_smart {
+            self.deferred_sequence_hotkey = None;
+        }
+        self.pending_runtime_commands.retain(|command| {
+            !matches!(
+                command,
+                RuntimeCommand::Hotkey(
+                    HotkeyAction::SmartConvertLastWord
+                        | HotkeyAction::SmartConvertLastSequence
+                        | HotkeyAction::SmartConvertSelection
+                )
+            )
+        });
+
+        cancelled_deferred_smart
     }
 }
 
@@ -416,6 +466,91 @@ impl ControlId {
 mod tests {
     use super::*;
     use crate::{config::Config, input::hotkeys::HotkeyAction};
+
+    #[test]
+    fn smarter_toggle_uses_saved_bindings_without_committing_drafts() {
+        let cfg = Config::default();
+        let mut state = AppState {
+            applied_config: cfg.clone(),
+            autoconvert_enabled: true,
+            hotkey_sequence_values: HotkeySequenceValues {
+                smart_last_word: None,
+                smart_last_sequence: None,
+                smart_selection: None,
+                ..HotkeySequenceValues::from_config_all(&cfg)
+            },
+            active_hotkey_sequences: HotkeySequenceValues::from_config(&cfg),
+            ..Default::default()
+        };
+
+        assert!(!state.set_smarter_hotkeys_enabled(true));
+        assert_eq!(
+            state.active_hotkey_sequences.smart_last_word,
+            cfg.smart_hotkey_convert_last_word_sequence
+        );
+        assert_eq!(
+            state.active_hotkey_sequences.smart_last_sequence,
+            cfg.smart_hotkey_convert_last_sequence_sequence
+        );
+        assert_eq!(
+            state.active_hotkey_sequences.smart_selection,
+            cfg.smart_hotkey_convert_selection_sequence
+        );
+        assert!(state.hotkey_sequence_values.smart_last_word.is_none());
+        assert!(state.hotkey_sequence_values.smart_last_sequence.is_none());
+        assert!(state.hotkey_sequence_values.smart_selection.is_none());
+        assert!(state.autoconvert_enabled);
+    }
+
+    #[test]
+    fn disabling_smarter_hotkeys_cancels_pending_smart_actions_only() {
+        let cfg = Config {
+            smarter_hotkeys_enabled: true,
+            ..Default::default()
+        };
+        let mut state = AppState {
+            applied_config: cfg.clone(),
+            active_hotkey_sequences: HotkeySequenceValues::from_config(&cfg),
+            deferred_sequence_hotkey: Some(DeferredSequenceHotkey {
+                slot: HotkeySlot::SmartLastSequence,
+            }),
+            hotkey_sequence_progress: HotkeySequenceProgress {
+                smart_last_sequence: SequenceProgress {
+                    waiting_second: true,
+                    first_tick_ms: 42,
+                    matched_chords: 1,
+                },
+                ..Default::default()
+            },
+            pending_runtime_commands: [
+                RuntimeCommand::Hotkey(HotkeyAction::SmartConvertLastWord),
+                RuntimeCommand::Hotkey(HotkeyAction::SmartConvertLastSequence),
+                RuntimeCommand::Hotkey(HotkeyAction::SmartConvertSelection),
+                RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord),
+                RuntimeCommand::AutoconvertLastWord,
+            ]
+            .into(),
+            autoconvert_enabled: true,
+            ..Default::default()
+        };
+
+        assert!(state.set_smarter_hotkeys_enabled(false));
+        assert!(state.active_hotkey_sequences.smart_last_word.is_none());
+        assert!(state.active_hotkey_sequences.smart_last_sequence.is_none());
+        assert!(state.active_hotkey_sequences.smart_selection.is_none());
+        assert!(state.deferred_sequence_hotkey.is_none());
+        assert_eq!(state.hotkey_sequence_progress.smart_last_sequence.matched_chords, 0);
+        assert_eq!(state.active_hotkey_sequences.last_word, cfg.hotkey_convert_last_word_sequence);
+        assert_eq!(state.active_hotkey_sequences.pause, cfg.hotkey_pause_sequence);
+        assert!(state.autoconvert_enabled);
+        assert_eq!(
+            state.pending_runtime_commands.into_iter().collect::<Vec<_>>(),
+            vec![
+                RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord),
+                RuntimeCommand::AutoconvertLastWord,
+            ]
+        );
+    }
 
     #[test]
     fn disabled_autoconvert_feature_removes_pause_from_runtime_sequences() {

@@ -55,7 +55,7 @@ pub(crate) const AUTOSTART_ARG: &str = "--autostart";
 use windows::Win32::UI::WindowsAndMessaging::{WM_CTLCOLOREDIT, WM_ERASEBKGND};
 
 use crate::{
-    app::{AppState, RuntimeCommand},
+    app::{AppState, ControlId, HotkeySlot, RuntimeCommand},
     app_identity, config,
     domain::text::{last_word::autoconvert_last_word, switch_keyboard_layout},
     input::hotkeys::{HotkeyAction, action_from_id},
@@ -130,29 +130,10 @@ fn init_e2e_playground(hwnd: HWND, state: &crate::app::AppState) {
 fn init_e2e_playground(_hwnd: HWND, _state: &crate::app::AppState) {}
 
 pub(crate) fn apply_theme_from_tray(hwnd: HWND, dark: bool) {
-    // Apply visuals immediately.
-    crate::platform::ui::themes::set_window_theme(hwnd, dark);
-
-    // Keep the main window checkbox state in sync, so Apply does not revert it.
     with_state_mut_do(hwnd, |state| {
         helpers::set_checkbox(state.checkboxes.theme_dark, dark);
+        handle_setting_toggle(hwnd, state, ControlId::DarkTheme);
     });
-
-    // Persist only this setting, do not overwrite other pending UI edits.
-    let mut cfg = config::load().unwrap_or_default();
-    cfg.theme_dark = dark;
-
-    if let Err(e) = config::save(&cfg) {
-        with_state_mut_do(hwnd, |state| {
-            crate::platform::ui::error_notifier::push(
-                hwnd,
-                state,
-                T_CONFIG,
-                "Failed to save config",
-                &io_to_win(e),
-            );
-        });
-    }
 }
 
 fn tray_toggle_hotkey_text(state: &AppState) -> String {
@@ -239,6 +220,14 @@ fn apply_config_to_ui(
         cfg.autoconvert_feature_enabled,
     );
 
+    apply_hotkeys_to_ui(state, cfg)?;
+    crate::platform::ui::sync_smarter_hotkey_controls(hwnd, state, cfg.smarter_hotkeys_enabled)?;
+    crate::platform::ui::sync_autoconvert_controls(state, cfg.autoconvert_feature_enabled);
+
+    Ok(())
+}
+
+fn apply_hotkeys_to_ui(state: &mut AppState, cfg: &config::Config) -> windows::core::Result<()> {
     state.hotkey_values = crate::app::HotkeyValues::from_config(cfg);
     state.hotkey_sequence_values = crate::app::HotkeySequenceValues::from_config_all(cfg);
 
@@ -289,20 +278,11 @@ fn apply_config_to_ui(
         state.hotkeys.smart_selection,
         &format_hotkey_sequence(cfg.smart_hotkey_convert_selection_sequence),
     )?;
-    crate::platform::ui::sync_smarter_hotkey_controls(hwnd, state, cfg.smarter_hotkeys_enabled)?;
-    crate::platform::ui::sync_autoconvert_controls(state, cfg.autoconvert_feature_enabled);
-
     Ok(())
 }
 
-fn read_ui_to_config(state: &AppState, mut cfg: config::Config) -> config::Config {
-    cfg.delay_ms = config::CONVERSION_DELAY_MS;
-
-    cfg.start_minimized = helpers::get_checkbox(state.checkboxes.start_minimized);
-    cfg.theme_dark = helpers::get_checkbox(state.checkboxes.theme_dark);
-    cfg.smarter_hotkeys_enabled = helpers::get_checkbox(state.checkboxes.smarter_hotkeys);
-    cfg.autoconvert_feature_enabled = helpers::get_checkbox(state.checkboxes.autoconvert_feature);
-
+fn read_hotkeys_to_config(state: &AppState) -> config::Config {
+    let mut cfg = state.applied_config.clone();
     cfg.hotkey_convert_last_word_sequence = state.hotkey_sequence_values.last_word;
     cfg.hotkey_convert_last_sequence_sequence = state.hotkey_sequence_values.last_sequence;
     cfg.hotkey_pause_sequence = state.hotkey_sequence_values.pause;
@@ -344,7 +324,7 @@ fn read_ui_to_config(state: &AppState, mut cfg: config::Config) -> config::Confi
     cfg
 }
 
-fn apply_config_runtime(
+fn apply_hotkeys_runtime(
     hwnd: HWND,
     state: &mut AppState,
     cfg: &config::Config,
@@ -352,9 +332,7 @@ fn apply_config_runtime(
     state.active_hotkey_sequences = crate::app::HotkeySequenceValues::from_config(cfg);
     state.active_pause_hotkey = cfg.hotkey_pause;
     state.active_pause_hotkey_sequence = cfg.hotkey_pause_sequence;
-    let cancelled_deferred_pause =
-        state.set_autoconvert_feature_enabled(cfg.autoconvert_feature_enabled);
-    if cancelled_deferred_pause {
+    if state.deferred_sequence_hotkey.take().is_some() {
         unsafe {
             let _ = KillTimer(
                 Some(hwnd),
@@ -378,10 +356,12 @@ fn apply_config_runtime(
         crate::input::hotkeys::register_from_config(hwnd, cfg),
     );
 
-    // ВАЖНО: зафиксировать тему в state до любых WM_CTLCOLOR*.
-    // А само применение Visual Styles для чекбоксов делать отложенно на старте.
-    let dark = cfg.theme_dark;
+    refresh_tray_tooltip(hwnd, state);
+    Ok(())
+}
 
+fn apply_theme(hwnd: HWND, state: &mut AppState, dark: bool) {
+    // Set the state before painting; defer visual styles while the window is hidden.
     state.current_theme_dark = dark;
 
     if unsafe { IsWindowVisible(hwnd).as_bool() } {
@@ -397,7 +377,17 @@ fn apply_config_runtime(
         }
     }
 
-    refresh_tray_tooltip(hwnd, state);
+}
+
+fn apply_config_runtime(
+    hwnd: HWND,
+    state: &mut AppState,
+    cfg: &config::Config,
+) -> windows::core::Result<()> {
+    state.applied_config = cfg.clone();
+    state.set_autoconvert_feature_enabled(cfg.autoconvert_feature_enabled);
+    apply_hotkeys_runtime(hwnd, state, cfg)?;
+    apply_theme(hwnd, state, cfg.theme_dark);
 
     if let Err(e) = crate::platform::win::tray::switch_tray_icon(hwnd, false) {
         tracing::warn!(error = ?e, "switch_tray_icon failed while applying config");
@@ -406,8 +396,7 @@ fn apply_config_runtime(
     Ok(())
 }
 
-/// Makes the AutoConvert checkbox effective immediately, including every
-/// runtime entry point. The persisted value is still changed only by Apply.
+/// Applies a saved AutoConvert setting to every runtime entry point.
 pub(crate) fn set_autoconvert_feature_enabled_from_ui(
     hwnd: HWND,
     state: &mut AppState,
@@ -435,6 +424,76 @@ pub(crate) fn set_autoconvert_feature_enabled_from_ui(
     refresh_tray_tooltip(hwnd, state);
     if let Err(e) = crate::platform::win::tray::switch_tray_icon(hwnd, false) {
         tracing::warn!(error = ?e, "switch_tray_icon failed while toggling AutoConvert feature");
+    }
+}
+
+fn handle_setting_toggle(hwnd: HWND, state: &mut AppState, id: ControlId) {
+    // Only committed settings may enter this save, never the hotkey drafts.
+    let mut cfg = state.applied_config.clone();
+    let (checkbox, setting) = match id {
+        ControlId::StartMinimized => (state.checkboxes.start_minimized, &mut cfg.start_minimized),
+        ControlId::DarkTheme => (state.checkboxes.theme_dark, &mut cfg.theme_dark),
+        ControlId::SmarterHotkeys => (
+            state.checkboxes.smarter_hotkeys,
+            &mut cfg.smarter_hotkeys_enabled,
+        ),
+        ControlId::AutoconvertFeature => (
+            state.checkboxes.autoconvert_feature,
+            &mut cfg.autoconvert_feature_enabled,
+        ),
+        _ => return,
+    };
+    let previous = *setting;
+    let enabled = helpers::get_checkbox(checkbox);
+    *setting = enabled;
+
+    if let Err(error) = save_config(&cfg) {
+        helpers::set_checkbox(checkbox, previous);
+        error.notify(hwnd, state);
+        return;
+    }
+    state.applied_config = cfg;
+
+    match id {
+        ControlId::DarkTheme => apply_theme(hwnd, state, enabled),
+        ControlId::SmarterHotkeys => {
+            if !enabled
+                && matches!(
+                    state.hotkey_capture.slot,
+                    Some(
+                        HotkeySlot::SmartLastWord
+                            | HotkeySlot::SmartLastSequence
+                            | HotkeySlot::SmartSelection
+                    )
+                )
+            {
+                stop_hotkey_capture_ui(hwnd, state);
+            }
+            if state.set_smarter_hotkeys_enabled(enabled) {
+                unsafe {
+                    let _ = KillTimer(
+                        Some(hwnd),
+                        crate::platform::win::keyboard::sequence::DEFERRED_SEQUENCE_TIMER_ID,
+                    );
+                }
+            }
+            let result = ui::sync_smarter_hotkey_controls(hwnd, state, enabled);
+            ui::error_notifier::report_unit(
+                hwnd,
+                state,
+                T_UI,
+                "Failed to update smarter hotkey fields",
+                result,
+            );
+        }
+        ControlId::AutoconvertFeature => {
+            if !enabled && state.hotkey_capture.slot == Some(HotkeySlot::Pause) {
+                stop_hotkey_capture_ui(hwnd, state);
+            }
+            ui::sync_autoconvert_controls(state, enabled);
+            set_autoconvert_feature_enabled_from_ui(hwnd, state, enabled);
+        }
+        _ => {}
     }
 }
 
@@ -749,17 +808,17 @@ fn io_to_win(e: std::io::Error) -> windows::core::Error {
     Error::new(HRESULT(0x8000_4005_u32 as i32), e.to_string())
 }
 
-/// Error returned by `build_and_save_config_from_ui`.
+/// Error returned when persisting settings or hotkeys.
 ///
 /// This type carries two payloads:
 /// - `user_text`: a short message intended to be shown to the user
 /// - `source`: the underlying Win32 error used for debug details
-struct ApplyConfigError {
+struct SaveConfigError {
     user_text: String,
     source: windows::core::Error,
 }
 
-impl ApplyConfigError {
+impl SaveConfigError {
     /// Enqueues the error into the UI notifier queue and schedules UI processing.
     ///
     /// This method is intentionally side effecting and should be called only from
@@ -775,83 +834,59 @@ impl ApplyConfigError {
     }
 }
 
-fn build_and_save_config_from_ui(
-    state: &mut AppState,
-) -> std::result::Result<config::Config, ApplyConfigError> {
-    // Apply must not depend on reading existing config file.
-    // Build a fresh config from UI and overwrite on disk.
-    let cfg = read_ui_to_config(state, config::Config::default());
-
-    config::save(&cfg).map_err(|e| {
+fn save_config(cfg: &config::Config) -> std::result::Result<(), SaveConfigError> {
+    config::save(cfg).map_err(|e| {
         let user_text = match e.kind() {
             std::io::ErrorKind::InvalidInput => e.to_string(),
             _ => "Failed to save config".to_string(),
         };
 
-        ApplyConfigError {
+        SaveConfigError {
             user_text,
             source: io_to_win(e),
         }
-    })?;
-
-    Ok(cfg)
+    })
 }
 
-/// Applies configuration changes requested by the UI.
-///
-/// Architectural boundary:
-/// This handler is a UI boundary. It coordinates:
-/// - persistence (load, merge, save)
-/// - runtime application of the new config
-/// - updating the UI to reflect the saved config
-///
-/// All user notifications are emitted here. Lower level helpers return `Result` only.
+/// Commits only hotkey edits, retaining every immediately saved setting.
 fn handle_apply(hwnd: HWND, state: &mut AppState) {
-    let cfg = match build_and_save_config_from_ui(state) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            e.notify(hwnd, state);
-            return;
-        }
-    };
+    stop_hotkey_capture_ui(hwnd, state);
+    // Use the committed snapshot so Apply can still repair an unreadable config file.
+    let cfg = read_hotkeys_to_config(state);
+    if let Err(error) = save_config(&cfg) {
+        error.notify(hwnd, state);
+        return;
+    }
+    state.applied_config = cfg.clone();
 
-    let apply_runtime = apply_config_runtime(hwnd, state, &cfg);
+    let apply_runtime = apply_hotkeys_runtime(hwnd, state, &cfg);
     ui::error_notifier::report_unit(
         hwnd,
         state,
         T_CONFIG,
-        "Failed to apply config at runtime",
+        "Failed to apply hotkeys at runtime",
         apply_runtime,
     );
 
-    let apply_ui = apply_config_to_ui(hwnd, state, &cfg);
+    let apply_ui = apply_hotkeys_to_ui(state, &cfg);
     ui::error_notifier::report_unit(
         hwnd,
         state,
         T_UI,
-        "Failed to update UI from config",
+        "Failed to update hotkey fields",
         apply_ui,
     );
 }
 
 fn handle_cancel(hwnd: HWND, state: &mut AppState) {
-    let cfg = config::load().unwrap_or_default();
-
-    let apply_runtime = apply_config_runtime(hwnd, state, &cfg);
-    ui::error_notifier::report_unit(
-        hwnd,
-        state,
-        T_CONFIG,
-        "Failed to apply config at runtime",
-        apply_runtime,
-    );
-
-    let apply_ui = apply_config_to_ui(hwnd, state, &cfg);
+    let cfg = state.applied_config.clone();
+    stop_hotkey_capture_ui(hwnd, state);
+    let apply_ui = apply_hotkeys_to_ui(state, &cfg);
     ui::error_notifier::report_unit(
         hwnd,
         state,
         T_UI,
-        "Failed to update UI from config",
+        "Failed to restore hotkey fields",
         apply_ui,
     );
 }
@@ -1006,7 +1041,23 @@ fn handle_switch_layout_hotkey(state: &mut AppState) {
     let _ = switch_keyboard_layout();
 }
 
+fn hotkey_action_enabled(state: &AppState, action: HotkeyAction) -> bool {
+    match action {
+        HotkeyAction::PauseToggle => state.autoconvert_feature_enabled,
+        HotkeyAction::SmartConvertLastWord
+        | HotkeyAction::SmartConvertLastSequence
+        | HotkeyAction::SmartConvertSelection => state.applied_config.smarter_hotkeys_enabled,
+        _ => true,
+    }
+}
+
 fn execute_runtime_command(hwnd: HWND, state: &mut AppState, command: RuntimeCommand) {
+    if let RuntimeCommand::Hotkey(action) = command
+        && !hotkey_action_enabled(state, action)
+    {
+        return;
+    }
+
     match command {
         RuntimeCommand::AutoconvertLastWord => {
             if state.autoconvert_feature_enabled && state.autoconvert_enabled {
@@ -1015,9 +1066,6 @@ fn execute_runtime_command(hwnd: HWND, state: &mut AppState, command: RuntimeCom
         }
         RuntimeCommand::Hotkey(action) => match action {
             HotkeyAction::PauseToggle => {
-                if !state.autoconvert_feature_enabled {
-                    return;
-                }
                 tracing::warn!(msg = "autoconvert_toggle", source = "hotkey_pause_toggle");
                 handle_pause_toggle(hwnd, state);
             }
@@ -1091,7 +1139,7 @@ fn on_hotkey(hwnd: HWND, wparam: WPARAM) -> LRESULT {
     };
 
     with_state_mut(hwnd, |state| {
-        if action == HotkeyAction::PauseToggle && !state.autoconvert_feature_enabled {
+        if !hotkey_action_enabled(state, action) {
             return;
         }
         enqueue_runtime_command(hwnd, state, RuntimeCommand::Hotkey(action));
@@ -1209,6 +1257,40 @@ mod tests {
             third: None,
             max_gap_ms: 250,
         }
+    }
+
+    #[test]
+    fn applying_hotkey_drafts_preserves_committed_settings() {
+        let cfg = config::Config {
+            delay_ms: 250,
+            start_minimized: true,
+            theme_dark: true,
+            smarter_hotkeys_enabled: true,
+            autoconvert_feature_enabled: false,
+            ..Default::default()
+        };
+        let draft = Some(seq(u32::from(b'Q')));
+        let state = AppState {
+            applied_config: cfg.clone(),
+            hotkey_sequence_values: HotkeySequenceValues {
+                last_word: draft,
+                ..HotkeySequenceValues::from_config_all(&cfg)
+            },
+            ..Default::default()
+        };
+
+        // No checkbox HWNDs are present: Apply must use committed preferences.
+        let result = read_hotkeys_to_config(&state);
+        assert!(result.start_minimized);
+        assert!(result.theme_dark);
+        assert!(result.smarter_hotkeys_enabled);
+        assert!(!result.autoconvert_feature_enabled);
+        assert_eq!(result.delay_ms, cfg.delay_ms);
+        assert_eq!(result.hotkey_convert_last_word_sequence, draft);
+        assert_eq!(
+            state.applied_config.hotkey_convert_last_word_sequence,
+            cfg.hotkey_convert_last_word_sequence
+        );
     }
 
     #[test]
