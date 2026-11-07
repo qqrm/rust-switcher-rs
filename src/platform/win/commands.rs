@@ -77,28 +77,11 @@ fn handle_buttons(hwnd: HWND, id: i32) -> LRESULT {
             super::handle_autostart_toggle(hwnd, state);
         }),
 
-        ControlId::SmarterHotkeys => with_state_mut_do(hwnd, |state| {
-            let enabled = helpers::get_checkbox(state.checkboxes.smarter_hotkeys);
-            if let Err(e) = crate::platform::ui::sync_smarter_hotkey_controls(hwnd, state, enabled)
-            {
-                crate::platform::ui::error_notifier::push(
-                    hwnd,
-                    state,
-                    T_UI,
-                    "Failed to update smarter hotkey fields",
-                    &e,
-                );
-                super::on_app_error(hwnd);
-            }
-        }),
-
-        ControlId::AutoconvertFeature => with_state_mut_do(hwnd, |state| {
-            let enabled = helpers::get_checkbox(state.checkboxes.autoconvert_feature);
-            if !enabled && state.hotkey_capture.slot == Some(crate::app::HotkeySlot::Pause) {
-                super::stop_hotkey_capture_ui(hwnd, state);
-            }
-            crate::platform::ui::sync_autoconvert_controls(state, enabled);
-            super::set_autoconvert_feature_enabled_from_ui(hwnd, state, enabled);
+        ControlId::StartMinimized
+        | ControlId::DarkTheme
+        | ControlId::SmarterHotkeys
+        | ControlId::AutoconvertFeature => with_state_mut_do(hwnd, |state| {
+            super::handle_setting_toggle(hwnd, state, cid);
         }),
 
         ControlId::Apply => with_state_mut_do(hwnd, |state| {

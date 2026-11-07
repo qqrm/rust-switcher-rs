@@ -239,6 +239,13 @@ function Apply-Settings($Window) {
     $element = Find-Control $Window 'Apply'
     (Get-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
 }
+function Assert-ConfigFlag([string]$Path, [string]$Flag, [bool]$Enabled) {
+    $expected = $Enabled.ToString().ToLowerInvariant()
+    Wait-Condition {
+        (Test-Path -LiteralPath $Path) -and
+        (Get-Content -LiteralPath $Path -Raw) -match "(?m)^$Flag\s*=\s*$expected\s*$"
+    } "$Flag saved immediately as $expected"
+}
 function Find-Playground($Window) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -285,7 +292,66 @@ try {
     $window = Find-AppWindow $debug
     Focus-App $window
     Toggle-Control $window 'Smarter hotkeys' $true
+    $debugConfig = Join-Path $debugProfile 'RustSwitcherDebug/config.json'
+    Assert-ConfigFlag $debugConfig 'smarter_hotkeys_enabled' $true
+    $savedConfig = Get-Content -LiteralPath $debugConfig -Raw
+    $lastWordEdit = [System.Windows.Automation.AutomationElement]::FromHandle(
+        [HostedInput]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 1201))
+    $lastWordValue = Get-Pattern $lastWordEdit ([System.Windows.Automation.ValuePattern]::Pattern)
+    $savedLastWord = $lastWordValue.Current.Value
+    $lastWordEdit.SetFocus()
+    Tap-Key 0x77 # F8 is a draft only until Apply.
+    Wait-Condition { $lastWordValue.Current.Value -match 'F8' } 'pending hotkey edit'
+    $minimized = Get-Pattern (Find-Control $window 'Start minimized') ([System.Windows.Automation.TogglePattern]::Pattern)
+    $heldConfig = [System.IO.File]::Open($debugConfig, [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $minimized.Toggle()
+        Wait-Condition { $minimized.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off } 'failed save restores checkbox'
+        if ((Get-Content -LiteralPath $debugConfig -Raw) -ne $savedConfig) { throw 'Failed save changed config bytes' }
+        if ($lastWordValue.Current.Value -notmatch 'F8') { throw 'Failed save changed the hotkey draft' }
+        Record-Pass 'failed checkbox save preserves settings and drafts'
+    } finally {
+        $heldConfig.Dispose()
+    }
+    foreach ($setting in @(
+        @('Start minimized', 'start_minimized', $true),
+        @('Start minimized', 'start_minimized', $false),
+        @('Dark theme', 'theme_dark', $true),
+        @('Dark theme', 'theme_dark', $false),
+        @('Smarter hotkeys', 'smarter_hotkeys_enabled', $false),
+        @('Smarter hotkeys', 'smarter_hotkeys_enabled', $true),
+        @('Enable AutoConvert', 'autoconvert_feature_enabled', $false),
+        @('Enable AutoConvert', 'autoconvert_feature_enabled', $true)
+    )) {
+        Toggle-Control $window $setting[0] $setting[2]
+        Assert-ConfigFlag $debugConfig $setting[1] $setting[2]
+        if ($lastWordValue.Current.Value -notmatch 'F8') { throw 'Checkbox click discarded the hotkey draft' }
+    }
+    if ((Get-Content -LiteralPath $debugConfig -Raw) -ne $savedConfig) {
+        throw 'Checkbox clicks saved an unapplied hotkey edit'
+    }
+    Toggle-Control $window 'Dark theme' $true
+    Assert-ConfigFlag $debugConfig 'theme_dark' $true
+    (Get-Pattern (Find-Control $window 'Cancel') ([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+    Assert-Value $lastWordValue $savedLastWord 'Cancel discards only the hotkey draft'
+    Assert-ConfigFlag $debugConfig 'theme_dark' $true
+    $theme = Get-Pattern (Find-Control $window 'Dark theme') ([System.Windows.Automation.TogglePattern]::Pattern)
+    if ($theme.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) { throw 'Cancel reverted a saved checkbox' }
+    Record-Pass 'checkboxes save both states immediately and preserve hotkey drafts'
+    $lastWordEdit.SetFocus()
+    Tap-Key 0x77
+    Wait-Condition { $lastWordValue.Current.Value -match 'F8' } 'new hotkey draft for Apply'
     Apply-Settings $window
+    Wait-Condition { (Get-Content -LiteralPath $debugConfig -Raw) -match '(?s)\[hotkey_convert_last_word_sequence.first\].*?vk = 119' } 'Apply saves the new hotkey'
+    Assert-ConfigFlag $debugConfig 'theme_dark' $true
+    $lastWordEdit.SetFocus()
+    Tap-Shift 2
+    Assert-Value $lastWordValue $savedLastWord 'restore original hotkey draft'
+    Apply-Settings $window
+    Wait-Condition {
+        ((Get-Content -LiteralPath $debugConfig -Raw) -replace 'theme_dark = true', 'theme_dark = false') -eq $savedConfig
+    } 'Apply restores original hotkeys and preserves saved settings'
     $playground = Find-Playground $window
     $playground.SetFocus()
     $value = Get-Pattern $playground ([System.Windows.Automation.ValuePattern]::Pattern)
@@ -310,6 +376,10 @@ try {
         Wait-Condition { $null -ne (Find-AppWindow $debug) } "debug $scenario startup"
         $window = Find-AppWindow $debug
         Focus-App $window
+        foreach ($name in @('Dark theme', 'Smarter hotkeys', 'Enable AutoConvert')) {
+            $toggle = Get-Pattern (Find-Control $window $name) ([System.Windows.Automation.TogglePattern]::Pattern)
+            if ($toggle.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) { throw "$name did not survive restart" }
+        }
         $playground = Find-Playground $window
         $playground.SetFocus()
         $value = Get-Pattern $playground ([System.Windows.Automation.ValuePattern]::Pattern)
@@ -318,8 +388,10 @@ try {
         if ($scenario -eq 'autoconvert') {
             Tap-Key 0xA3; Start-Sleep -Milliseconds 100; Tap-Key 0xA3
             Start-Sleep -Milliseconds 300
+            (Get-Pattern (Find-Control $window 'Cancel') ([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            $playground.SetFocus()
             foreach ($character in 'GHBDTN '.ToCharArray()) { Tap-Key ([ushort]$character) }
-            Assert-Value $value 'привет ' 'debug autoconvert after explicit runtime toggle'
+            Assert-Value $value 'привет ' 'debug Cancel preserves active AutoConvert'
         } else {
             foreach ($character in 'GHBDTN VBH'.ToCharArray()) { Tap-Key ([ushort]$character) }
             Assert-Value $value 'ghbdtn vbh' 'debug last-sequence initial input'
@@ -354,7 +426,6 @@ try {
     $window = Find-AppWindow $debug
     Focus-App $window
     Toggle-Control $window 'Smarter hotkeys' $true
-    Apply-Settings $window
     $playground = Find-Playground $window
     & (Join-Path $PSScriptRoot 'journal-cases.ps1') -DebugProcess $debug -AppWindow $window `
         -AppPlayground $playground -EnglishLayout $english -FixtureProcess $journalFixture `
@@ -490,10 +561,9 @@ try {
     if (-not $editor.WaitForExit(5000)) { throw 'Isolated editor did not close' }
     # Settings use addressed UI Automation patterns; they do not need foreground input.
     Toggle-Control $window 'Dark theme' $true
-    Apply-Settings $window
     $config = Join-Path $releaseProfile 'RustSwitcher/config.json'
-    Wait-Condition { (Test-Path -LiteralPath $config) -and (Get-Content -LiteralPath $config -Raw) -match 'theme_dark\s*=\s*true' } 'release setting persisted'
-    Record-Pass 'release settings saved'
+    Assert-ConfigFlag $config 'theme_dark' $true
+    Record-Pass 'release settings saved without Apply'
     if ($null -ne (Get-AutostartCommand)) {
         throw 'Unexpected pre-existing autostart entry on fresh VM'
     }

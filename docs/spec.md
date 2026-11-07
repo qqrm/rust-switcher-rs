@@ -150,6 +150,10 @@ Native Win32 UI with a single window and two group sections (custom painted fram
 - Smarter hotkeys (checkbox)
 - Enable AutoConvert (checkbox; disables the Autoconvert pause field when off)
 
+Every checkbox applies and saves its setting as soon as it is toggled. A failed
+save restores the previous checkbox value and reports the error. Checkbox clicks
+do not commit pending hotkey edits.
+
 ### Hotkeys group
 - Read only displays for:
   - Convert last word
@@ -159,14 +163,14 @@ Native Win32 UI with a single window and two group sections (custom painted fram
   - Switch layout (sequence)
 
 Buttons:
-- Apply: persists config and applies theme changes immediately
-- Cancel: reloads config from disk and applies it to UI and runtime (including theme)
+- Apply: saves and activates only the hotkey edits
+- Cancel: discards pending hotkey edits; immediately saved settings and runtime AutoConvert status remain unchanged
 - Exit: closes the application
 
 Note: there is currently no dedicated GitHub/"Report issue" button in the shipped UI.
 
 Theme behavior:
-- Theme can be changed from UI checkbox + Apply.
+- Theme changes and saves immediately when its checkbox is toggled.
 - Theme can also be changed from tray menu.
 - Tray theme switch persists theme_dark into config immediately (without overwriting other pending UI edits).
 
