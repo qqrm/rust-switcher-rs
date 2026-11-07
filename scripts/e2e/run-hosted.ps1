@@ -388,9 +388,28 @@ try {
         if ($scenario -eq 'autoconvert') {
             Tap-Key 0xA3; Start-Sleep -Milliseconds 100; Tap-Key 0xA3
             Start-Sleep -Milliseconds 300
+            $appHandle = [IntPtr]$window.Current.NativeWindowHandle
+            $cancelDraft = [System.Windows.Automation.AutomationElement]::FromHandle(
+                [HostedInput]::GetDlgItem($appHandle, 1201))
+            $cancelValue = Get-Pattern $cancelDraft ([System.Windows.Automation.ValuePattern]::Pattern)
+            $originalHotkey = $cancelValue.Current.Value
+            $cancelDraft.SetFocus()
+            Wait-Condition { $cancelDraft.Current.HasKeyboardFocus } 'hotkey draft focus while AutoConvert is active'
+            Tap-Key 0x77
+            Wait-Condition { $cancelValue.Current.Value -match 'F8' } 'hotkey draft while AutoConvert is active'
             (Get-Pattern (Find-Control $window 'Cancel') ([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            Assert-Value $cancelValue $originalHotkey 'Cancel completed while AutoConvert is active'
             $playground.SetFocus()
-            foreach ($character in 'GHBDTN '.ToCharArray()) { Tap-Key ([ushort]$character) }
+            $playgroundHandle = [IntPtr]$playground.Current.NativeWindowHandle
+            Wait-Condition {
+                $playground.Current.HasKeyboardFocus -and
+                [HostedInput]::WindowFocus($appHandle) -eq $playgroundHandle
+            } 'playground focus restored after Cancel'
+            [HostedInput]::PostMessage($appHandle, 0x50, [UIntPtr]::Zero, $english) | Out-Null
+            Wait-Condition { [HostedInput]::WindowLayout($appHandle) -eq $english } 'English layout restored after Cancel'
+            foreach ($character in 'GHBDTN'.ToCharArray()) { Tap-Key ([ushort]$character) }
+            Assert-Value $value 'ghbdtn' 'debug input delivered after Cancel'
+            Tap-Key 0x20
             Assert-Value $value 'привет ' 'debug Cancel preserves active AutoConvert'
         } else {
             foreach ($character in 'GHBDTN VBH'.ToCharArray()) { Tap-Key ([ushort]$character) }
