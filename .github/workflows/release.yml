@@ -45,14 +45,14 @@ jobs:
             test "$ACTUAL_SHA" = "$EXPECTED_SHA"
           fi
       - name: Checkout exact source without stored credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
       - name: Detect release-worthy dependency merge
         id: release_context
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         with:
           github-token: ${{ github.token }}
           script: |
@@ -115,7 +115,7 @@ jobs:
       - name: Transfer version plan to the isolated writer
         if: steps.release_context.outputs.should_release == 'true'
         id: upload
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: version-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/version-plan
@@ -138,13 +138,13 @@ jobs:
       version: ${{ steps.writer.outputs.version }}
     steps:
       - name: Checkout exact source without stored credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
       - name: Download this run's version plan by immutable artifact ID
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
           path: ${{ runner.temp }}/version-plan
@@ -175,7 +175,7 @@ jobs:
       manifest_sha: ${{ steps.bundle.outputs.manifest_sha }}
     steps:
       - name: Checkout checked version merge without stored credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -210,7 +210,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Publication manifest failed' }
       - name: Transfer verified publication files
         id: upload
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: publication-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publication
@@ -232,7 +232,7 @@ jobs:
       MANIFEST_SHA: ${{ needs.build.outputs.manifest_sha }}
     steps:
       - name: Checkout checked version merge without stored credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -242,7 +242,7 @@ jobs:
         with:
           toolchain: nightly
       - name: Download this run's verified files by immutable artifact ID
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
           path: ${{ runner.temp }}/publication
@@ -262,7 +262,7 @@ jobs:
       - name: Authenticate to crates.io with trusted publishing
         id: crates_auth
         continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9
       - name: Publish checked crates without compilation
         shell: pwsh
         env:
@@ -292,7 +292,7 @@ jobs:
           'available=true' >> $env:GITHUB_OUTPUT
       - name: Checkout checked WinGet automation without stored credentials
         if: steps.credentials.outputs.available == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           ref: ${{ needs.version-pr.outputs.merged }}
