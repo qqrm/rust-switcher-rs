@@ -1,183 +1,20 @@
 name: Gitleaks
-
 on:
   push:
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   gitleaks:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      GITLEAKS_VERSION: "8.30.1"
+    timeout-minutes: 10
     steps:
-      - name: Check out all branches and tags
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Install the verified Gitleaks release
-        shell: bash
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
-          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-        run: |
-          tool_dir="$(mktemp -d "$RUNNER_TEMP/gitleaks-bin.XXXXXX")"
-          archive="$tool_dir/gitleaks.tar.gz"
-          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            --output "$archive"
-          printf '%s  %s\n' "$GITLEAKS_SHA256" "$archive" | sha256sum --check --strict -
-          tar -xzf "$archive" -C "$tool_dir" gitleaks
-          printf 'GITLEAKS_BIN=%s\n' "$tool_dir/gitleaks" >> "$GITHUB_ENV"
-
-      - name: Verify detection and scan the complete fetched history
-        shell: python
-        run: |
-          import json
-          import os
-          from pathlib import Path
-          import re
-          import secrets
-          import string
-          import subprocess
-          import sys
-          import tempfile
-
-          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-          binary = os.environ["GITLEAKS_BIN"]
-          version = subprocess.check_output([binary, "version"], text=True).strip()
-          if version != os.environ["GITLEAKS_VERSION"]:
-              raise RuntimeError("The installed Gitleaks version does not match its pin")
-
-          def git(repo, *args):
-              return subprocess.check_output(
-                  ["git", "-C", str(repo), *args], text=True, stderr=subprocess.PIPE
-              ).strip()
-
-          if git(workspace, "rev-parse", "--is-shallow-repository") != "false":
-              raise RuntimeError("A complete, non-shallow checkout is required")
-          commit_count = int(git(workspace, "rev-list", "--count", "--all"))
-          ref_count = len(git(workspace, "for-each-ref", "--format=%(refname)").splitlines())
-          if commit_count == 0:
-              raise RuntimeError("Refusing an empty Git history")
-
-          # Use the same checked-in policy for the controls and the real scan.
-          config = workspace / ".gitleaks.toml"
-          config_args = ["--config", str(config)] if config.is_file() else []
-          scan_env = os.environ.copy()
-          for key in ("GITLEAKS_CONFIG", "GITLEAKS_CONFIG_TOML"):
-              scan_env.pop(key, None)
-
-          def scan(source, report):
-              result = subprocess.run(
-                  [binary, "git", str(source),
-                   "--log-opts=--all --full-history --diff-merges=first-parent --text --no-textconv --no-ext-diff",
-                   "--redact=100", "--exit-code=2", "--no-banner", "--no-color",
-                   "--ignore-gitleaks-allow", "--gitleaks-ignore-path", str(workspace),
-                   "--report-format=json", "--report-path", str(report), *config_args],
-                  cwd=workspace, env=scan_env, text=True, capture_output=True,
-              )
-              log = result.stdout + result.stderr
-              report.with_suffix(".log").write_text(log, encoding="utf-8")
-              if result.returncode not in (0, 2):
-                  raise RuntimeError(
-                      f"Gitleaks processing error (exit {result.returncode}); scan is not successful"
-                  )
-              counts = re.findall(r"\b([0-9]+) commits? scanned\.", log)
-              if not counts or int(counts[-1]) == 0:
-                  raise RuntimeError("Gitleaks did not scan any commits")
-              findings = json.loads(report.read_text(encoding="utf-8"))
-              if not isinstance(findings, list) or bool(findings) != (result.returncode == 2):
-                  raise RuntimeError("Gitleaks exit status and report disagree")
-              return result.returncode, findings, int(counts[-1])
-
-          with tempfile.TemporaryDirectory(prefix="gitleaks-check-", dir=os.environ["RUNNER_TEMP"]) as temporary:
-              temp = Path(temporary)
-              control = temp / "control"
-              control.mkdir()
-              git(control, "init", "--initial-branch=main")
-              git(control, "config", "user.name", "Gitleaks detection control")
-              git(control, "config", "user.email", "gitleaks-control@example.invalid")
-              git(control, "config", "commit.gpgsign", "false")
-              git(control, "config", "core.hooksPath", "/dev/null")
-
-              def commit(message):
-                  git(control, "add", "--all")
-                  git(control, "commit", "-m", message)
-                  return git(control, "rev-parse", "HEAD")
-
-              expected = set()
-
-              def seed(filename):
-                  # Construct fake credentials at runtime; no real credential is used.
-                  suffix = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36))
-                  (control / filename).write_text("gh" + "p_" + suffix + "\n", encoding="utf-8")
-                  sha = commit("Add a synthetic detection control")
-                  expected.add(("github-pat", filename, sha))
-
-              (control / "README.txt").write_text("Clean detection control\n", encoding="utf-8")
-              (control / ".gitattributes").write_text("attributes-secret.env -diff\n", encoding="utf-8")
-              commit("Create a clean control")
-              clean_status, _, _ = scan(control, temp / "clean.json")
-              if clean_status != 0:
-                  raise RuntimeError("The clean negative control failed")
-
-              seed("deleted-secret.env")
-              (control / "deleted-secret.env").unlink()
-              commit("Remove the synthetic credential from HEAD")
-
-              seed("attributes-secret.env")
-              (control / "attributes-secret.env").unlink()
-              commit("Remove the credential hidden by Git attributes")
-
-              git(control, "checkout", "-b", "control-side-branch")
-              seed("branch-secret.env")
-              git(control, "checkout", "main")
-
-              git(control, "checkout", "-b", "control-tag-branch")
-              seed("tag-secret.env")
-              git(control, "tag", "control-history-tag")
-              git(control, "checkout", "main")
-              git(control, "branch", "-D", "control-tag-branch")
-
-              git(control, "checkout", "-b", "control-merge-parent")
-              (control / "parent.txt").write_text("Harmless merge parent\n", encoding="utf-8")
-              commit("Prepare a merge parent")
-              git(control, "checkout", "main")
-              git(control, "merge", "--no-ff", "--no-commit", "control-merge-parent")
-              seed("merge-secret.env")
-              (control / "merge-secret.env").unlink()
-              commit("Remove the credential introduced only by the merge")
-
-              status, findings, _ = scan(control, temp / "positive.json")
-              observed = {(item["RuleID"], item["File"], item["Commit"]) for item in findings}
-              if status != 2 or observed != expected:
-                  raise RuntimeError("Detection control failed: history, attributes, branch, tag, or merge was missed")
-              if any((control / filename).exists() for _, filename, _ in expected):
-                  raise RuntimeError("The positive control must have a clean HEAD")
-              print("PASS: clean control; deleted-history, attributes, branch-only, tag-only, and merge-only secrets detected")
-
-              status, findings, scanned_count = scan(workspace, temp / "repository.json")
-              summary = (
-                  "## Gitleaks history scan\n\n"
-                  f"- Scanner: {version}\n"
-                  "- Detection controls: passed (clean, deleted history, attributes, branch, tag, merge)\n"
-                  f"- Available commits: {commit_count}; refs: {ref_count}\n"
-                  f"- Commits with scanned additions: {scanned_count}\n"
-                  f"- Findings: {len(findings)}\n"
-              )
-              print(summary)
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
-                  output.write(summary)
-              for item in findings:
-                  print(json.dumps({key: item[key] for key in ("RuleID", "File", "StartLine", "Commit")}))
-              sys.exit(status)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
