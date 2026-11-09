@@ -22,7 +22,7 @@ tempfile = "3.27"
 lingua = { version = "1.8", default-features = false, features = ["english", "russian"] }
 # The ranker uses EN/RU locally and verifies on-demand language model packs.
 fst = "0.4.7"
-sha2 = "0.10"
+sha2 = "0.11"
 lingua-english-language-model = "=1.3.0"
 lingua-russian-language-model = "=1.3.0"
 tracing = { version = "0.1", features = ["release_max_level_off"] }
