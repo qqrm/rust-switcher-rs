@@ -267,7 +267,15 @@ fn verify_payload(spec: &ModelSpec, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() != spec.byte_len {
         return Err(invalid_data("model length does not match the manifest"));
     }
-    if format!("{:x}", Sha256::digest(bytes)) != spec.sha256 {
+    // sha2 0.11 returns an Array without LowerHex; compare its canonical
+    // lowercase hex encoding without adding a formatting dependency.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut actual_hex = [0u8; 64];
+    for (index, byte) in Sha256::digest(bytes).iter().copied().enumerate() {
+        actual_hex[2 * index] = HEX[usize::from(byte >> 4)];
+        actual_hex[2 * index + 1] = HEX[usize::from(byte & 0x0f)];
+    }
+    if actual_hex.as_slice() != spec.sha256.as_bytes() {
         return Err(invalid_data("model SHA-256 does not match the manifest"));
     }
     Ok(())
