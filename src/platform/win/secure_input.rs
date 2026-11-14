@@ -7,8 +7,8 @@
 use std::{
     collections::HashMap,
     sync::{
-        OnceLock,
-        atomic::{AtomicIsize, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -24,8 +24,9 @@ use windows::Win32::{
     },
     UI::{
         Accessibility::{
-            CUIAutomation, HWINEVENTHOOK, IUIAutomation, IUIAutomationElement, SetWinEventHook,
-            UIA_IsPasswordPropertyId,
+            CUIAutomation, HWINEVENTHOOK, IUIAutomation, IUIAutomationElement,
+            IUIAutomationFocusChangedEventHandler, IUIAutomationFocusChangedEventHandler_Impl,
+            SetWinEventHook, UIA_IsPasswordPropertyId,
         },
         WindowsAndMessaging::{
             ES_PASSWORD, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GUITHREADINFO, GWL_STYLE,
@@ -51,6 +52,9 @@ static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static PENDING_CAPTURES: AtomicUsize = AtomicUsize::new(0);
 static WORKER: OnceLock<Option<BoundedWorker<Command, Status>>> = OnceLock::new();
 static FOCUS_HOOKS_READY: OnceLock<bool> = OnceLock::new();
+// UIA callbacks run on another thread. Preserve snapshot-to-submission ordering
+// against their focus refreshes without ever waiting on the keyboard hook.
+static CAPTURE_DISPATCH: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Status {
@@ -158,26 +162,75 @@ impl Drop for ComGuard {
     }
 }
 
+// UIA focus events cover descendants that do not send native HWND focus
+// changes (including browser DOM fields). The callback is a wake-up only: it
+// neither authorizes pending keys nor calls a provider or changes the journal.
+#[windows::core::implement(IUIAutomationFocusChangedEventHandler)]
+struct FocusChangedHandler {
+    enabled: Arc<AtomicBool>,
+    notify: Box<dyn Fn() + Send + Sync>,
+}
+
+impl IUIAutomationFocusChangedEventHandler_Impl for FocusChangedHandler_Impl {
+    fn HandleFocusChangedEvent(
+        &self,
+        _sender: windows::core::Ref<IUIAutomationElement>,
+    ) -> windows::core::Result<()> {
+        if self.enabled.load(Ordering::Acquire) {
+            (self.notify)();
+        }
+        Ok(())
+    }
+}
+
 // Release COM interfaces before uninitializing their owning MTA.
 struct Provider {
     automation: Option<IUIAutomation>,
     // Identity only, never a cached password verdict. Bounded independently of
     // the text journal, so returning to a known editor preserves its cache.
     elements: HashMap<Target, IUIAutomationElement>,
+    focus_handler: Option<IUIAutomationFocusChangedEventHandler>,
+    focus_events_enabled: Arc<AtomicBool>,
     apartment: ComGuard,
 }
 
 impl Provider {
     fn new() -> Self {
         let apartment = ComGuard(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok());
-        let automation = if apartment.0 {
+        let automation: Option<IUIAutomation> = if apartment.0 {
             unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok()
         } else {
             None
         };
+        let focus_events_enabled = Arc::new(AtomicBool::new(true));
+        let focus_handler = automation.as_ref().and_then(|automation| {
+            let handler: IUIAutomationFocusChangedEventHandler = FocusChangedHandler {
+                enabled: Arc::clone(&focus_events_enabled),
+                notify: Box::new(|| {
+                    let queued = with_uia_focus_dispatch(enqueue_refresh_for_generation);
+                    tracing::debug!(queued, "secure input: UIA focus notification");
+                }),
+            }
+            .into();
+            // Subscription and removal both belong to this persistent MTA.
+            // A provider that stalls here cannot block either input hook.
+            match unsafe { automation.AddFocusChangedEventHandler(None, &handler) } {
+                Ok(()) => {
+                    tracing::debug!("secure input: UIA focus subscription installed");
+                    Some(handler)
+                }
+                Err(error) => {
+                    focus_events_enabled.store(false, Ordering::Release);
+                    tracing::debug!(hresult = ?error.code(), "secure input: UIA focus subscription unavailable");
+                    None
+                }
+            }
+        });
         Self {
             automation,
             elements: HashMap::new(),
+            focus_handler,
+            focus_events_enabled,
             apartment,
         }
     }
@@ -218,6 +271,17 @@ impl Provider {
         Verdict {
             status,
             element_changed,
+        }
+    }
+}
+
+impl Drop for Provider {
+    fn drop(&mut self) {
+        // COM can deliver an already in-flight event during unsubscription.
+        // Disable its notification before releasing the handler/apartment.
+        self.focus_events_enabled.store(false, Ordering::Release);
+        if let (Some(automation), Some(handler)) = (&self.automation, &self.focus_handler) {
+            let _ = unsafe { automation.RemoveFocusChangedEventHandler(handler) };
         }
     }
 }
@@ -312,16 +376,48 @@ pub(crate) fn clear_sensitive_context_if_current(expected: u64) {
     }
 }
 
-fn enqueue_refresh() {
+fn enqueue_refresh() -> bool {
+    enqueue_refresh_for_generation(capture_generation())
+}
+
+fn enqueue_refresh_for_generation(generation: u64) -> bool {
     if let (Some(Some(worker)), Some(target)) = (WORKER.get(), Target::capture()) {
-        let _ = worker.submit(
-            Command::Refresh(Probe {
-                target,
-                generation: capture_generation(),
-            }),
+        worker.submit(
+            Command::Refresh(Probe { target, generation }),
             CAPTURE_LIFETIME,
-        );
+        )
+    } else {
+        false
     }
+}
+
+fn begin_capture_dispatch(expected: u64) -> Option<MutexGuard<'static, ()>> {
+    match CAPTURE_DISPATCH.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            // The physical key still reaches the editor. Its journal prefix
+            // becomes unavailable because this event could not be ordered.
+            tracing::debug!(
+                reason = "dispatch_contention",
+                "secure input: capture rejected"
+            );
+            reject_capture(expected);
+            None
+        }
+    }
+}
+
+fn with_uia_focus_dispatch<R>(submit: impl FnOnce(u64) -> R) -> R {
+    // Keep the epoch from before locking: a hook that loses try_lock can reject
+    // this epoch while we own the lock. Its missing first key must not be made
+    // complete by a refresh stamped with the resulting newer epoch.
+    let expected = capture_generation();
+    let _dispatch = CAPTURE_DISPATCH
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // The production closure only snapshots native handles and uses try_send;
+    // it never calls a provider, waits for a response, or locks the journal.
+    submit(expected)
 }
 
 /// Called for navigation, mouse changes and focus events, including events with
@@ -460,6 +556,12 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
                 return result.status;
             }
             let typed = ring_buffer::record_captured_keydown(&capture.key, capture.generation);
+            // Native focus can change while decoding, before its WinEvent is
+            // delivered. Reject that incomplete prefix before pending work
+            // drops to zero and a later focus switch could cache it as valid.
+            if !capture_is_current(&capture) {
+                return Status::Unknown;
+            }
             if typed.is_some()
                 && validate_capture_generation(capture.generation)
                 && ring_buffer::last_char_triggers_autoconvert()
@@ -533,6 +635,13 @@ fn capture_is_current(capture: &Capture) -> bool {
 /// Nonblocking hook entry: preserve physical input and normal hotkey handling
 /// even if the target's accessibility provider is unavailable or hung.
 pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
+    let observed = capture_generation();
+    let Some(_dispatch) = begin_capture_dispatch(observed) else {
+        return;
+    };
+    if !validate_capture_generation(observed) {
+        return;
+    }
     // These actions can move focus inside one browser HWND or replace unknown
     // content. A queued observation from the preceding editor cannot survive.
     if matches!(
@@ -550,7 +659,6 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         clear_sensitive_context();
         return;
     }
-    let observed = capture_generation();
     let Some(key) = ring_buffer::capture_keydown(kb, vk) else {
         return;
     };
@@ -631,6 +739,115 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn uia_refresh_cannot_overtake_a_started_raw_snapshot() {
+        use std::{sync::mpsc, thread};
+
+        let _guard = ring_buffer::test_guard();
+        let (snapshot_started, snapshot_observed) = mpsc::channel();
+        let (finish_snapshot, resume_snapshot) = mpsc::channel();
+        let (focus_started, focus_observed) = mpsc::channel();
+        let (submitted, order) = mpsc::channel();
+        let capture_submission = submitted.clone();
+        let capture = thread::spawn(move || {
+            let expected = capture_generation();
+            let _dispatch = begin_capture_dispatch(expected).unwrap();
+            snapshot_started.send(()).unwrap();
+            resume_snapshot
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            capture_submission.send("capture").unwrap();
+        });
+        snapshot_observed
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let focus = thread::spawn(move || {
+            focus_started.send(()).unwrap();
+            with_uia_focus_dispatch(|_| submitted.send("refresh").unwrap());
+        });
+        focus_observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(order.recv_timeout(Duration::from_millis(50)).is_err());
+        finish_snapshot.send(()).unwrap();
+        capture.join().unwrap();
+        focus.join().unwrap();
+        assert_eq!(order.recv().unwrap(), "capture");
+        assert_eq!(order.recv().unwrap(), "refresh");
+    }
+
+    #[test]
+    fn contended_capture_cannot_be_reauthorized_by_the_owning_focus_refresh() {
+        use std::{sync::mpsc, thread};
+
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        let before = capture_generation();
+        let (focus_locked, focus_observed) = mpsc::channel();
+        let (finish_refresh, resume_refresh) = mpsc::channel();
+        let focus = thread::spawn(move || {
+            with_uia_focus_dispatch(|expected| {
+                focus_locked.send(()).unwrap();
+                resume_refresh.recv_timeout(Duration::from_secs(1)).unwrap();
+                expected
+            })
+        });
+        focus_observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        assert!(begin_capture_dispatch(before).is_none());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(!validate_capture_generation(before));
+        finish_refresh.send(()).unwrap();
+        let refresh_generation = focus.join().unwrap();
+        assert_eq!(refresh_generation, before);
+        // This is the existing post-probe Refresh mutation. Its old epoch must
+        // not reset the unavailable prefix created by the missing physical key.
+        ring_buffer::discard_changed_capture_context(refresh_generation);
+        ring_buffer::push_text("suffix");
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn uia_focus_callback_is_bounded_and_late_delivery_is_disabled() {
+        use std::sync::mpsc;
+
+        let (release, blocked) = mpsc::channel();
+        let (started, observed) = mpsc::channel();
+        let worker = BoundedWorker::start("uia-focus-notification-test", move || {
+            move |()| {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            }
+        })
+        .unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let callback_notifications = Arc::clone(&notifications);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let handler: IUIAutomationFocusChangedEventHandler = FocusChangedHandler {
+            enabled: Arc::clone(&enabled),
+            notify: Box::new(move || {
+                callback_notifications.fetch_add(1, Ordering::Relaxed);
+                let _ = worker.submit((), Duration::from_secs(1));
+            }),
+        }
+        .into();
+
+        // The callback does not need a sender property, and a blocked consumer
+        // cannot turn an accessibility event into a synchronous provider wait.
+        unsafe { handler.HandleFocusChangedEvent(None) }.unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let before = Instant::now();
+        for _ in 0..32 {
+            unsafe { handler.HandleFocusChangedEvent(None) }.unwrap();
+        }
+        assert!(before.elapsed() < Duration::from_millis(100));
+        enabled.store(false, Ordering::Release);
+        let count = notifications.load(Ordering::Acquire);
+        unsafe { handler.HandleFocusChangedEvent(None) }.unwrap();
+        assert_eq!(notifications.load(Ordering::Acquire), count);
+        let _ = release.send(());
+        let _ = release.send(());
+    }
 
     fn boolean_variant(value: bool, kind: VARENUM) -> VARIANT {
         VARIANT {

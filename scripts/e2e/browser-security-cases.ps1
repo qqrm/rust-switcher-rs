@@ -134,6 +134,28 @@ if ([BrowserInput]::SecurityMetadata($switcherHandle, 0) -ne 0x52535031) {
 
 Invoke-PasswordCase 'UIA protection and all text hotkeys' {
     param($details)
+    $commands = @(
+        @{name = 'last-word'; key = 0xA0; count = 2; selection = $false},
+        @{name = 'smart-last-word'; key = 0xA0; count = 3; selection = $false},
+        @{name = 'last-sequence'; key = 0xA4; count = 2; selection = $false},
+        @{name = 'smart-last-sequence'; key = 0xA4; count = 3; selection = $false},
+        @{name = 'selection'; key = 0xA0; count = 2; selection = $true},
+        @{name = 'smart-selection'; key = 0xA0; count = 3; selection = $true}
+    )
+    $details.ordinaryCommands = @()
+    foreach ($command in $commands) {
+        # A missing binding must fail before password immutability can pass.
+        # Exercise the same native keys in an ordinary field first.
+        Reset-PasswordFixture
+        $plainText = if ($command.selection) { 'ghbdtn ghbdtn' } else { 'ghbdtn' }
+        $converted = if ($command.selection) { 'привет привет' } else { 'привет' }
+        Type-NormalFixture $session 'b' $plainText
+        if ($command.selection) { Read-Browser $session "fixture.select('b')" | Out-Null }
+        Tap-PasswordChord $command.key $command.count
+        Wait-Browser { (Read-Browser $session 'fixture.values()').b -eq $converted } `
+            "ordinary $($command.name) positive control"
+        $details.ordinaryCommands += $command.name
+    }
     Reset-PasswordFixture
     Type-NormalFixture $session 'b' 'ghbdtn'
     # No click between windows: preserve the normal journal as a cached context.
@@ -150,14 +172,7 @@ Invoke-PasswordCase 'UIA protection and all text hotkeys' {
     Type-PasswordFixture 'ghbdtn' $before | Out-Null
     $details.provider = Assert-BrowserPassword $true
     $details.commands = @()
-    foreach ($command in @(
-        @{name = 'last-word'; key = 0xA0; count = 2; selection = $false},
-        @{name = 'smart-last-word'; key = 0xA0; count = 3; selection = $false},
-        @{name = 'last-sequence'; key = 0xA4; count = 2; selection = $false},
-        @{name = 'smart-last-sequence'; key = 0xA4; count = 3; selection = $false},
-        @{name = 'selection'; key = 0xA0; count = 2; selection = $true},
-        @{name = 'smart-selection'; key = 0xA0; count = 3; selection = $true}
-    )) {
+    foreach ($command in $commands) {
         Read-Browser $session "fixture.focus('a')" | Out-Null
         if ($command.selection) { Read-Browser $session "fixture.select('a')" | Out-Null }
         Tap-PasswordChord $command.key $command.count

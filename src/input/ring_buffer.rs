@@ -481,7 +481,15 @@ impl InputJournal {
                 (Some(_), None) | (None, Some(_)) => true,
             }
         {
-            self.last_focus_key = key;
+            // A native focus observation can briefly have no focused HWND
+            // between two controls of the same window. Keep the previous
+            // control's provenance until the next known identity: its pending
+            // or unavailable prefix belongs to A, not a subsequently focused B.
+            // Actual input without focus still clears provenance through
+            // secure_capture_unavailable and remains globally unavailable.
+            if key.is_some() {
+                self.last_focus_key = key;
+            }
             return;
         }
 
@@ -841,7 +849,8 @@ pub fn layout_tag_from_hkl(hkl: HKL) -> LayoutTag {
 
 #[cfg(windows)]
 pub fn warm_decoder() {
-    let _ = layout_decode::warm();
+    let ready = layout_decode::warm();
+    tracing::debug!(ready, "input journal: decoder startup readiness");
 }
 
 #[cfg(test)]
@@ -1000,6 +1009,10 @@ pub fn capture_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<CapturedKey> {
     }
     let foreground = unsafe { GetForegroundWindow() };
     let Some(focus) = current_focus_cache_key(foreground) else {
+        tracing::debug!(
+            reason = "focus_unavailable",
+            "input journal: snapshot rejected"
+        );
         mark_capture_unavailable();
         return None;
     };
@@ -1007,6 +1020,10 @@ pub fn capture_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<CapturedKey> {
     let layout = unsafe { GetKeyboardLayout(thread) }.0 as usize;
     let mut keyboard_state = [0u8; 256];
     if unsafe { GetKeyboardState(&mut keyboard_state) }.is_err() {
+        tracing::debug!(
+            reason = "keyboard_state_unavailable",
+            "input journal: snapshot rejected"
+        );
         mark_capture_unavailable();
         return None;
     }
@@ -1046,6 +1063,15 @@ fn decode_captured_key(key: &CapturedKey, generation: u64) -> Option<DecodedText
             key.focus.focus_hwnd as usize,
         ),
     );
+    if !matches!(decoded, layout_decode::DecodeResult::Text(_)) {
+        let outcome = match &decoded {
+            layout_decode::DecodeResult::Text(_) => "text",
+            layout_decode::DecodeResult::PendingDeadKey => "pending_dead_key",
+            layout_decode::DecodeResult::NoText => "no_text",
+            layout_decode::DecodeResult::Unavailable => "unavailable",
+        };
+        tracing::debug!(outcome, "input journal: decode produced no text");
+    }
     if !validate_secure_input_generation(generation) || !key.is_current() {
         return None;
     }
@@ -1582,16 +1608,22 @@ fn apply_secure_focus_transition(
     now_ms: u64,
     pending_capture: bool,
 ) {
+    let previous_identity_present = journal.last_focus_key.is_some();
+    let next_identity_present = key.is_some();
+    let same_foreground = journal.last_fg_hwnd == foreground;
+    let unavailable_before = journal.capture_unavailable;
     let same_native_target = match (journal.last_focus_key, key) {
         (Some(previous), Some(current)) => same_focus_identity(previous, current),
-        (None, None) => journal.last_fg_hwnd == foreground,
+        (None, None) => same_foreground,
         _ => false,
     };
+    let departing_capture_lost =
+        !same_native_target && pending_capture && previous_identity_present;
     if !same_native_target {
         // A queued suffix from the departing editor is about to be cancelled.
         // Cache its incomplete-prefix marker so a later return cannot authorize
         // deleting fewer characters than the real editor contains.
-        if pending_capture && journal.last_focus_key.is_some() {
+        if departing_capture_lost {
             journal.capture_unavailable = true;
         }
         SECURE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -1601,6 +1633,18 @@ fn apply_secure_focus_transition(
     // Duplicate focus events for the same native target preserve both the epoch
     // and queued keys. A fresh UIA identity comparison handles DOM descendants.
     journal.switch_foreground(foreground, key, now_ms);
+    if unavailable_before || journal.capture_unavailable || departing_capture_lost {
+        tracing::debug!(
+            previous_identity_present,
+            next_identity_present,
+            same_foreground,
+            same_native_target,
+            pending_capture,
+            unavailable_before,
+            unavailable_after = journal.capture_unavailable,
+            "secure input: native focus unavailable transition"
+        );
+    }
 }
 
 /// A fresh UIA observation found a different descendant of this native target.
@@ -1964,6 +2008,79 @@ mod secure_clear_tests {
         });
         push_text("suffix");
         assert!(runs_snapshot().is_empty());
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_focus_gap_keeps_rejection_with_the_departing_control() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let a = focus_key_for_test(101, 0).unwrap();
+        let b = FocusCacheKey {
+            focus_hwnd: a.focus_hwnd + 1,
+            ..a
+        };
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(a), 1_000, false);
+            journal.push_text_internal("prefix", LayoutTag::En, RunOrigin::Physical);
+            // The remaining A capture is cancelled during a transient no-focus
+            // observation. Its incomplete prefix must stay attached to A.
+            apply_secure_focus_transition(journal, 101, None, 1_010, true);
+            assert_eq!(journal.last_focus_key, Some(a));
+            assert!(journal.capture_unavailable);
+            apply_secure_focus_transition(journal, 101, Some(b), 1_020, true);
+            assert!(!journal.capture_unavailable);
+            journal.push_text_internal(".", LayoutTag::En, RunOrigin::Physical);
+            assert_eq!(journal.total_chars, 1);
+            // Restoring A still refuses its incomplete prefix; the identity gap
+            // is not a reason to trust either A's stored text or a later suffix.
+            apply_secure_focus_transition(journal, 101, Some(a), 1_030, false);
+            assert!(journal.capture_unavailable);
+        });
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_focus_gap_back_to_same_control_keeps_missing_key_rejection() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let a = focus_key_for_test(101, 0).unwrap();
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(a), 1_000, false);
+            apply_secure_focus_transition(journal, 101, None, 1_010, true);
+            apply_secure_focus_transition(journal, 101, Some(a), 1_020, false);
+            assert!(journal.capture_unavailable);
+            journal.push_text_internal("suffix", LayoutTag::En, RunOrigin::Physical);
+            assert_eq!(journal.total_chars, 0);
+        });
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn actual_key_without_focus_still_rejects_the_next_native_prefix() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let a = focus_key_for_test(101, 0).unwrap();
+        let b = FocusCacheKey {
+            focus_hwnd: a.focus_hwnd + 1,
+            ..a
+        };
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(a), 1_000, false);
+            apply_secure_focus_transition(journal, 101, None, 1_010, false);
+        });
+        // Unlike an event-only gap, a raw key with unknown focus has genuinely
+        // lost ownership. The next target cannot safely accept only a suffix.
+        secure_capture_unavailable();
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(b), 1_020, false);
+            assert!(journal.capture_unavailable);
+            journal.push_text_internal("suffix", LayoutTag::En, RunOrigin::Physical);
+            assert_eq!(journal.total_chars, 0);
+        });
         clear_secure_input_data();
     }
 

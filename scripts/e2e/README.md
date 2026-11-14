@@ -150,6 +150,16 @@ input: the harness verifies the focused element's `IsPassword` property and that
 the focused native HWND is not Edit/RichEdit. This prevents a native-style-only
 implementation from accidentally satisfying the browser test.
 
+`browser-config.toml` explicitly enables all eight tested shortcut sequences,
+smart conversion, and the AutoConvert feature. Omitted optional bindings in a
+partial config deserialize as disabled; they do not inherit `Config::default()`.
+A Windows regression loads this exact fixture through the production config
+loader and verifies every active runtime binding. Before password hotkey checks,
+all six text commands must convert ordinary input with the same native key
+sequences. Selection controls contain two words so converting only the last word
+cannot pass. An absent binding cannot satisfy password immutability by doing
+nothing.
+
 All tested input and hotkeys use `SendInput`. CDP changes only the owned fixture's
 setup and reads its synthetic values. Tests cover normal-to-password clicks,
 Shift+Tab under the same native HWND, and changing the currently focused input

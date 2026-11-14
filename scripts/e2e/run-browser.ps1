@@ -338,10 +338,8 @@ try {
     $switcherProfile = Join-Path $runRoot 'switcher-profile'
     $configDirectory = Join-Path $switcherProfile 'RustSwitcherDebug'
     New-Item -ItemType Directory -Path $configDirectory | Out-Null
-    @'
-delay_ms = 100
-smarter_hotkeys_enabled = true
-'@ | Set-Content -LiteralPath (Join-Path $configDirectory 'config.json') -Encoding utf8NoBOM
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'browser-config.toml') `
+        -Destination (Join-Path $configDirectory 'config.json')
     $switcherInfo = [System.Diagnostics.ProcessStartInfo]::new($DebugExe)
     $switcherInfo.UseShellExecute = $false
     $switcherInfo.CreateNoWindow = $true
