@@ -376,29 +376,54 @@ impl Provider {
                 !unsafe { automation.CompareElements(previous, &element) }
                     .is_ok_and(|same| same.as_bool())
             });
-        let status = element_status(&element);
-        // A property lookup can itself race a same-HWND DOM focus change.
-        let stable = unsafe { automation.GetFocusedElement() }
-            .ok()
-            .and_then(|current| unsafe { automation.CompareElements(&element, &current) }.ok())
-            .is_some_and(|same| same.as_bool());
-        if !stable || !request.is_current() {
-            return Verdict::UNKNOWN;
-        }
-        let forget = self.elements.len() >= IDENTITY_CACHE_CAPACITY
-            && !self.elements.contains_key(&request.probe.target);
-        if forget {
-            self.elements.clear();
-        }
-        self.elements.insert(request.probe.target, element);
-        // A queued snapshot retains the revision visible at hook entry. Neither
-        // this observation nor a later Capture may retroactively relabel it.
-        let revision = PUBLISHED_IDENTITIES.publish(request.probe.target, element_changed, forget);
-        Verdict {
-            status,
+        probe_observed_identity(
             element_changed,
-            identity: MetadataIdentity::Published(revision),
-        }
+            || request.is_current(),
+            || {
+                let forget = self.elements.len() >= IDENTITY_CACHE_CAPACITY
+                    && !self.elements.contains_key(&request.probe.target);
+                if forget {
+                    self.elements.clear();
+                }
+                self.elements.insert(request.probe.target, element.clone());
+                PUBLISHED_IDENTITIES.publish(request.probe.target, element_changed, forget)
+            },
+            || element_status(&element),
+            || {
+                // A property lookup can itself race a same-HWND DOM focus change.
+                unsafe { automation.GetFocusedElement() }
+                    .ok()
+                    .and_then(|current| unsafe { automation.CompareElements(&element, &current) }.ok())
+                    .is_some_and(|same| same.as_bool())
+            },
+        )
+    }
+}
+
+fn probe_observed_identity(
+    element_changed: bool,
+    request_is_current: impl Fn() -> bool,
+    publish_identity: impl FnOnce() -> u64,
+    password_status: impl FnOnce() -> Status,
+    remains_focused: impl FnOnce() -> bool,
+) -> Verdict {
+    if !request_is_current() {
+        return Verdict::UNKNOWN;
+    }
+    // The exact focused element is known now. Publish its identity before
+    // slower metadata queries, so later keys can retain that observation.
+    // This is not authorization: the final verdict and every queued Capture
+    // still need fresh ordinary metadata and stable focus. Older snapshots
+    // keep their original revision, and failed probes never roll it back.
+    let revision = publish_identity();
+    let status = password_status();
+    if !remains_focused() || !request_is_current() {
+        return Verdict::UNKNOWN;
+    }
+    Verdict {
+        status,
+        element_changed,
+        identity: MetadataIdentity::Published(revision),
     }
 }
 
@@ -1423,6 +1448,209 @@ mod tests {
             element_changed,
             identity: MetadataIdentity::Published(revision),
         }
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum ProbePause {
+        Password,
+        Stability,
+    }
+
+    fn run_early_publication_case(
+        pause: ProbePause,
+        earlier_capture: bool,
+        status: Status,
+        stable: bool,
+        current: bool,
+    ) -> (Status, usize, bool) {
+        use std::sync::mpsc;
+
+        enum Action {
+            Refresh,
+            Capture {
+                identity_revision: Option<u64>,
+                pending: PendingCapture,
+            },
+        }
+
+        ring_buffer::clear_secure_input_data();
+        let generation = capture_generation();
+        let request = pointer_test_probe(generation);
+        let publications = Arc::new(IdentityPublications::new());
+        let old_revision = publications.publish(request.target, true, false);
+        let worker_publications = Arc::clone(&publications);
+        let request_current = Arc::new(AtomicBool::new(true));
+        let worker_current = Arc::clone(&request_current);
+        let appended = Arc::new(AtomicUsize::new(0));
+        let worker_appended = Arc::clone(&appended);
+        let (observing, observation_started) = mpsc::channel();
+        let (confirm, confirmation) = mpsc::channel();
+        let (querying, query_started) = mpsc::channel();
+        let (finish, resume_query) = mpsc::channel();
+        let (completed, results) = mpsc::channel();
+        let worker = BoundedWorker::start_with_expiration(
+            "early-identity-test",
+            3,
+            move || {
+                move |action| {
+                    let result = match action {
+                        Action::Refresh => {
+                            observing.send(()).unwrap();
+                            confirmation.recv_timeout(Duration::from_secs(2)).unwrap();
+                            // This is the production ordering seam used by
+                            // Provider::probe, with its property/focus query
+                            // blocked after the exact element was observed.
+                            let verdict = probe_observed_identity(
+                                true,
+                                || worker_current.load(Ordering::Acquire),
+                                || worker_publications.publish(request.target, true, false),
+                                || {
+                                    if pause == ProbePause::Password {
+                                        querying.send(()).unwrap();
+                                        resume_query.recv_timeout(Duration::from_secs(2)).unwrap();
+                                    }
+                                    status
+                                },
+                                || {
+                                    if pause == ProbePause::Stability {
+                                        querying.send(()).unwrap();
+                                        resume_query.recv_timeout(Duration::from_secs(2)).unwrap();
+                                    }
+                                    stable
+                                },
+                            );
+                            if stable && current {
+                                assert!(verdict.element_changed);
+                            }
+                            complete_refresh(request, verdict, || true)
+                        }
+                        Action::Capture {
+                            identity_revision,
+                            pending,
+                        } => {
+                            let result = if !validate_capture_generation(generation) {
+                                Status::Unknown
+                            } else {
+                                // Each later key still receives its own fresh
+                                // ordinary verdict for the unchanged element.
+                                let fresh = probe_observed_identity(
+                                    false,
+                                    || validate_capture_generation(generation),
+                                    || worker_publications.publish(request.target, false, false),
+                                    || Status::NotSecure,
+                                    || true,
+                                );
+                                if capture_metadata_allows(identity_revision, fresh) {
+                                    ring_buffer::push_text("x");
+                                    if !ring_buffer::runs_snapshot().is_empty() {
+                                        worker_appended.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Status::NotSecure
+                                } else {
+                                    reject_probe(request);
+                                    Status::Unknown
+                                }
+                            };
+                            drop(pending);
+                            result
+                        }
+                    };
+                    completed.send(result).unwrap();
+                    result
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(worker.submit(Action::Refresh, Duration::from_secs(2)));
+        observation_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let enqueue_capture = || {
+            let frontier = publications.frontier();
+            let _dispatch = begin_capture_dispatch(generation).unwrap();
+            let identity_revision = publications.at_admission(request.target, frontier);
+            assert!(worker.submit(
+                Action::Capture {
+                    identity_revision,
+                    pending: PendingCapture::new(generation),
+                },
+                Duration::from_secs(2),
+            ));
+            identity_revision
+        };
+        if earlier_capture {
+            assert_eq!(enqueue_capture(), Some(old_revision));
+        }
+        confirm.send(()).unwrap();
+        query_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Moving publication after the blocked query fails here: a later
+        // snapshot would still carry A, although B's focus was already observed.
+        let later_revision = enqueue_capture();
+        assert!(later_revision.is_some());
+        assert_ne!(later_revision, Some(old_revision));
+        assert_eq!(enqueue_capture(), later_revision);
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        request_current.store(current, Ordering::Release);
+        finish.send(()).unwrap();
+        let refresh_result = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..(2 + usize::from(earlier_capture)) {
+            let _ = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let appended = appended.load(Ordering::Relaxed);
+        let current = validate_capture_generation(generation);
+        if appended == 0 {
+            ring_buffer::push_text("late-suffix");
+            assert!(ring_buffer::runs_snapshot().is_empty());
+        }
+        ring_buffer::clear_secure_input_data();
+        (refresh_result, appended, current)
+    }
+
+    #[test]
+    fn observed_identity_is_available_while_fresh_metadata_is_pending() {
+        let _guard = ring_buffer::test_guard();
+        for pause in [ProbePause::Password, ProbePause::Stability] {
+            assert_eq!(
+                run_early_publication_case(pause, false, Status::NotSecure, true, true),
+                (Status::NotSecure, 2, true),
+            );
+            // An earlier A key poisons the whole prefix, including B keys
+            // admitted after publication while metadata was still pending.
+            assert_eq!(
+                run_early_publication_case(pause, true, Status::NotSecure, true, true),
+                (Status::NotSecure, 0, false),
+            );
+        }
+    }
+
+    #[test]
+    fn early_identity_does_not_authorize_denied_unstable_or_expired_metadata() {
+        let _guard = ring_buffer::test_guard();
+        for pause in [ProbePause::Password, ProbePause::Stability] {
+            for (status, stable, current, expected) in [
+                (Status::Secure, true, true, Status::Secure),
+                (Status::Unknown, true, true, Status::Unknown),
+                (Status::NotSecure, false, true, Status::Unknown),
+                (Status::NotSecure, true, false, Status::Unknown),
+            ] {
+                assert_eq!(
+                    run_early_publication_case(pause, false, status, stable, current),
+                    (expected, 0, false),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_observation_cannot_publish_an_identity_or_query_metadata() {
+        let verdict = probe_observed_identity(
+            true,
+            || false,
+            || panic!("a stale observation must not publish an identity"),
+            || panic!("a stale observation must not query password metadata"),
+            || panic!("a stale observation must not query focus"),
+        );
+        assert_eq!(verdict.status, Status::Unknown);
+        assert!(matches!(verdict.identity, MetadataIdentity::Unavailable));
     }
 
     #[test]

@@ -321,8 +321,10 @@ Invoke-PasswordCase 'focused input changes from text to password' {
     param($details)
     Reset-PasswordFixture 'input'
     Focus-BrowserEditor $session 'a'
-    Type-NormalFixture $session 'a' 'keep'
+    # Establish the ordinary-field prerequisite before exercising the type
+    # change. No observation is inserted between that change and password input.
     $details.normalProvider = Assert-BrowserPassword $false
+    Type-NormalFixture $session 'a' 'keep'
     $before = Read-SecurityState
     Read-Browser $session "fixture.set('a', ''); fixture.setType('a', 'password')" | Out-Null
     Type-PasswordFixture 'ghbdtn' $before | Out-Null

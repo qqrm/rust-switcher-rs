@@ -58,6 +58,12 @@ unchanged ordinary element can survive an overlapping pointer observation;
 an unclassified or changed identity cannot authorize it. Native Edit/RichEdit
 style checks do not use this UIA identity path.
 
+Identity is published after observing focus, before the remaining password and
+stable-focus queries. Publication grants no capture permission: every key still
+requires its own fresh, explicit non-password result for that exact revision.
+A failed or sensitive metadata result retains the existing rejection path;
+published revisions are never rolled back to make older keys current again.
+
 This is best-effort protection based on observable metadata, not proof of the
 element that received a physical key. UIA observations can miss a transient
 focus change. For example, if an ordinary field B is known, focus moves to a
