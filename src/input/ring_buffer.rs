@@ -884,7 +884,7 @@ fn mods_ctrl_or_alt_down() -> bool {
 }
 
 #[cfg(windows)]
-fn is_modifier_vk(vk: VIRTUAL_KEY) -> bool {
+pub(crate) fn is_modifier_vk(vk: VIRTUAL_KEY) -> bool {
     matches!(vk.0, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
 }
 

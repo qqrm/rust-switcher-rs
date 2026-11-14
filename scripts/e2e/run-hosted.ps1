@@ -538,7 +538,18 @@ try {
     Write-Output "Unicode boundary: input UTF-16=$($unicodeInput.Length), output=$($unicodeActual.Length), converted=$($unicodeActual -eq $unicodeExpected), unchanged=$($unicodeActual -eq $unicodeInput)"
     if ($unicodeActual -ne $unicodeInput -and $unicodeActual -ne $unicodeExpected) {
         $scenarioFailures.Add("Unicode selection was partially replaced: input UTF-16 length=$($unicodeInput.Length), output=$($unicodeActual.Length)")
-    } else { Record-Pass 'release Unicode selection boundary preserves complete text' }
+    } else {
+        # The replacement text arrives before the queued caret-restoration
+        # keys finish. Require the complete final selection before changing
+        # the fixture for recovery, including when conversion safely refused.
+        Wait-Condition {
+            if ($editValue.Current.Value -ne $unicodeActual) {
+                throw 'Unicode selection text changed after its accepted result'
+            }
+            [HostedInput]::HasSelection([IntPtr]$edit.Current.NativeWindowHandle, $unicodeInput.Length)
+        } 'complete Unicode selection restoration before recovery'
+        Record-Pass 'release Unicode selection boundary preserves complete text'
+    }
     if ($release.HasExited -or -not [HostedInput]::Responsive([IntPtr]$window.Current.NativeWindowHandle)) {
         throw 'Release app stopped responding after Unicode selection'
     }

@@ -30,6 +30,7 @@ use windows::Win32::{
             IUIAutomationFocusChangedEventHandler, IUIAutomationFocusChangedEventHandler_Impl,
             SetWinEventHook, UIA_IsPasswordPropertyId,
         },
+        Input::KeyboardAndMouse::VIRTUAL_KEY,
         WindowsAndMessaging::{
             ES_PASSWORD, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GUITHREADINFO, GWL_STYLE,
             GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
@@ -452,11 +453,25 @@ fn with_uia_focus_dispatch<R>(submit: impl FnOnce(u64) -> R) -> R {
     submit(expected)
 }
 
-/// Called for navigation, mouse changes and focus events, including events with
-/// the same native HWND. No provider calls or waits occur here.
+/// Called for navigation and wheel changes, including changes within the same
+/// native HWND. No provider calls or waits occur here.
 pub(crate) fn invalidate_context() {
     ring_buffer::invalidate_capture_context();
     enqueue_refresh();
+}
+
+/// Clear the previous input context before a pointer press reaches its target.
+/// The post-click focus probe is queued separately when the button is released.
+pub(crate) fn invalidate_pointer_context() {
+    ring_buffer::invalidate_capture_context();
+    tracing::debug!("secure input: pointer press invalidated context");
+}
+
+/// Queue the pointer's focus probe after the press, without resetting the epoch
+/// or input already captured while the button was held.
+pub(crate) fn refresh_pointer_context() {
+    let queued = enqueue_refresh();
+    tracing::debug!(queued, "secure input: pointer release refresh");
 }
 
 pub(crate) fn invalidate_context_if_current(expected: u64) {
@@ -667,6 +682,15 @@ fn capture_is_current(capture: &Capture) -> bool {
 /// Nonblocking hook entry: preserve physical input and normal hotkey handling
 /// even if the target's accessibility provider is unavailable or hung.
 pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
+    let Ok(virtual_key) = u16::try_from(vk).map(VIRTUAL_KEY) else {
+        return;
+    };
+    // Modifier taps reach hotkey handling but never enter the text journal.
+    // Contention with a focus callback cannot lose a capture for these keys,
+    // so it must not invalidate the text that Double Alt is about to convert.
+    if ring_buffer::is_modifier_vk(virtual_key) {
+        return;
+    }
     let observed = capture_generation();
     let Some(_dispatch) = begin_capture_dispatch(observed) else {
         return;
@@ -856,6 +880,37 @@ mod tests {
         ring_buffer::discard_changed_capture_context(refresh_generation);
         ring_buffer::push_text("suffix");
         assert!(ring_buffer::runs_snapshot().is_empty());
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn modifier_taps_preserve_the_journal_during_focus_dispatch_contention() {
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        ring_buffer::push_text(".ghbdtn");
+        let before = ring_buffer::runs_snapshot();
+        let capture_before = capture_generation();
+        let context_before = generation();
+        with_uia_focus_dispatch(|_| {
+            // Exercise the production entry point while a focus callback owns
+            // dispatch. Include both Alt taps and every supported modifier.
+            for vk in [
+                0xA4, 0xA4, 0xA5, 0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0x5B, 0x5C,
+            ] {
+                let key = KBDLLHOOKSTRUCT { vkCode: vk, ..Default::default() };
+                record_keydown(&key, vk);
+                assert!(validate_capture_generation(capture_before), "modifier {vk:#x}");
+                assert!(validate_generation(context_before), "modifier {vk:#x}");
+                assert_eq!(ring_buffer::runs_snapshot(), before, "modifier {vk:#x}");
+            }
+            // Losing a printable event must still reject the entire prefix.
+            // Ignoring dispatch contention for every key is not a valid fix.
+            let period = KBDLLHOOKSTRUCT { vkCode: 0xBE, ..Default::default() };
+            record_keydown(&period, 0xBE);
+            assert!(!validate_capture_generation(capture_before));
+            assert!(!validate_generation(context_before));
+            assert!(ring_buffer::runs_snapshot().is_empty());
+        });
         ring_buffer::clear_secure_input_data();
     }
 
