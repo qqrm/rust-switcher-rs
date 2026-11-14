@@ -47,6 +47,12 @@ timeout, or obsolete focus result blocks capture and conversion; ordinary typing
 and layout switching remain available. Password detection clears the active
 journal, all cached journals, and pending decoder composition.
 
+An immediate focus change can also prevent an ordinary input segment from being
+captured when its field cannot be identified in time. In that case last-word and
+sequence conversion leave the text unchanged; they do not reuse a partial
+history. Explicit selection conversion can read and validate the visible text
+once the ordinary field is identified. See [focus-change behavior](docs/security.md#immediate-focus-changes).
+
 UI Automation runs on a separate worker. The keyboard hook can briefly queue
 bounded raw keyboard snapshots for validation before decoding and journal
 insertion. Snapshots contain key codes, keyboard state, layout, and focus

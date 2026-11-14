@@ -101,8 +101,9 @@
       fields[id].type = type;
       return true;
     },
-    select(id) {
+    select(id, requireFocus = false) {
       const element = fields[id];
+      if (requireFocus && (deepActive() !== element || !document.hasFocus())) return false;
       if (element.isContentEditable) {
         const range = element.ownerDocument.createRange();
         range.selectNodeContents(element);
@@ -110,6 +111,19 @@
         selection.removeAllRanges();
         selection.addRange(range);
       } else element.setSelectionRange(0, element.value.length);
+      return deepActive() === element && document.hasFocus();
+    },
+    collapseEnd(id) {
+      const element = fields[id];
+      if (deepActive() !== element || !document.hasFocus()) return false;
+      if (element.isContentEditable) {
+        const range = element.ownerDocument.createRange();
+        range.selectNodeContents(element);
+        range.collapse(false);
+        const selection = element.ownerDocument.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } else element.setSelectionRange(element.value.length, element.value.length);
       return deepActive() === element && document.hasFocus();
     },
     focus(id) {

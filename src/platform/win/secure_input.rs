@@ -463,7 +463,7 @@ pub(crate) fn invalidate_context() {
 /// Clear the previous input context before a pointer press reaches its target.
 /// The post-click focus probe is queued separately when the button is released.
 pub(crate) fn invalidate_pointer_context() {
-    ring_buffer::invalidate_capture_context();
+    ring_buffer::invalidate_pointer_capture_context();
     tracing::debug!("secure input: pointer press invalidated context");
 }
 
@@ -897,15 +897,24 @@ mod tests {
             for vk in [
                 0xA4, 0xA4, 0xA5, 0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0x5B, 0x5C,
             ] {
-                let key = KBDLLHOOKSTRUCT { vkCode: vk, ..Default::default() };
+                let key = KBDLLHOOKSTRUCT {
+                    vkCode: vk,
+                    ..Default::default()
+                };
                 record_keydown(&key, vk);
-                assert!(validate_capture_generation(capture_before), "modifier {vk:#x}");
+                assert!(
+                    validate_capture_generation(capture_before),
+                    "modifier {vk:#x}"
+                );
                 assert!(validate_generation(context_before), "modifier {vk:#x}");
                 assert_eq!(ring_buffer::runs_snapshot(), before, "modifier {vk:#x}");
             }
             // Losing a printable event must still reject the entire prefix.
             // Ignoring dispatch contention for every key is not a valid fix.
-            let period = KBDLLHOOKSTRUCT { vkCode: 0xBE, ..Default::default() };
+            let period = KBDLLHOOKSTRUCT {
+                vkCode: 0xBE,
+                ..Default::default()
+            };
             record_keydown(&period, 0xBE);
             assert!(!validate_capture_generation(capture_before));
             assert!(!validate_generation(context_before));

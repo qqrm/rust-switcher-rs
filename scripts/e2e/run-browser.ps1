@@ -20,6 +20,7 @@ $results = [System.Collections.Generic.List[object]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $connections = [System.Collections.Generic.List[System.IDisposable]]::new()
+$ordinaryOutcomes = [ordered]@{converted = 0; safe_focus_refusal = 0}
 $switcherOutput = $null
 $switcherErrors = $null
 $failure = $null
@@ -257,6 +258,117 @@ function Focus-BrowserEditor($Session, [string]$Id) {
     Read-Browser $Session "fixture.focus('$Id')" | Out-Null
     Wait-Browser { Read-Browser $Session "fixture.focused('$Id')" } "browser field $Id focus"
 }
+function Test-BrowserValueWithin($Session, [string]$Field, [string]$Expected, [int]$Milliseconds = 4000) {
+    # Only an exhausted value wait returns false. Transport, provider, and
+    # process errors propagate and cannot become accepted conservative refusal.
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($Milliseconds)
+    do {
+        if ((Read-Browser $Session 'fixture.values()').$Field -ceq $Expected) { return $true }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+function Read-BrowserJournalState([IntPtr]$Window) {
+    if ([BrowserInput]::SecurityMetadata($Window, 0) -ne 0x52535031) {
+        throw 'The debug executable has no hosted journal inspection API'
+    }
+    return [pscustomobject]@{
+        activeChars = [BrowserInput]::SecurityMetadata($Window, 1)
+        cachedChars = [BrowserInput]::SecurityMetadata($Window, 2)
+        capturedChars = [BrowserInput]::SecurityMetadata($Window, 3)
+        pointerBaseline = [BrowserInput]::SecurityMetadata($Window, 5)
+        captureUnavailable = [BrowserInput]::SecurityMetadata($Window, 6)
+    }
+}
+function Get-BrowserFocusSnapshot($Session) {
+    return @{native = [BrowserInput]::Snapshot($Session.Handle);
+        dom = Read-Browser $Session 'fixture.diagnostics()'}
+}
+function Assert-BrowserTargetFocus($NativeBefore, $Observed, [string]$Field, [long]$Window) {
+    if ($null -eq $NativeBefore -or $null -eq $Observed -or
+        $null -eq $Observed.native -or $null -eq $Observed.dom) {
+        throw 'Browser target focus proof is missing'
+    }
+    if ($Window -eq 0 -or $NativeBefore.error -ne 0 -or $NativeBefore.focus -eq 0 -or
+        $NativeBefore.foreground -ne $Window -or $Observed.native.error -ne 0 -or
+        $Observed.native.foreground -ne $Window -or $Observed.native.focus -ne $NativeBefore.focus -or
+        $Observed.dom.documentFocused -isnot [bool] -or -not $Observed.dom.documentFocused -or
+        $Observed.dom.field -cne $Field -or $Observed.dom.activeId -cne $Field) {
+        throw 'Browser native or DOM focus moved from the original target'
+    }
+}
+function Assert-BrowserOtherFields($Sessions, [hashtable]$ExpectedOther) {
+    foreach ($sessionId in @('a', 'b')) {
+        $values = Read-Browser $Sessions[$sessionId] 'fixture.values()'
+        foreach ($field in @('a', 'b', 'guard')) {
+            $key = "$sessionId/$field"
+            if ($ExpectedOther.ContainsKey($key) -and $values.$field -cne $ExpectedOther[$key]) {
+                throw "Input changed another field ${key}: '$($values.$field)'"
+            }
+        }
+    }
+}
+function Assert-BrowserSafeFocusRefusal([hashtable]$Case, [System.Collections.IDictionary]$Record,
+    $Journal, [string]$Field, [long]$Window) {
+    if ($Case.Mode -cne 'click' -or $Case.Kind -cnotin @('textarea', 'editable')) {
+        throw 'Conservative refusal is restricted to the two immediate-click cases'
+    }
+    if ($Record.actualBefore -cne $Case.Text -or $Record.actualAfter -cne $Case.Text -or
+        $Record.otherFieldsUnchanged -isnot [bool] -or -not $Record.otherFieldsUnchanged) {
+        throw 'Conservative refusal requires the complete original text and unchanged other fields'
+    }
+    foreach ($focus in @($Record.firstAltFocus, $Record.secondAltFocus, $Record.finalFocus)) {
+        Assert-BrowserTargetFocus $Record.focusAfterInput $focus $Field $Window
+    }
+    if ($null -eq $Journal) { throw 'Conservative refusal journal metadata is missing' }
+    foreach ($name in @('activeChars', 'cachedChars', 'capturedChars', 'pointerBaseline', 'captureUnavailable')) {
+        $property = $Journal.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value -or
+            ($property.Value -isnot [long] -and $property.Value -isnot [int] -and
+             $property.Value -isnot [uint] -and $property.Value -isnot [ulong]) -or $property.Value -lt 0) {
+            throw "Conservative refusal has invalid journal metadata: $name"
+        }
+    }
+    if ($Journal.captureUnavailable -ne 1 -or $Journal.activeChars -ne 0 -or $Journal.cachedChars -ne 0 -or
+        $Journal.capturedChars -ne $Journal.pointerBaseline) {
+        throw 'Conservative refusal requires unavailable capture, empty journals, and no append since pointer-down'
+    }
+}
+function Invoke-BrowserClickRecovery($Session, [string]$Field, [hashtable]$Case, $NativeBefore,
+    $Sessions, [hashtable]$ExpectedOther, [System.Collections.IDictionary]$Recovery) {
+    # Preserve the existing text and focus. Selecting it exercises the normal
+    # selection command rather than retrying the refused journal conversion.
+    if (-not (Read-Browser $Session "fixture.select('$Field', true)")) {
+        throw 'Refused click target lost focus before selection recovery'
+    }
+    Tap-BrowserKey 0xA0
+    Start-Sleep -Milliseconds 100
+    Tap-BrowserKey 0xA0
+    Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $Case.Expected } 'same-control selection recovery'
+    $Recovery.selectionResult = (Read-Browser $Session 'fixture.values()').$Field
+    if ($Recovery.selectionResult -cne $Case.Expected) { throw 'Selection recovery did not preserve the exact converted text' }
+    Assert-BrowserTargetFocus $NativeBefore (Get-BrowserFocusSnapshot $Session) $Field ($Session.Handle.ToInt64())
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    if (-not (Read-Browser $Session "fixture.collapseEnd('$Field')")) { throw 'Same-control caret collapse failed' }
+    Tap-BrowserKey 0x1B
+    Set-BrowserEnglish $Session
+    # No readiness polling or guard query between the boundary and fresh keys.
+    $Recovery.inputTrace = [BrowserInput]::Type($Session.Handle, 'ghbdtn', 0, 0)
+    $typed = $Case.Expected + 'ghbdtn'
+    Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $typed } 'exact same-control fresh input' 2500
+    Tap-BrowserKey 0xA4
+    Start-Sleep -Milliseconds 100
+    Tap-BrowserKey 0xA4
+    $expected = $Case.Expected + 'привет'
+    Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $expected } 'same-control fresh journal recovery' 4000
+    Start-Sleep -Milliseconds 75
+    $Recovery.actual = (Read-Browser $Session 'fixture.values()').$Field
+    if ($Recovery.actual -cne $expected) { throw 'Fresh journal recovery did not remain exact and stable' }
+    $Recovery.finalFocus = Get-BrowserFocusSnapshot $Session
+    Assert-BrowserTargetFocus $NativeBefore $Recovery.finalFocus $Field ($Session.Handle.ToInt64())
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    $Recovery.otherFieldsUnchanged = $true
+}
 
 try {
     $browserExe = @(
@@ -393,7 +505,8 @@ try {
         $name = "browser $($case.Kind) $($case.Mode) '$($case.Text)' firstGap=$($case.Gap) repeat=$($case.Repeat)"
         $record = [ordered]@{name = $name; input = $case.Text; expected = $case.Expected; actualBefore = $null;
             actualAfter = $null; inputTrace = $null; focusAfterInput = $null; firstAltFocus = $null;
-            secondAltFocus = $null; finalFocus = $null; otherFieldsUnchanged = $null; error = $null}
+            secondAltFocus = $null; finalFocus = $null; otherFieldsUnchanged = $null;
+            outcome = $null; refusal = $null; recovery = $null; error = $null}
         $heldModifier = [ushort]0
         $destination = $sessions.a
         $targetField = 'a'
@@ -456,12 +569,36 @@ try {
             Tap-BrowserKey 0xA4
             $record.secondAltFocus = @{native = [BrowserInput]::Snapshot($destination.Handle);
                 dom = Read-Browser $destination 'fixture.diagnostics()'}
-            Wait-Browser { (Read-Browser $destination 'fixture.values()').$targetField -eq $case.Expected } 'exact Double Alt browser result' 4000
-            Start-Sleep -Milliseconds 75
-            $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField
-            if ($record.actualAfter -ne $case.Expected) { throw 'Browser conversion did not remain stable' }
-            if (-not (Read-Browser $destination "fixture.focused('$targetField')")) {
-                throw 'Double Alt moved focus away from the target editor'
+            $refused = $false
+            if ($case.Mode -eq 'click') {
+                if (-not (Test-BrowserValueWithin $destination $targetField $case.Expected 4000)) {
+                    $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField
+                    $record.finalFocus = Get-BrowserFocusSnapshot $destination
+                    $record.otherFieldsUnchanged = $false
+                    Assert-BrowserOtherFields $sessions $expectedOther
+                    $record.otherFieldsUnchanged = $true
+                    $journal = Read-BrowserJournalState $switcher.MainWindowHandle
+                    Assert-BrowserSafeFocusRefusal $case $record $journal $targetField ($destination.Handle.ToInt64())
+                    $record.refusal = @{actualBefore = $record.actualBefore; actualAfter = $record.actualAfter;
+                        journal = $journal; focus = $record.finalFocus; otherFieldsUnchanged = $true}
+                    $record.outcome = 'safe_focus_refusal'
+                    $record.recovery = [ordered]@{}
+                    Invoke-BrowserClickRecovery $destination $targetField $case $record.focusAfterInput `
+                        $sessions $expectedOther $record.recovery
+                    $record.recovery.journalAfter = Read-BrowserJournalState $switcher.MainWindowHandle
+                    $refused = $true
+                }
+            } else {
+                Wait-Browser { (Read-Browser $destination 'fixture.values()').$targetField -eq $case.Expected } 'exact Double Alt browser result' 4000
+            }
+            if (-not $refused) {
+                Start-Sleep -Milliseconds 75
+                $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField
+                if ($record.actualAfter -ne $case.Expected) { throw 'Browser conversion did not remain stable' }
+                if (-not (Read-Browser $destination "fixture.focused('$targetField')")) {
+                    throw 'Double Alt moved focus away from the target editor'
+                }
+                $record.outcome = 'converted'
             }
         } catch {
             $record.error = $_.Exception.Message
@@ -474,23 +611,16 @@ try {
             } catch { }
             if ($null -ne $expectedOther) {
                 try {
+                    $record.otherFieldsUnchanged = $false
+                    Assert-BrowserOtherFields $sessions $expectedOther
                     $record.otherFieldsUnchanged = $true
-                    foreach ($sessionId in @('a', 'b')) {
-                        $values = Read-Browser $sessions[$sessionId] 'fixture.values()'
-                        foreach ($field in @('a', 'b', 'guard')) {
-                            $key = "$sessionId/$field"
-                            if ($expectedOther.ContainsKey($key) -and $values.$field -ne $expectedOther[$key]) {
-                                $record.otherFieldsUnchanged = $false
-                                throw "Input changed another field ${key}: '$($values.$field)'"
-                            }
-                        }
-                    }
                 } catch {
                     $record.error = "$($record.error) $($_.Exception.Message)".Trim()
                 }
             }
         }
         if ($null -ne $record.error) { $failures.Add("${name}: $($record.error)") }
+        else { $ordinaryOutcomes[$record.outcome]++ }
         $results.Add([pscustomobject]$record)
         $record | ConvertTo-Json -Depth 6 -Compress | Write-Output
         if ($null -eq $record.error) { Write-Output "PASS: $name" } else { Write-Output "FAIL: $name" }
@@ -526,7 +656,7 @@ try {
         }
     }
     $report = [ordered]@{passed = @($results | Where-Object { $null -eq $_.error }).Count;
-        total = $results.Count; cases = $results.ToArray(); failures = $failures.ToArray(); failure = $failure;
+        total = $results.Count; ordinaryOutcomes = $ordinaryOutcomes; cases = $results.ToArray(); failures = $failures.ToArray(); failure = $failure;
         cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID}
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')
     $report | ConvertTo-Json -Depth 8 | Write-Output

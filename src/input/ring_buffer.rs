@@ -40,6 +40,8 @@ static SECURE_INPUT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static SECURE_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[cfg(debug_assertions)]
 static PHYSICAL_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static LAST_POINTER_CAPTURE_BASELINE: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_CAPACITY_CHARS: usize = 4096;
 #[cfg(windows)]
 static JOURNAL_CACHE: OnceLock<Mutex<HashMap<FocusCacheKey, CachedJournal>>> = OnceLock::new();
@@ -1523,12 +1525,30 @@ pub fn clear_secure_input_data() {
 /// refresh already queued for the new DOM field in this reset epoch.
 #[cfg(windows)]
 pub fn invalidate_capture_context() {
+    with_journal_mut(invalidate_capture_journal);
+}
+
+#[cfg(windows)]
+fn invalidate_capture_journal(journal: &mut InputJournal) {
+    let foreground = journal.last_fg_hwnd;
+    let focus = journal.last_focus_key;
+    clear_secure_journal(journal, false, false);
+    journal.last_fg_hwnd = foreground;
+    journal.last_focus_key = focus;
+}
+
+/// Keep the debug baseline on the same boundary as the pointer's input reset.
+/// Physical append and this sample share the journal lock, so an old capture
+/// cannot increment between clearing its epoch and recording the baseline.
+#[cfg(windows)]
+pub fn invalidate_pointer_capture_context() {
     with_journal_mut(|journal| {
-        let foreground = journal.last_fg_hwnd;
-        let focus = journal.last_focus_key;
-        clear_secure_journal(journal, false, false);
-        journal.last_fg_hwnd = foreground;
-        journal.last_focus_key = focus;
+        invalidate_capture_journal(journal);
+        #[cfg(debug_assertions)]
+        LAST_POINTER_CAPTURE_BASELINE.store(
+            PHYSICAL_CAPTURE_COUNT.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     });
 }
 
@@ -1771,10 +1791,84 @@ pub fn secure_input_test_metadata() -> (usize, usize, u64) {
     )
 }
 
+/// Read-only evidence for a refused burst following a pointer boundary. The
+/// baseline is historical; observing it never resets the cumulative counter.
+#[cfg(debug_assertions)]
+pub fn secure_input_test_pointer_metadata() -> (u64, bool) {
+    with_journal_mut(|journal| {
+        (
+            LAST_POINTER_CAPTURE_BASELINE.load(Ordering::Relaxed),
+            journal.capture_unavailable,
+        )
+    })
+}
+
 #[cfg(test)]
 mod secure_clear_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
+
+    #[cfg(all(windows, debug_assertions))]
+    #[test]
+    fn pointer_baseline_samples_without_resetting_the_physical_capture_counter() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let captured = with_journal_mut(|journal| {
+            // Seed an actual journal prefix and its corresponding debug count.
+            // The counter deliberately remains monotonic across test cleanup.
+            journal.push_text_internal("before", LayoutTag::En, RunOrigin::Physical);
+            PHYSICAL_CAPTURE_COUNT.fetch_add(6, Ordering::Relaxed) + 6
+        });
+        let previous = secure_input_generation();
+        invalidate_pointer_capture_context();
+        assert!(!validate_secure_input_generation(previous));
+        assert!(runs_snapshot().is_empty());
+        assert_eq!(secure_input_test_pointer_metadata(), (captured, false));
+        assert_eq!(secure_input_test_metadata().2, captured);
+
+        // A later append must remain distinguishable from the pointer boundary.
+        with_journal_mut(|journal| {
+            journal.push_text_internal("after", LayoutTag::En, RunOrigin::Physical);
+            PHYSICAL_CAPTURE_COUNT.fetch_add(5, Ordering::Relaxed);
+        });
+        invalidate_capture_context();
+        assert_eq!(secure_input_test_metadata().2, captured + 5);
+        assert_eq!(secure_input_test_pointer_metadata().0, captured);
+        invalidate_pointer_capture_context();
+        assert_eq!(secure_input_test_pointer_metadata(), (captured + 5, false));
+        assert_eq!(secure_input_test_metadata().2, captured + 5);
+        clear_secure_input_data();
+    }
+
+    #[cfg(all(windows, debug_assertions))]
+    #[test]
+    fn pointer_metadata_observation_preserves_text_epoch_and_unavailable_state() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        invalidate_pointer_capture_context();
+        let baseline = secure_input_test_pointer_metadata().0;
+        push_text("retained-input");
+        let before = runs_snapshot();
+        let epoch = secure_input_generation();
+        let captured = secure_input_test_metadata().2;
+        for _ in 0..2 {
+            assert_eq!(secure_input_test_pointer_metadata(), (baseline, false));
+            assert_eq!(secure_input_test_metadata().2, captured);
+            assert_eq!(runs_snapshot(), before);
+            assert!(validate_secure_input_generation(epoch));
+        }
+
+        secure_capture_unavailable();
+        let rejected_epoch = secure_input_generation();
+        for _ in 0..2 {
+            assert_eq!(secure_input_test_pointer_metadata(), (baseline, true));
+            assert_eq!(secure_input_test_metadata().2, captured);
+            assert!(validate_secure_input_generation(rejected_epoch));
+        }
+        push_text("rejected-suffix");
+        assert!(runs_snapshot().is_empty());
+        clear_secure_input_data();
+    }
 
     #[test]
     fn secure_clear_rejects_old_generation_and_removes_active_text() {

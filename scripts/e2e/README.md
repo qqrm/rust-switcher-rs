@@ -123,9 +123,11 @@ The 51 cases cover five editor types, a single period, words with a leading
 period, 0/1/30 ms first-key gaps, repeated fast typing, and transitions between
 fields/windows while Ctrl or Alt is released. Textarea and contenteditable cases
 also require complete conversion of 101 characters, both with a leading letter
-and a leading period. Every case checks exact input
-before conversion, exact output afterward, and unchanged neighboring/source
-fields in both windows. Input and conversion are never retried. Native focus,
+and a leading period. All cases check exact input and unchanged neighboring/source
+fields in both windows. The 49 cases outside immediate-click transitions require
+the exact converted output. The two click cases allow the verified conservative
+refusal described below as well as exact conversion. Their original input timing
+and first-key gaps are unchanged. Original input and Double Alt are never retried. Native focus,
 caret-owner HWND, caret rectangle and keyboard-layout snapshots are included in
 the JSON results so a journal failure can be distinguished from incorrect input
 or browser focus setup. A failure stays red while the remaining cases collect
@@ -135,6 +137,43 @@ evidence. Missing browsers or desktop capabilities also fail instead of skipping
 Windows input. It invokes them through a child script under StrictMode, verifies
 connection-owned request IDs, and checks event filtering and error propagation.
 This runs in the PowerShell CI gate before the interactive scenarios.
+
+#### Conservative refusal after an immediate click
+
+A new focused UIA element can be observed after a raw key snapshot was taken.
+The protection contract rejects a snapshot whose element identity changed. Only
+the two original textarea/contenteditable `click` cases may accept that refusal,
+and only after the original four-second conversion wait has expired normally.
+Browser, input, provider, or metadata exceptions remain failures. No additional
+readiness wait or guard polling occurs before the first tested key.
+
+Before any recovery action, the original text must remain exactly intact, native
+foreground/focus and DOM focus must still identify the original target, and every
+other field in both windows must remain unchanged. Read-only debug metadata must
+show capture unavailable, zero active/cache characters, and a cumulative physical
+append count equal to the count sampled atomically at the last pointer-down
+boundary. Selectors `5` (that baseline) and `6` (unavailable as `0`/`1`) supplement
+the existing inspection channel. These checks reject partial conversion and
+capture followed by clearing. They prove conservative refusal; they do not claim
+to establish the precise timing cause of the refusal.
+
+Acceptance also requires two recoveries on the same control. First, select the
+existing text and use the normal selection shortcut to produce the exact
+original expected conversion. Then collapse the caret at the end of that same
+field, send Escape, select the English layout, and immediately type physical
+`ghbdtn`. Double Alt must produce the original converted text followed by
+`привет`. CDP does not replace text during either recovery. Focus and every other
+field are checked before recovery, after selection conversion, and after fresh
+journal conversion. Each ordinary result records `converted` or
+`safe_focus_refusal`, with the latter including counter evidence and recovery
+results; the summary counts both outcomes separately. Password assertions and
+the mutation gate do not accept conservative refusal in place of their checks.
+
+`test-browser-outcomes.ps1` exercises the production refusal predicate and value
+wait without Windows input. It rejects partial text, capture deltas, retained
+history, focus changes, false unavailable state, and missing/null metadata. It
+also proves that non-click cases cannot use this outcome and that transport or
+timeout exceptions cannot be mistaken for a normal exhausted value wait.
 
 The separate focus unit regressions reproduce a caret-owner change under
 unchanged keyboard focus after the first glyph, and assert that changing the

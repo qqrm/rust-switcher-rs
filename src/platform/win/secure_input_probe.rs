@@ -18,6 +18,15 @@ pub(super) fn read(hwnd: HWND, selector: usize) -> LRESULT {
             .map(|state| LRESULT(isize::from(state.autoconvert_enabled)))
             .unwrap_or(LRESULT(-1));
     }
+    if matches!(selector, 5 | 6) {
+        let (baseline, unavailable) =
+            crate::input::ring_buffer::secure_input_test_pointer_metadata();
+        return if selector == 5 {
+            LRESULT(isize::try_from(baseline).unwrap_or(isize::MAX))
+        } else {
+            LRESULT(isize::from(unavailable))
+        };
+    }
     // Observing a counter must not drain a worker, classify a field or clear a
     // journal: otherwise the test could hide transient password capture.
     let (active, cached, captured) = crate::input::ring_buffer::secure_input_test_metadata();

@@ -25,6 +25,25 @@ input can expose the correct property; a custom control with no usable metadata
 cannot be authorized for capture. A provider that explicitly mislabels secret
 content as ordinary text cannot be corrected by this mechanism.
 
+### Immediate focus changes
+
+A click can move between browser fields before their asynchronous accessibility
+notification reaches Rust Switcher. If the first queued key observes a different
+UIA element, the guard cannot establish which field owned that key when it was
+pressed. It discards the incomplete input history even when the newly focused
+field currently reports `IsPassword = false`. This can leave an ordinary burst
+typed immediately after a click unavailable for last-word or sequence conversion.
+The physical input still reaches the application, and the conversion leaves it
+unchanged.
+
+Once the ordinary field has been identified, explicitly selecting the visible
+text allows the selection-conversion path to validate and convert that text
+without recovering rejected keystrokes. A new input segment after an explicit
+navigation/reset boundary can also be captured normally. Repeating the sequence
+shortcut alone does not reconstruct the discarded history. This conservative
+behavior is a compatibility tradeoff, not a guarantee that every first burst
+after a focus change can be converted.
+
 ## Responsiveness and temporary data
 
 The keyboard hook does not call UI Automation or wait for its provider. It takes
@@ -51,6 +70,12 @@ stale generations, journal/cache clearing, and restoration guards. Windows
 acceptance tests exercise real browser controls through physical-style injected
 test input on disposable GitHub-hosted runners, including password transitions
 within one native browser window and positive ordinary-text conversions.
+Stable-field cases require exact conversion. The two immediate-click cases also
+permit a verified refusal: unchanged text and focus, untouched other fields,
+empty active and cached journals, an unavailable-prefix marker, and no physical
+character appended since the pointer-down boundary. A refusal must then recover
+through selection conversion and a fresh input segment in the same control.
+These cases do not insert a readiness wait before the tested first key.
 
 The debug fixture exposes only aggregate counters, including a cumulative count
 of characters actually appended from physical input. That counter detects
