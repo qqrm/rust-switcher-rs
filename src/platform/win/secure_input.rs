@@ -392,19 +392,15 @@ impl Provider {
                 !unsafe { automation.CompareElements(previous, &element) }
                     .is_ok_and(|same| same.as_bool())
             });
+        let forget = self.elements.len() >= IDENTITY_CACHE_CAPACITY
+            && !self.elements.contains_key(&request.probe.target);
         probe_observed_identity(
             element_changed,
-            || validate_capture_generation(request.probe.generation),
-            || request.metadata_is_current(),
-            || {
-                let forget = self.elements.len() >= IDENTITY_CACHE_CAPACITY
-                    && !self.elements.contains_key(&request.probe.target);
-                if forget {
-                    self.elements.clear();
-                }
-                self.elements.insert(request.probe.target, element.clone());
-                PUBLISHED_IDENTITIES.publish(request.probe.target, element_changed, forget)
-            },
+            (
+                || validate_capture_generation(request.probe.generation),
+                || request.metadata_is_current(),
+            ),
+            || PUBLISHED_IDENTITIES.publish(request.probe.target, element_changed, forget),
             |revision| PUBLISHED_IDENTITIES.retire(request.probe.target, revision),
             || element_status(&element),
             || {
@@ -416,18 +412,26 @@ impl Provider {
                     })
                     .is_some_and(|same| same.as_bool())
             },
+            || {
+                accept_observed_identity(request.probe, element_changed, || {
+                    if forget {
+                        self.elements.clear();
+                    }
+                    self.elements.insert(request.probe.target, element.clone());
+                })
+            },
         )
     }
 }
 
 fn probe_observed_identity(
     element_changed: bool,
-    generation_is_current: impl Fn() -> bool,
-    metadata_is_current: impl Fn() -> bool,
+    (generation_is_current, metadata_is_current): (impl Fn() -> bool, impl Fn() -> bool),
     publish_identity: impl FnOnce() -> u64,
     retire_identity: impl Fn(u64),
     password_status: impl FnOnce() -> Status,
     remains_focused: impl FnOnce() -> bool,
+    accept_identity: impl FnOnce() -> bool,
 ) -> Verdict {
     if !generation_is_current() || !metadata_is_current() {
         return Verdict::UNKNOWN;
@@ -466,11 +470,40 @@ fn probe_observed_identity(
         }
         return Verdict::UNKNOWN;
     }
+    // Only an atomic discard for this target can authorize replacing the
+    // accepted identity. A pure raw reset may preserve the provisional identity
+    // while still preventing this old observation from committing its owner.
+    if !denied && !accept_identity() {
+        if !metadata_is_current() {
+            retire_identity(revision);
+        }
+        return Verdict::UNKNOWN;
+    }
     Verdict {
         status,
         element_changed,
         identity: MetadataIdentity::Published(revision),
     }
+}
+
+fn accept_observed_identity(
+    request: Probe,
+    element_changed: bool,
+    accept_identity: impl FnOnce(),
+) -> bool {
+    if element_changed
+        && !ring_buffer::discard_changed_capture_context_for_focus_if_current(
+            request.generation,
+            request.target.foreground,
+            request.target.focus,
+        )
+    {
+        return false;
+    }
+    // The journal lock is released before touching COM interfaces. A native
+    // switch after the discard can only cache the already-cleared history.
+    accept_identity();
+    true
 }
 
 /// Freeze the clicked control before observing focus. A different focused
@@ -1007,7 +1040,11 @@ fn apply_refresh_metadata(
         }
         Status::NotSecure if result.element_changed => {
             tracing::debug!("secure input: focused UIA element changed");
-            ring_buffer::discard_changed_capture_context(request.generation);
+            let _ = ring_buffer::discard_changed_capture_context_for_focus_if_current(
+                request.generation,
+                request.target.foreground,
+                request.target.focus,
+            );
         }
         Status::NotSecure => {}
     }
@@ -1549,8 +1586,10 @@ mod tests {
                             // blocked after the exact element was observed.
                             let verdict = probe_observed_identity(
                                 true,
-                                || validate_capture_generation(generation),
-                                || worker_current.load(Ordering::Acquire),
+                                (
+                                    || validate_capture_generation(generation),
+                                    || worker_current.load(Ordering::Acquire),
+                                ),
                                 || worker_publications.publish(request.target, true, false),
                                 |revision| worker_publications.retire(request.target, revision),
                                 || {
@@ -1567,6 +1606,7 @@ mod tests {
                                     }
                                     stable
                                 },
+                                || true,
                             );
                             if stable && current {
                                 assert!(verdict.element_changed);
@@ -1584,11 +1624,11 @@ mod tests {
                                 // ordinary verdict for the unchanged element.
                                 let fresh = probe_observed_identity(
                                     false,
-                                    || validate_capture_generation(generation),
-                                    || true,
+                                    (|| validate_capture_generation(generation), || true),
                                     || worker_publications.publish(request.target, false, false),
                                     |revision| worker_publications.retire(request.target, revision),
                                     || Status::NotSecure,
+                                    || true,
                                     || true,
                                 );
                                 if capture_metadata_allows(identity_revision, fresh) {
@@ -1702,15 +1742,270 @@ mod tests {
     fn stale_observation_cannot_publish_an_identity_or_query_metadata() {
         let verdict = probe_observed_identity(
             true,
-            || false,
-            || panic!("a stale observation must not query native metadata"),
+            (
+                || false,
+                || panic!("a stale observation must not query native metadata"),
+            ),
             || panic!("a stale observation must not publish an identity"),
             |_| panic!("a stale observation must not retire another identity"),
             || panic!("a stale observation must not query password metadata"),
             || panic!("a stale observation must not query focus"),
+            || panic!("a stale observation must not accept an identity"),
         );
         assert_eq!(verdict.status, Status::Unknown);
         assert!(matches!(verdict.identity, MetadataIdentity::Unavailable));
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum IdentityInterruption {
+        Metadata,
+        BeforeAcceptance,
+        AfterDiscard,
+        RawResetBeforeAcceptance,
+    }
+
+    fn run_restored_identity_case(
+        interruption: IdentityInterruption,
+        commit_early: bool,
+    ) -> (bool, String) {
+        use std::cell::Cell;
+
+        ring_buffer::clear_secure_input_data();
+        ring_buffer::test_switch_foreground(101, 1_000);
+        ring_buffer::push_text("old-C");
+        let mut request = pointer_test_probe(capture_generation());
+        request.target.foreground = 101;
+        request.target.focus = 10_101;
+        let publications = IdentityPublications::new();
+        publications.publish(request.target, true, false);
+        let accepted = Cell::new('C');
+        let switch_away = || {
+            // Exercise real journal caching. The explicit boundary in empty U
+            // advances the raw epoch without purging T's cached C history.
+            ring_buffer::test_switch_foreground(202, 1_100);
+            ring_buffer::invalidate_capture_context();
+        };
+        let changed = accepted.get() != 'B';
+        let interrupted = probe_observed_identity(
+            changed,
+            (
+                || validate_capture_generation(request.generation),
+                || ring_buffer::raw_foreground_for_test() == 101,
+            ),
+            || {
+                if commit_early {
+                    // Negative control reproduces the previous early COM-cache
+                    // update while keeping revision retirement enabled.
+                    accepted.set('B');
+                }
+                publications.publish(request.target, changed, false)
+            },
+            |revision| publications.retire(request.target, revision),
+            || {
+                if interruption == IdentityInterruption::Metadata {
+                    switch_away();
+                }
+                Status::NotSecure
+            },
+            || true,
+            || {
+                if interruption == IdentityInterruption::BeforeAcceptance {
+                    switch_away();
+                }
+                if interruption == IdentityInterruption::RawResetBeforeAcceptance {
+                    ring_buffer::invalidate_capture_context();
+                }
+                accept_observed_identity(request, changed, || {
+                    if interruption == IdentityInterruption::AfterDiscard {
+                        switch_away();
+                    }
+                    accepted.set('B');
+                })
+            },
+        );
+        assert!(!validate_capture_generation(request.generation));
+        if matches!(
+            interruption,
+            IdentityInterruption::Metadata | IdentityInterruption::BeforeAcceptance
+        ) {
+            assert_eq!(interrupted.status, Status::Unknown);
+            assert_eq!(
+                publications.at_admission(request.target, publications.frontier()),
+                None,
+            );
+        } else if interruption == IdentityInterruption::RawResetBeforeAcceptance {
+            assert_eq!(interrupted.status, Status::Unknown);
+            assert!(
+                publications
+                    .at_admission(request.target, publications.frontier())
+                    .is_some()
+            );
+            assert_eq!(accepted.get(), 'C');
+        }
+        // The result reaches the coordinator after the native transition. It
+        // must leave the other window and retained histories untouched.
+        assert_eq!(
+            complete_refresh(request, interrupted, || true),
+            Status::Unknown
+        );
+        ring_buffer::test_switch_foreground(101, 1_200);
+        let restored: String = ring_buffer::runs_snapshot()
+            .into_iter()
+            .map(|run| run.text)
+            .collect();
+        assert_eq!(
+            restored,
+            if matches!(
+                interruption,
+                IdentityInterruption::AfterDiscard | IdentityInterruption::RawResetBeforeAcceptance
+            ) {
+                ""
+            } else {
+                "old-C"
+            },
+        );
+
+        let returned = Probe {
+            generation: capture_generation(),
+            ..request
+        };
+        let changed = accepted.get() != 'B';
+        let refreshed = probe_observed_identity(
+            changed,
+            (|| validate_capture_generation(returned.generation), || true),
+            || publications.publish(returned.target, changed, false),
+            |revision| publications.retire(returned.target, revision),
+            || Status::NotSecure,
+            || true,
+            || accept_observed_identity(returned, changed, || accepted.set('B')),
+        );
+        assert_eq!(
+            complete_refresh(returned, refreshed, || true),
+            Status::NotSecure
+        );
+        let (captured, pending) = {
+            let frontier = publications.frontier();
+            let _dispatch = begin_capture_dispatch(returned.generation).unwrap();
+            (
+                publications.at_admission(returned.target, frontier),
+                PendingCapture::new(returned.generation),
+            )
+        };
+        let fresh = probe_observed_identity(
+            accepted.get() != 'B',
+            (|| validate_capture_generation(returned.generation), || true),
+            || publications.publish(returned.target, false, false),
+            |revision| publications.retire(returned.target, revision),
+            || Status::NotSecure,
+            || true,
+            || accept_observed_identity(returned, false, || accepted.set('B')),
+        );
+        assert!(capture_metadata_allows(captured, fresh));
+        ring_buffer::push_text("new-B");
+        let text = ring_buffer::runs_snapshot()
+            .into_iter()
+            .map(|run| run.text)
+            .collect();
+        drop(pending);
+        ring_buffer::clear_secure_input_data();
+        (refreshed.element_changed, text)
+    }
+
+    #[test]
+    fn provisional_identity_cannot_hide_a_restored_journals_old_owner() {
+        let _guard = ring_buffer::test_guard();
+        assert_eq!(
+            run_restored_identity_case(IdentityInterruption::Metadata, true),
+            (false, String::from("old-Cnew-B")),
+        );
+        for interruption in [
+            IdentityInterruption::Metadata,
+            IdentityInterruption::BeforeAcceptance,
+        ] {
+            assert_eq!(
+                run_restored_identity_case(interruption, false),
+                (true, String::from("new-B")),
+            );
+        }
+        // Even a successful result can arrive after the native target changed.
+        // Its atomic discard happened before that transition cached T's text.
+        assert_eq!(
+            run_restored_identity_case(IdentityInterruption::AfterDiscard, false),
+            (false, String::from("new-B")),
+        );
+        assert_eq!(
+            run_restored_identity_case(IdentityInterruption::RawResetBeforeAcceptance, false),
+            (true, String::from("new-B")),
+        );
+    }
+
+    #[test]
+    fn denied_or_incomplete_metadata_preserves_the_accepted_identity() {
+        use std::cell::Cell;
+
+        for (status, stable) in [
+            (Status::Secure, true),
+            (Status::Unknown, true),
+            (Status::NotSecure, false),
+        ] {
+            let publications = IdentityPublications::new();
+            let target = pointer_test_probe(0).target;
+            let accepted = Cell::new('C');
+            let _ = probe_observed_identity(
+                true,
+                (|| true, || true),
+                || publications.publish(target, true, false),
+                |revision| publications.retire(target, revision),
+                || status,
+                || stable,
+                || {
+                    accepted.set('B');
+                    true
+                },
+            );
+            assert_eq!(accepted.get(), 'C');
+        }
+    }
+
+    #[test]
+    fn identity_acceptance_evicts_its_target_while_native_journal_focus_lags() {
+        use std::cell::Cell;
+
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        ring_buffer::test_switch_foreground(101, 1_000);
+        ring_buffer::push_text("old-C");
+        ring_buffer::test_switch_foreground(202, 1_100);
+        ring_buffer::push_text("current-U");
+        let other_runs = ring_buffer::runs_snapshot();
+        let context = generation();
+        let mut request = pointer_test_probe(capture_generation());
+        request.target.foreground = 101;
+        request.target.focus = 10_101;
+        let publications = IdentityPublications::new();
+        let accepted = Cell::new('C');
+        let result = probe_observed_identity(
+            true,
+            (|| validate_capture_generation(request.generation), || true),
+            || publications.publish(request.target, true, false),
+            |revision| publications.retire(request.target, revision),
+            || Status::NotSecure,
+            || true,
+            || accept_observed_identity(request, true, || accepted.set('B')),
+        );
+        assert_eq!(accepted.get(), 'B');
+        assert_eq!(
+            complete_refresh(request, result, || true),
+            Status::NotSecure
+        );
+        assert!(validate_generation(context));
+        assert_eq!(ring_buffer::raw_foreground_for_test(), 202);
+        assert_eq!(ring_buffer::runs_snapshot(), other_runs);
+        ring_buffer::test_switch_foreground(101, 1_200);
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        ring_buffer::test_switch_foreground(202, 1_300);
+        assert_eq!(ring_buffer::runs_snapshot(), other_runs);
+        ring_buffer::clear_secure_input_data();
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1757,8 +2052,10 @@ mod tests {
                         Query::Observe => {
                             let verdict = probe_observed_identity(
                                 true,
-                                || validate_capture_generation(raw),
-                                || worker_current.load(Ordering::Acquire),
+                                (
+                                    || validate_capture_generation(raw),
+                                    || worker_current.load(Ordering::Acquire),
+                                ),
                                 || worker_publications.publish(request.target, true, false),
                                 |revision| {
                                     if retirement {
@@ -1777,6 +2074,7 @@ mod tests {
                                     }
                                     stable
                                 },
+                                || true,
                             );
                             if pause == TimeoutPause::Reply {
                                 // The helper's final check succeeded, but the
@@ -1788,11 +2086,11 @@ mod tests {
                         }
                         Query::FreshCapture => probe_observed_identity(
                             false,
-                            || true,
-                            || true,
+                            (|| true, || true),
                             || worker_publications.publish(request.target, false, false),
                             |revision| worker_publications.retire(request.target, revision),
                             || Status::NotSecure,
+                            || true,
                             || true,
                         ),
                     }
@@ -1982,19 +2280,19 @@ mod tests {
             "superseded-identity-test",
             2,
             move || {
+                let accepted = std::cell::Cell::new(!element_changed);
                 move |action| {
                     let appended = match action {
                         Action::Observe => {
                             let verdict = probe_observed_identity(
                                 element_changed,
-                                || validate_capture_generation(old_generation),
-                                || {
+            (|| validate_capture_generation(old_generation), || {
                                     worker_deadline.load(Ordering::Acquire)
                                         && worker_native.load(Ordering::Acquire)
                                         // The old policy incorrectly included
                                         // navigation in metadata invalidity.
                                         && (!old_policy || validate_capture_generation(old_generation))
-                                },
+                                }),
                                 || worker_publications.publish(request.target, element_changed, false),
                                 |revision| worker_publications.retire(request.target, revision),
                                 || {
@@ -2003,6 +2301,7 @@ mod tests {
                                     status
                                 },
                                 || stable,
+                                || accept_observed_identity(request, element_changed, || accepted.set(true)),
                             );
                             assert_eq!(verdict.status, Status::Unknown);
                             assert_eq!(complete_refresh(request, verdict, || true), Status::Unknown);
@@ -2014,14 +2313,16 @@ mod tests {
                                 // even when its metadata revision was retained.
                                 0
                             } else {
+                                let changed = !accepted.get();
+                                let current = Probe { generation, ..request };
                                 let fresh = probe_observed_identity(
-                                    false,
-                                    || validate_capture_generation(generation),
-                                    || true,
-                                    || worker_publications.publish(request.target, false, false),
+                                    changed,
+            (|| validate_capture_generation(generation), || true),
+                                    || worker_publications.publish(request.target, changed, false),
                                     |revision| worker_publications.retire(request.target, revision),
                                     || Status::NotSecure,
                                     || true,
+                                    || accept_observed_identity(current, changed, || accepted.set(true)),
                                 );
                                 if capture_metadata_allows(revision, fresh) {
                                     ring_buffer::push_text("x");
@@ -2109,7 +2410,7 @@ mod tests {
                     changed,
                     false
                 ),
-                (0, 1)
+                (0, usize::from(!changed))
             );
             for (status, stable, deadline, native) in [
                 (Status::Secure, true, true, true),

@@ -78,6 +78,16 @@ and deadline remain valid. A fully validated ordinary observation may likewise
 retain its identity when only reply delivery expires. Every later key still
 requires its own fresh validation; neither case reauthorizes older input.
 
+The provider remembers a changed ordinary element for journal ownership only
+after clearing that target's retained history under its generation check. If
+native focus delivery lags, it evicts the target's cache without clearing another
+active editor or expiring that editor's guards. This ordering also covers a
+native window switch before the coordinator receives the reply: either the
+generation changed first and acceptance fails, or the old prefix was cleared
+before it could be cached. Failed, sensitive, and superseded observations do not
+replace the last accepted COM identity. UIA calls finish before the journal lock
+is acquired, and the accepted COM interface is stored after that lock is released.
+
 This is best-effort protection based on observable metadata, not proof of the
 element that received a physical key. UIA observations can miss a transient
 focus change. For example, if an ordinary field B is known, focus moves to a

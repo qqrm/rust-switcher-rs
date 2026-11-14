@@ -1721,27 +1721,65 @@ fn apply_secure_focus_transition(
 /// A fresh UIA observation found a different descendant of this native target.
 /// Discard old text without advancing the raw epoch of ordered pending keys.
 /// Retaining that epoch also retains evidence of any missing physical input.
-#[cfg(any(test, windows))]
+#[cfg(test)]
 pub fn discard_changed_capture_context(generation: u64) {
+    let _ = discard_changed_capture_context_if_current(generation);
+}
+
+/// A provider can accept a new identity only after this atomic transition has
+/// discarded the expected generation's old context. Stale observations do nothing.
+#[cfg(test)]
+pub(crate) fn discard_changed_capture_context_if_current(generation: u64) -> bool {
     with_journal_mut(|journal| {
         if !validate_secure_input_generation(generation) {
-            return;
+            return false;
         }
-        SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
-        #[cfg(windows)]
-        layout_decode::reset();
-        // This observation retains the raw epoch. It cannot make a suffix
-        // complete after an earlier key in that epoch was rejected.
-        let capture_unavailable = journal.capture_unavailable;
-        journal.clear();
-        journal.capture_unavailable = capture_unavailable;
+        discard_changed_journal(journal);
         #[cfg(windows)]
         if let Some(current) = journal.last_focus_key {
             with_journal_cache_mut(|cache| {
                 cache.retain(|key, _| !same_focus_identity(*key, current))
             });
         }
-    });
+        true
+    })
+}
+
+/// UIA may observe a target before its native focus event reaches the journal.
+/// Evict that target's old descendants without clearing another active editor.
+#[cfg(windows)]
+pub fn discard_changed_capture_context_for_focus_if_current(
+    generation: u64,
+    foreground: usize,
+    focus: usize,
+) -> bool {
+    with_journal_mut(|journal| {
+        if !validate_secure_input_generation(generation) {
+            return false;
+        }
+        let matches_target = |key: FocusCacheKey| {
+            key.foreground_hwnd as usize == foreground && key.focus_hwnd as usize == focus
+        };
+        with_journal_cache_mut(|cache| cache.retain(|key, _| !matches_target(*key)));
+        if journal.last_fg_hwnd as usize == foreground
+            && journal.last_focus_key.is_some_and(matches_target)
+        {
+            discard_changed_journal(journal);
+        }
+        true
+    })
+}
+
+#[cfg(any(test, windows))]
+fn discard_changed_journal(journal: &mut InputJournal) {
+    SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    #[cfg(windows)]
+    layout_decode::reset();
+    // This observation retains the raw epoch. It cannot make a suffix
+    // complete after an earlier key in that epoch was rejected.
+    let capture_unavailable = journal.capture_unavailable;
+    journal.clear();
+    journal.capture_unavailable = capture_unavailable;
 }
 
 /// A missing event invalidates the whole prefix, not merely the lost character.
@@ -2373,19 +2411,93 @@ mod secure_clear_tests {
         assert!(runs_snapshot().is_empty());
     }
 
-    #[cfg(windows)]
     #[test]
-    fn uia_focus_change_expires_guards_without_dropping_post_focus_keys() {
+    fn uia_focus_acceptance_discards_only_current_context_and_preserves_capture_state() {
         let _guard = test_guard();
         clear_secure_input_data();
+        let stale_epoch = secure_input_generation();
+        invalidate_capture_context();
+        push_text("old-field");
         let capture_epoch = secure_input_generation();
         let guard_token = secure_context_generation();
-        discard_changed_capture_context(capture_epoch);
+        let old_runs = runs_snapshot();
+        assert!(!discard_changed_capture_context_if_current(stale_epoch));
+        assert!(validate_secure_input_generation(capture_epoch));
+        assert!(validate_secure_context_generation(guard_token));
+        assert_eq!(runs_snapshot(), old_runs);
+        assert!(with_journal(|journal| journal.input_started));
+
+        assert!(discard_changed_capture_context_if_current(capture_epoch));
         assert!(validate_secure_input_generation(capture_epoch));
         assert!(!validate_secure_context_generation(guard_token));
+        assert!(runs_snapshot().is_empty());
+        assert!(with_journal(|journal| journal.input_started));
         push_text("new-field");
         reject_secure_context(guard_token);
         assert!(!runs_snapshot().is_empty());
+
+        reject_secure_capture(capture_epoch);
+        let rejected_epoch = secure_input_generation();
+        let rejected_context = secure_context_generation();
+        assert!(discard_changed_capture_context_if_current(rejected_epoch));
+        assert!(validate_secure_input_generation(rejected_epoch));
+        assert!(!validate_secure_context_generation(rejected_context));
+        assert!(with_journal(|journal| journal.capture_unavailable));
+        push_text("lost-suffix");
+        assert!(runs_snapshot().is_empty());
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uia_target_discard_handles_lagging_native_focus_without_clearing_another_editor() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        test_switch_foreground(101, 1_000);
+        push_text("old-T");
+        let target_runs = runs_snapshot();
+        test_switch_foreground(202, 1_100);
+        let stale_epoch = secure_input_generation();
+        invalidate_capture_context();
+        push_text("current-U");
+        let other_runs = runs_snapshot();
+        let epoch = secure_input_generation();
+        let context = secure_context_generation();
+
+        assert!(!discard_changed_capture_context_for_focus_if_current(
+            stale_epoch,
+            101,
+            10_101,
+        ));
+        assert!(validate_secure_input_generation(epoch));
+        assert!(validate_secure_context_generation(context));
+        assert_eq!(runs_snapshot(), other_runs);
+        test_switch_foreground(101, 1_200);
+        assert_eq!(runs_snapshot(), target_runs);
+        test_switch_foreground(202, 1_300);
+        assert_eq!(runs_snapshot(), other_runs);
+
+        // UIA sees T's changed descendant while the journal still names U.
+        // T's cached prefix must disappear, and U's history/guards must survive.
+        assert!(discard_changed_capture_context_for_focus_if_current(
+            epoch, 101, 10_101,
+        ));
+        assert!(validate_secure_input_generation(epoch));
+        assert!(validate_secure_context_generation(context));
+        assert_eq!(runs_snapshot(), other_runs);
+        assert_eq!(raw_foreground_for_test(), 202);
+        test_switch_foreground(101, 1_400);
+        assert!(runs_snapshot().is_empty());
+        test_switch_foreground(202, 1_500);
+        assert_eq!(runs_snapshot(), other_runs);
+
+        assert!(discard_changed_capture_context_for_focus_if_current(
+            epoch, 202, 10_202,
+        ));
+        assert!(validate_secure_input_generation(epoch));
+        assert!(!validate_secure_context_generation(context));
+        assert!(runs_snapshot().is_empty());
+        assert!(with_journal(|journal| journal.input_started));
         clear_secure_input_data();
     }
 
