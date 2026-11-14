@@ -17,6 +17,17 @@ foreach ($name in @('Test-BrowserValueWithin', 'Assert-BrowserTargetFocus', 'Ass
     if ($functions.Count -ne 1) { throw "Expected one production helper named $name" }
     . ([scriptblock]::Create($functions[0].Extent.Text))
 }
+$securityPath = Join-Path (Split-Path -Parent $HarnessPath) 'browser-security-cases.ps1'
+$securityAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path -LiteralPath $securityPath), [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors) { throw ($parseErrors | Out-String) }
+$stimulusHelpers = @($securityAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Assert-DelayedPasswordStimulus'
+}, $false))
+if ($stimulusHelpers.Count -ne 1) { throw 'Expected one delayed-password stimulus validator' }
+. ([scriptblock]::Create($stimulusHelpers[0].Extent.Text))
 
 function New-FocusFixture {
     return @{native = [pscustomobject]@{foreground = 123; focus = 456; error = 0};
@@ -106,5 +117,52 @@ foreach ($message in @('fixture protocol error', 'Timed out: exact Double Alt br
     if (-not $propagated) { throw 'An unrelated browser failure was treated as exhausted value wait' }
     $checks.Add("browser error propagated: $message")
 }
-if ($checks.Count -lt 30) { throw 'Browser outcome regression discovery was incomplete' }
+
+function New-DelayedPasswordFixture {
+    return @{Values = [pscustomobject]@{a = 'g'; b = ''}; Proof = [pscustomobject]@{
+        complete = $true; prevented = $true; delayMs = 45; downOwner = 'a'; finalOwner = 'b';
+        downAt = 100.0; focusAt = 145.0; events = @(
+            [pscustomobject]@{type = 'mouseup'; target = 'b'; key = ''; data = ''; trusted = $true; at = 101.0},
+            [pscustomobject]@{type = 'keydown'; target = 'a'; key = 'g'; data = ''; trusted = $true; at = 102.0},
+            [pscustomobject]@{type = 'input'; target = 'a'; key = ''; data = 'g'; trusted = $true; at = 103.0},
+            [pscustomobject]@{type = 'keyup'; target = 'a'; key = 'g'; data = ''; trusted = $true; at = 104.0},
+            [pscustomobject]@{type = 'focusin'; target = 'b'; key = ''; data = ''; trusted = $true; at = 145.0}
+        )
+    }}
+}
+function Assert-DelayedStimulusRejected([string]$Name, [scriptblock]$Change) {
+    $fixture = New-DelayedPasswordFixture
+    & $Change $fixture
+    $rejected = $false
+    try { Assert-DelayedPasswordStimulus $fixture.Proof $fixture.Values | Out-Null }
+    catch {
+        if ($_.Exception.Message.Contains('SECURITY_CAPTURE_VIOLATION:')) { throw 'Invalid stimulus masqueraded as a security finding' }
+        $rejected = $true
+    }
+    if (-not $rejected) { throw "Invalid delayed password stimulus was accepted: $Name" }
+    $checks.Add($Name)
+}
+$fixture = New-DelayedPasswordFixture
+if ((Assert-DelayedPasswordStimulus $fixture.Proof $fixture.Values) -ne 45) {
+    throw 'Valid delayed password stimulus did not preserve observed timing'
+}
+$checks.Add('trusted password input precedes delayed ordinary focus')
+Assert-DelayedStimulusRejected 'password never received input' { param($f) $f.Values.a = '' }
+Assert-DelayedStimulusRejected 'ordinary field received test key' { param($f) $f.Values.b = 'g' }
+Assert-DelayedStimulusRejected 'mousedown did not prevent focus' { param($f) $f.Proof.prevented = $false }
+Assert-DelayedStimulusRejected 'password was not original focus owner' { param($f) $f.Proof.downOwner = 'b' }
+Assert-DelayedStimulusRejected 'ordinary field never gained focus' { param($f) $f.Proof.finalOwner = 'a' }
+Assert-DelayedStimulusRejected 'focus timer too early' { param($f) $f.Proof.focusAt = 124.0 }
+Assert-DelayedStimulusRejected 'focus timer outside provider budget' { param($f) $f.Proof.focusAt = 175.0 }
+Assert-DelayedStimulusRejected 'actual focus event later than timer timestamp' { param($f) $f.Proof.events[4].at = 180.0 }
+Assert-DelayedStimulusRejected 'missing focus timestamp' { param($f) $f.Proof.focusAt = $null }
+Assert-DelayedStimulusRejected 'nonfinite focus timestamp' { param($f) $f.Proof.focusAt = [double]::NaN }
+Assert-DelayedStimulusRejected 'scripted keyboard event' { param($f) $f.Proof.events[1].trusted = $false }
+Assert-DelayedStimulusRejected 'scripted input event' { param($f) $f.Proof.events[2].trusted = $false }
+Assert-DelayedStimulusRejected 'key targeted ordinary field' { param($f) $f.Proof.events[1].target = 'b' }
+Assert-DelayedStimulusRejected 'input targeted ordinary field' { param($f) $f.Proof.events[2].target = 'b' }
+Assert-DelayedStimulusRejected 'input occurred after focus moved' { param($f) $f.Proof.events[2].at = 146.0 }
+Assert-DelayedStimulusRejected 'input event absent' { param($f) $f.Proof.events = @($f.Proof.events | Where-Object type -ne 'input') }
+Assert-DelayedStimulusRejected 'duplicate input event' { param($f) $f.Proof.events += $f.Proof.events[2] }
+if ($checks.Count -ne 53) { throw "Browser outcome regression discovery was incomplete: $($checks.Count)" }
 Write-Output "PASS: $($checks.Count) browser outcome helper assertions"

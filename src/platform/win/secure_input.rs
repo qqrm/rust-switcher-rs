@@ -9,8 +9,8 @@ use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicBool, AtomicIsize, Ordering},
+        Arc, LazyLock, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -55,6 +55,7 @@ const POINTER_ANCESTOR_LIMIT: usize = 8;
 const POINTER_FOCUS_ATTEMPTS: usize = 75;
 const POINTER_FOCUS_INTERVAL: Duration = Duration::from_millis(1);
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
+const IDENTITY_CACHE_CAPACITY: usize = 64;
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 // At most the bounded capture queue plus its current consumer can own entries.
 // Old queued work must not mark unrelated later native contexts incomplete.
@@ -64,6 +65,8 @@ static FOCUS_HOOKS_READY: OnceLock<bool> = OnceLock::new();
 // UIA callbacks run on another thread. Preserve snapshot-to-submission ordering
 // against their focus refreshes without ever waiting on the keyboard hook.
 static CAPTURE_DISPATCH: Mutex<()> = Mutex::new(());
+static PUBLISHED_IDENTITIES: LazyLock<IdentityPublications> =
+    LazyLock::new(IdentityPublications::new);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Status {
@@ -84,6 +87,52 @@ struct Target {
     focus: usize,
     thread: u32,
     process: u32,
+}
+
+/// Only native target metadata and monotonic revisions cross into the hook.
+/// COM interfaces remain owned by the provider worker.
+struct IdentityPublications {
+    frontier: AtomicU64,
+    targets: Mutex<HashMap<Target, u64>>,
+}
+
+impl IdentityPublications {
+    fn new() -> Self {
+        Self {
+            frontier: AtomicU64::new(0),
+            targets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn frontier(&self) -> u64 {
+        self.frontier.load(Ordering::Acquire)
+    }
+
+    fn at_admission(&self, target: Target, entry_frontier: u64) -> Option<u64> {
+        // Never wait behind a provider publication on the keyboard hook. A
+        // revision established during target lookup cannot label an older key.
+        let targets = self.targets.try_lock().ok()?;
+        targets
+            .get(&target)
+            .copied()
+            .filter(|revision| *revision <= entry_frontier)
+    }
+
+    fn publish(&self, target: Target, changed: bool, forget: bool) -> u64 {
+        let mut targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if forget || (targets.len() >= IDENTITY_CACHE_CAPACITY && !targets.contains_key(&target)) {
+            targets.clear();
+        }
+        if !changed && let Some(revision) = targets.get(&target) {
+            return *revision;
+        }
+        let revision = self.frontier.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        targets.insert(target, revision);
+        revision
+    }
 }
 
 impl Target {
@@ -127,6 +176,7 @@ struct Capture {
     key: CapturedKey,
     target: Target,
     generation: u64,
+    identity_revision: Option<u64>,
     captured: Instant,
     _pending: PendingCapture,
 }
@@ -205,16 +255,21 @@ enum Command {
 struct Verdict {
     status: Status,
     element_changed: bool,
-    // A pointer provider may have waited while raw keys entered the FIFO. Those
-    // snapshots must not inherit an identity established only after their input.
-    pointer_anchor: bool,
+    identity: MetadataIdentity,
+}
+
+#[derive(Clone, Copy)]
+enum MetadataIdentity {
+    Native,
+    Published(u64),
+    Unavailable,
 }
 
 impl Verdict {
     const UNKNOWN: Self = Self {
         status: Status::Unknown,
         element_changed: false,
-        pointer_anchor: false,
+        identity: MetadataIdentity::Unavailable,
     };
 }
 
@@ -330,14 +385,19 @@ impl Provider {
         if !stable || !request.is_current() {
             return Verdict::UNKNOWN;
         }
-        if self.elements.len() >= 64 && !self.elements.contains_key(&request.probe.target) {
+        let forget = self.elements.len() >= IDENTITY_CACHE_CAPACITY
+            && !self.elements.contains_key(&request.probe.target);
+        if forget {
             self.elements.clear();
         }
         self.elements.insert(request.probe.target, element);
+        // A queued snapshot retains the revision visible at hook entry. Neither
+        // this observation nor a later Capture may retroactively relabel it.
+        let revision = PUBLISHED_IDENTITIES.publish(request.probe.target, element_changed, forget);
         Verdict {
             status,
             element_changed,
-            pointer_anchor: matches!(request.source, ProbeSource::Pointer(_)),
+            identity: MetadataIdentity::Published(revision),
         }
     }
 }
@@ -664,6 +724,7 @@ unsafe extern "system" fn focus_changed(
 /// permitted on the hook path.
 pub(crate) fn initialize(hwnd: HWND) {
     MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
+    LazyLock::force(&PUBLISHED_IDENTITIES);
     FOCUS_HOOKS_READY.get_or_init(|| {
         let foreground = unsafe {
             SetWinEventHook(
@@ -726,7 +787,7 @@ fn verdict(
         return Verdict {
             status,
             element_changed: false,
-            pointer_anchor: false,
+            identity: MetadataIdentity::Native,
         };
     }
     if FOCUS_HOOKS_READY.get() != Some(&true) {
@@ -766,14 +827,15 @@ fn process_command(
             if !capture_is_current(&capture) {
                 return Status::Unknown;
             }
-            if !result.status.is_allowed() || result.element_changed {
+            if !capture_metadata_allows(capture.identity_revision, result) {
                 tracing::debug!(status = ?result.status, element_changed = result.element_changed,
+                    identity_matches = identity_matches(capture.identity_revision, result.identity),
                     "secure input: capture metadata rejected");
                 reject_probe(Probe {
                     target: capture.target,
                     generation: capture.generation,
                 });
-                return result.status;
+                return Status::Unknown;
             }
             let typed = ring_buffer::record_captured_keydown(&capture.key, capture.generation);
             // Native focus can change while decoding, before its WinEvent is
@@ -834,24 +896,15 @@ fn complete_refresh(
     result: Verdict,
     target_is_current: impl FnOnce() -> bool,
 ) -> Status {
-    // Provider work has finished before this barrier. A hook snapshot already
-    // in progress must finish registering its pending lease and submitting it
-    // before we inspect the FIFO's ownership. New hooks still use try_lock and
-    // reject their prefix instead of waiting for this coordinator.
-    let _dispatch = (result.pointer_anchor || !result.status.is_allowed()).then(|| {
+    // Denied observations must account for snapshots whose pending lease is
+    // still being registered. Successful observations publish an identity
+    // revision; an older snapshot cannot inherit that later publication.
+    let _dispatch = (!result.status.is_allowed()).then(|| {
         CAPTURE_DISPATCH
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     });
     if !validate_capture_generation(request.generation) || !target_is_current() {
-        return Status::Unknown;
-    }
-    if result.pointer_anchor && pending_capture_for_generation(request.generation) {
-        tracing::debug!(
-            reason = "input_during_pointer_probe",
-            "secure input: pointer anchor rejected"
-        );
-        reject_probe(request);
         return Status::Unknown;
     }
     apply_refresh_metadata(request, result, |request| {
@@ -889,6 +942,21 @@ fn apply_refresh_metadata(
     result.status
 }
 
+fn identity_matches(captured: Option<u64>, observed: MetadataIdentity) -> bool {
+    match observed {
+        // Standard Edit/RichEdit already binds input to its native HWND.
+        MetadataIdentity::Native => true,
+        MetadataIdentity::Published(revision) => captured == Some(revision),
+        MetadataIdentity::Unavailable => false,
+    }
+}
+
+fn capture_metadata_allows(captured: Option<u64>, result: Verdict) -> bool {
+    result.status.is_allowed()
+        && !result.element_changed
+        && identity_matches(captured, result.identity)
+}
+
 fn capture_is_current(capture: &Capture) -> bool {
     if !validate_capture_generation(capture.generation) {
         tracing::debug!(reason = "stale_epoch", "secure input: capture rejected");
@@ -923,6 +991,9 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
     if ring_buffer::is_modifier_vk(virtual_key) {
         return;
     }
+    // Sample before native lookup or the raw snapshot. The target-specific
+    // lookup below refuses any revision published after this hook entry.
+    let identity_frontier = PUBLISHED_IDENTITIES.frontier();
     let observed = capture_generation();
     let Some(_dispatch) = begin_capture_dispatch(observed) else {
         return;
@@ -947,6 +1018,7 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         clear_sensitive_context();
         return;
     }
+    let identity_revision = PUBLISHED_IDENTITIES.at_admission(target, identity_frontier);
     let Some(key) = ring_buffer::capture_keydown(kb, vk) else {
         return;
     };
@@ -963,6 +1035,7 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         key,
         target,
         generation: expected,
+        identity_revision,
         captured: Instant::now(),
         _pending: PendingCapture::new(expected),
     };
@@ -1344,12 +1417,154 @@ mod tests {
         }
     }
 
-    fn pointer_test_verdict(pointer_anchor: bool) -> Verdict {
+    fn published_test_verdict(revision: u64, element_changed: bool) -> Verdict {
         Verdict {
             status: Status::NotSecure,
-            element_changed: true,
-            pointer_anchor,
+            element_changed,
+            identity: MetadataIdentity::Published(revision),
         }
+    }
+
+    #[test]
+    fn publication_after_hook_entry_cannot_label_its_target_or_snapshot() {
+        let publications = IdentityPublications::new();
+        let target = pointer_test_probe(0).target;
+        let initial = publications.publish(target, true, false);
+        let entry = publications.frontier();
+        let snapshot = publications.at_admission(target, entry);
+        assert_eq!(snapshot, Some(initial));
+        let changed = publications.publish(target, true, false);
+        assert_ne!(initial, changed);
+        // Publication can occur while native target lookup is still running,
+        // or after its raw snapshot. Neither path may inherit the new identity.
+        assert_eq!(publications.at_admission(target, entry), None);
+        let fresh = published_test_verdict(changed, false);
+        assert!(!capture_metadata_allows(None, fresh));
+        assert!(!capture_metadata_allows(snapshot, fresh));
+        let later = publications.at_admission(target, publications.frontier());
+        assert!(capture_metadata_allows(later, fresh));
+        assert_eq!(publications.publish(target, false, false), changed);
+    }
+
+    #[test]
+    fn absent_or_contended_publications_never_supply_a_default_identity() {
+        let publications = IdentityPublications::new();
+        let target = pointer_test_probe(0).target;
+        assert_eq!(
+            publications.at_admission(target, publications.frontier()),
+            None
+        );
+        let revision = publications.publish(target, true, false);
+        let locked = publications.targets.lock().unwrap();
+        let start = Instant::now();
+        let missing = publications.at_admission(target, publications.frontier());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(missing, None);
+        drop(locked);
+        assert!(!capture_metadata_allows(
+            missing,
+            published_test_verdict(revision, false)
+        ));
+        assert!(!capture_metadata_allows(Some(revision), Verdict::UNKNOWN));
+        for status in [Status::Secure, Status::Unknown] {
+            assert!(!capture_metadata_allows(
+                Some(revision),
+                Verdict {
+                    status,
+                    ..published_test_verdict(revision, false)
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn evicted_or_reused_native_targets_never_reuse_a_publication() {
+        let publications = IdentityPublications::new();
+        let target = pointer_test_probe(0).target;
+        let original = publications.publish(target, true, false);
+        for index in 0..IDENTITY_CACHE_CAPACITY {
+            publications.publish(
+                Target {
+                    focus: index + 2,
+                    ..target
+                },
+                true,
+                false,
+            );
+        }
+        assert!(publications.targets.lock().unwrap().len() <= IDENTITY_CACHE_CAPACITY);
+        assert_eq!(
+            publications.at_admission(target, publications.frontier()),
+            None
+        );
+        let republished = publications.publish(target, false, false);
+        assert_ne!(original, republished);
+        assert!(!capture_metadata_allows(
+            Some(original),
+            published_test_verdict(republished, false)
+        ));
+        let reused_handle = Target {
+            process: target.process + 1,
+            ..target
+        };
+        assert_eq!(
+            publications.at_admission(reused_handle, publications.frontier()),
+            None
+        );
+        let replacement = publications.publish(reused_handle, true, false);
+        assert_ne!(republished, replacement);
+        let forgotten = publications.publish(target, false, true);
+        assert_ne!(republished, forgotten);
+        assert_eq!(
+            publications.at_admission(reused_handle, publications.frontier()),
+            None
+        );
+    }
+
+    #[test]
+    fn publication_before_snapshot_submission_cannot_reauthorize_the_key() {
+        use std::{sync::mpsc, thread};
+
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        let generation = capture_generation();
+        let request = pointer_test_probe(generation);
+        let publications = Arc::new(IdentityPublications::new());
+        let old = publications.publish(request.target, true, false);
+        let snapshot_publications = Arc::clone(&publications);
+        let (started, observed) = mpsc::channel();
+        let (finish, resume) = mpsc::channel();
+        let snapshot = thread::spawn(move || {
+            let frontier = snapshot_publications.frontier();
+            let _dispatch = begin_capture_dispatch(generation).unwrap();
+            let revision = snapshot_publications.at_admission(request.target, frontier);
+            started.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(2)).unwrap();
+            (revision, PendingCapture::new(generation))
+        });
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!pending_capture_for_generation(generation));
+        // A provider can finish an older Refresh while the raw snapshot has
+        // not yet registered its lease or entered the capture FIFO.
+        let promoted = publications.publish(request.target, true, false);
+        assert_ne!(old, promoted);
+        assert_eq!(
+            complete_refresh(request, published_test_verdict(promoted, true), || true),
+            Status::NotSecure
+        );
+        finish.send(()).unwrap();
+        let (captured, pending) = snapshot.join().unwrap();
+        assert_eq!(captured, Some(old));
+        assert!(!capture_metadata_allows(
+            captured,
+            published_test_verdict(promoted, false)
+        ));
+        reject_probe(request);
+        assert!(!validate_capture_generation(generation));
+        ring_buffer::push_text("late-suffix");
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        drop(pending);
+        ring_buffer::clear_secure_input_data();
     }
 
     #[test]
@@ -1368,7 +1583,7 @@ mod tests {
                     Verdict {
                         status,
                         element_changed: false,
-                        pointer_anchor: false,
+                        identity: MetadataIdentity::Published(1),
                     },
                     |request| {
                         // Isolate the shared status policy from live native
@@ -1397,7 +1612,7 @@ mod tests {
                     Verdict {
                         status: Status::NotSecure,
                         element_changed: false,
-                        pointer_anchor: false,
+                        identity: MetadataIdentity::Published(1),
                     },
                     || true,
                 ),
@@ -1408,18 +1623,27 @@ mod tests {
             drop(pending);
             // Unknown is a positive control: synthetic decoding must really
             // append, so the Secure rejection cannot pass through a fake HWND.
-            assert_eq!(ring_buffer::runs_snapshot().is_empty(), status == Status::Secure);
+            assert_eq!(
+                ring_buffer::runs_snapshot().is_empty(),
+                status == Status::Secure
+            );
         }
         ring_buffer::clear_secure_input_data();
     }
 
-    fn run_pointer_fifo_case(pointer_anchor: bool, key_during_wait: bool) -> (Status, usize, bool) {
+    fn run_publication_fifo_case(
+        pointer: bool,
+        changed: bool,
+        key_during_probe: bool,
+        enforce_revision: bool,
+    ) -> (Status, usize, bool) {
         use std::sync::mpsc;
 
         enum Action {
-            Pointer,
+            Refresh,
             Capture {
                 generation: u64,
+                identity_revision: Option<u64>,
                 pending: PendingCapture,
             },
         }
@@ -1427,80 +1651,136 @@ mod tests {
         ring_buffer::clear_secure_input_data();
         let generation = capture_generation();
         let request = pointer_test_probe(generation);
-        let focused = Arc::new(AtomicUsize::new(0)); // Password A still owns input.
+        let publications = Arc::new(IdentityPublications::new());
+        publications.publish(request.target, true, false);
+        let worker_publications = Arc::clone(&publications);
+        let focused = Arc::new(AtomicUsize::new(usize::from(!changed)));
         let worker_focus = Arc::clone(&focused);
         let appended = Arc::new(AtomicUsize::new(0));
         let worker_appended = Arc::clone(&appended);
         let (waiting, observed_wait) = mpsc::channel();
         let (focus_changed, resume_probe) = mpsc::channel();
         let (completed, results) = mpsc::channel();
-        let worker = BoundedWorker::start("pointer-admission-test", move || {
-            move |action| {
-                let result = match action {
-                    Action::Pointer => {
-                        // The real anchor-wait helper confirms ordinary B only
-                        // after the test has queued A's input when requested.
-                        assert_eq!(
-                            wait_for_pointer_focus(
-                                1,
-                                |anchor| Some(*anchor == worker_focus.load(Ordering::Acquire)),
-                                || {
-                                    waiting.send(()).unwrap();
-                                    resume_probe.recv_timeout(Duration::from_secs(2)).unwrap();
-                                    true
-                                },
-                            ),
-                            Some(1)
-                        );
-                        complete_refresh(request, pointer_test_verdict(pointer_anchor), || true)
-                    }
-                    Action::Capture {
-                        generation,
-                        pending,
-                    } => {
-                        // Synthetic decoding isolates admission from Windows
-                        // focus/keyboard setup. The real epoch and journal are
-                        // used, and the negative control must actually append.
-                        let result = if validate_capture_generation(generation) {
-                            ring_buffer::push_text("x");
-                            if !ring_buffer::runs_snapshot().is_empty() {
-                                worker_appended.fetch_add(1, Ordering::Relaxed);
+        let worker = BoundedWorker::start_with_expiration(
+            "identity-admission-test",
+            8,
+            move || {
+                move |action| {
+                    let result = match action {
+                        Action::Refresh => {
+                            // Pause the real FIFO while the old identity is still
+                            // published. This models either a focused Refresh or
+                            // pointer COM work preceding anchor confirmation.
+                            if pointer && changed {
+                                assert_eq!(
+                                    wait_for_pointer_focus(
+                                        1,
+                                        |anchor| Some(
+                                            *anchor == worker_focus.load(Ordering::Acquire)
+                                        ),
+                                        || {
+                                            waiting.send(()).unwrap();
+                                            resume_probe
+                                                .recv_timeout(Duration::from_secs(2))
+                                                .unwrap();
+                                            true
+                                        },
+                                    ),
+                                    Some(1)
+                                );
+                            } else {
+                                waiting.send(()).unwrap();
+                                resume_probe.recv_timeout(Duration::from_secs(2)).unwrap();
                             }
-                            Status::NotSecure
-                        } else {
-                            Status::Unknown
-                        };
-                        drop(pending);
-                        result
-                    }
-                };
-                completed.send(result).unwrap();
-                result
-            }
-        })
+                            if pointer && !changed {
+                                assert_eq!(
+                                    wait_for_pointer_focus(
+                                        1,
+                                        |anchor| Some(
+                                            *anchor == worker_focus.load(Ordering::Acquire)
+                                        ),
+                                        || panic!("the frozen anchor should now own focus"),
+                                    ),
+                                    Some(1)
+                                );
+                            }
+                            let revision =
+                                worker_publications.publish(request.target, changed, false);
+                            complete_refresh(
+                                request,
+                                published_test_verdict(revision, changed),
+                                || true,
+                            )
+                        }
+                        Action::Capture {
+                            generation,
+                            identity_revision,
+                            pending,
+                        } => {
+                            // Synthetic decoding isolates admission from Windows
+                            // focus/keyboard setup. Use the production revision
+                            // policy, real epoch and journal, with an old-policy
+                            // positive control that must actually append.
+                            let revision =
+                                worker_publications.publish(request.target, false, false);
+                            let fresh = published_test_verdict(revision, false);
+                            let allowed = !enforce_revision
+                                || capture_metadata_allows(identity_revision, fresh);
+                            let result = if !validate_capture_generation(generation) {
+                                Status::Unknown
+                            } else if allowed {
+                                ring_buffer::push_text("x");
+                                if !ring_buffer::runs_snapshot().is_empty() {
+                                    worker_appended.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Status::NotSecure
+                            } else {
+                                reject_probe(Probe {
+                                    generation,
+                                    ..request
+                                });
+                                Status::Unknown
+                            };
+                            drop(pending);
+                            result
+                        }
+                    };
+                    completed.send(result).unwrap();
+                    result
+                }
+            },
+            |_| {},
+        )
         .unwrap();
-        assert!(worker.submit(Action::Pointer, Duration::from_secs(2)));
+        assert!(worker.submit(Action::Refresh, Duration::from_secs(2)));
         observed_wait.recv_timeout(Duration::from_secs(2)).unwrap();
         let enqueue_capture = || {
+            let frontier = publications.frontier();
             let _dispatch = begin_capture_dispatch(generation).unwrap();
-            assert!(worker.submit(
-                Action::Capture {
-                    generation,
-                    pending: PendingCapture::new(generation),
-                },
-                Duration::from_secs(2)
-            ));
+            let identity_revision = publications.at_admission(request.target, frontier);
+            for _ in 0..3 {
+                assert!(worker.submit(
+                    Action::Capture {
+                        generation,
+                        identity_revision,
+                        pending: PendingCapture::new(generation),
+                    },
+                    Duration::from_secs(2)
+                ));
+            }
         };
-        if key_during_wait {
+        if key_during_probe {
             enqueue_capture();
         }
         focused.store(1, Ordering::Release);
         focus_changed.send(()).unwrap();
-        let pointer_result = results.recv_timeout(Duration::from_secs(2)).unwrap();
-        if !key_during_wait {
+        let refresh_result = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        if !key_during_probe {
             enqueue_capture();
         }
-        let _ = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..3 {
+            let _ = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
         let appended = appended.load(Ordering::Relaxed);
         let current = validate_capture_generation(generation);
         if appended == 0 {
@@ -1508,27 +1788,35 @@ mod tests {
             assert!(ring_buffer::runs_snapshot().is_empty());
         }
         ring_buffer::clear_secure_input_data();
-        (pointer_result, appended, current)
+        (refresh_result, appended, current)
     }
 
     #[test]
-    fn pointer_completion_rejects_input_queued_before_its_anchor_was_confirmed() {
+    fn identity_promotion_cannot_relabel_an_already_queued_key() {
         let _guard = ring_buffer::test_guard();
-        // Removing the pointer barrier reproduces the incorrect A-key append.
-        // This control makes refusal non-vacuous despite synthetic decoding.
-        assert_eq!(
-            run_pointer_fifo_case(false, true),
-            (Status::NotSecure, 1, true)
-        );
-        assert_eq!(
-            run_pointer_fifo_case(true, true),
-            (Status::Unknown, 0, false)
-        );
-        // A confirmed anchor with no older pending input still captures normally.
-        assert_eq!(
-            run_pointer_fifo_case(true, false),
-            (Status::NotSecure, 1, true)
-        );
+        for pointer in [false, true] {
+            // An older queued Refresh and a waiting pointer anchor must both
+            // reject password-A input after they publish ordinary B. Disabling
+            // only revision binding reproduces the old erroneous append.
+            assert_eq!(
+                run_publication_fifo_case(pointer, true, true, false),
+                (Status::NotSecure, 3, true)
+            );
+            assert_eq!(
+                run_publication_fifo_case(pointer, true, true, true),
+                (Status::NotSecure, 0, false)
+            );
+            assert_eq!(
+                run_publication_fifo_case(pointer, true, false, true),
+                (Status::NotSecure, 3, true)
+            );
+            // A known, unchanged ordinary B remains usable while its pointer
+            // metadata is queried. Every key still needs its own fresh verdict.
+            assert_eq!(
+                run_publication_fifo_case(pointer, false, true, true),
+                (Status::NotSecure, 3, true)
+            );
+        }
     }
 
     #[test]
@@ -1542,11 +1830,21 @@ mod tests {
             Verdict {
                 status: Status::NotSecure,
                 element_changed: false,
-                pointer_anchor: false,
+                identity: MetadataIdentity::Native,
             },
             || true,
         );
         assert_eq!(result, Status::NotSecure);
+        let native = Verdict {
+            status: Status::NotSecure,
+            element_changed: false,
+            identity: MetadataIdentity::Native,
+        };
+        assert!(capture_metadata_allows(None, native));
+        assert!(capture_metadata_allows(Some(u64::MAX), native));
+        for status in [Status::Secure, Status::Unknown] {
+            assert!(!capture_metadata_allows(None, Verdict { status, ..native }));
+        }
         assert!(validate_capture_generation(generation));
         ring_buffer::push_text("known-native-input");
         assert!(!ring_buffer::runs_snapshot().is_empty());
@@ -1595,7 +1893,7 @@ mod tests {
         finish_snapshot.send(()).unwrap();
         let pending = lease.recv_timeout(Duration::from_secs(2)).unwrap();
         snapshot.join().unwrap();
-        assert_eq!(completion.join().unwrap(), Status::Unknown);
+        assert_eq!(completion.join().unwrap(), verdict.status);
         assert!(!validate_capture_generation(generation));
         ring_buffer::push_text("late-suffix");
         assert!(ring_buffer::runs_snapshot().is_empty());
@@ -1605,7 +1903,11 @@ mod tests {
 
     #[test]
     fn refresh_completion_waits_for_started_snapshot_to_register_its_lease() {
-        for verdict in [pointer_test_verdict(true), Verdict::UNKNOWN] {
+        for status in [Status::Secure, Status::Unknown] {
+            let verdict = Verdict {
+                status,
+                ..Verdict::UNKNOWN
+            };
             assert_refresh_waits_for_started_snapshot(verdict);
         }
     }
@@ -1636,8 +1938,12 @@ mod tests {
     }
 
     #[test]
-    fn contended_key_cannot_be_reopened_by_pointer_or_failed_observation() {
-        for verdict in [pointer_test_verdict(true), Verdict::UNKNOWN] {
+    fn contended_key_cannot_be_reopened_by_a_denied_observation() {
+        for status in [Status::Secure, Status::Unknown] {
+            let verdict = Verdict {
+                status,
+                ..Verdict::UNKNOWN
+            };
             assert_contended_key_stays_rejected(verdict);
         }
     }

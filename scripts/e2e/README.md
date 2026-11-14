@@ -28,7 +28,7 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Last typed sequence | Debug double Alt converts two words and short leading-dot inputs in external native Edit controls | Physical typing in release requires a separate VM with keyboard access |
 | First character after focus/modifiers | Debug journal matrix switches between two unowned external windows and two controls, releases Ctrl/Alt in the destination, and asserts exact before/after strings | Synthetic input and native Edit controls do not reproduce every Telegram/Qt or physical-keyboard interaction |
 | Browser fields and first-character timing | Debug Double Alt in a real Chrome/Edge process, two windows, input/textarea/contenteditable/shadow DOM/iframe fields, first-key timing and Tab/click navigation | Synthetic input and a local fixture do not prove behavior in the user's exact browser, extensions or web application |
-| Browser password fields | Six debug cases require a real UIA `IsPassword` signal without an Edit/RichEdit HWND, zero captured password characters, empty active/cache journals, blocked text hotkeys, same-HWND transitions, and ordinary-field recovery | Local synthetic passwords and the installed Chrome/Edge version; unknown custom controls and OS races are not universal guarantees |
+| Browser password fields | Seven debug cases require a real UIA `IsPassword` signal without an Edit/RichEdit HWND, zero captured password characters, empty active/cache journals, blocked text hotkeys, same-HWND transitions, and ordinary-field recovery | Local synthetic passwords and the installed Chrome/Edge version; unknown custom controls and OS races are not universal guarantees |
 | Password test sensitivity | A temporary source mutation makes UIA report ordinary input; the real browser suite must detect journal capture | This mutation targets the UIA password signal; native password styles and other guard layers have separate tests |
 | Journal capacity | Native Edit checks 99/100/101 characters; browser checks 101 with a letter and a leading dot; journal unit tests cover 4096 and overflow | Overflow refuses any conversion that reaches the discarded prefix; a complete last word after a retained boundary can still convert |
 | Automatic last-word conversion | Debug runtime toggle followed by a word and space | Other delimiters are not exercised by this GUI scenario |
@@ -183,7 +183,7 @@ directly; browser results establish which transitions occurred on that runner.
 
 ### Password input acceptance
 
-`browser-security-cases.ps1` adds exactly six cases to the browser suite. The
+`browser-security-cases.ps1` adds exactly seven cases to the browser suite. The
 browser starts with `--force-renderer-accessibility` so the runner exercises its
 real Windows UI Automation provider. Each protected fixture is an HTML password
 input: the harness verifies the focused element's `IsPassword` property and that
@@ -204,10 +204,26 @@ All tested input and hotkeys use `SendInput`. CDP changes only the owned fixture
 setup and reads its synthetic values. Tests cover normal-to-password clicks,
 Shift+Tab under the same native HWND, and changing the currently focused input
 from `text` to `password` without changing focus. No wait for the application's
-guard is inserted before the first password character. Last word, last sequence,
+guard is inserted between the tested transition and the first password character. Last word, last sequence,
 selected text, their smart variants, and AutoConvert must preserve the complete
 password. Pause and CapsLock layout switching must remain functional. Returning
 to ordinary contenteditable must journal and convert all of `ghbdtn` to `привет`.
+
+The delayed-focus case starts with verified password field A focused. Ordinary
+field B cancels the click's default focus change and schedules its own focus
+after 45 ms. A single native input batch sends the click and physical `g` key;
+there is no CDP call or protection probe between them. Trusted DOM key/input
+events must show that A received `g` before B gained focus, with B still empty
+and the same native HWND. The observed delay must be at least 25 ms and less
+than 75 ms; a missed timing window or wrong input owner fails the stimulus.
+After the transition, the physical capture counter must remain unchanged and
+all retained text must be empty, including after Double Alt and 2.25 seconds of
+observation. Escape starts a new segment in already-focused B, where fresh
+`ghbdtn` must become `привет` while A remains unchanged. This proves the observed
+password-to-ordinary transition; a deterministic unit test separately forces
+the internal pointer-wait branch. `test-browser-outcomes.ps1` also rejects
+untrusted/missing input events, wrong owners, invalid ordering, and out-of-range
+timestamps so an invalid stimulus cannot masquerade as a security finding.
 
 A debug-only, explicitly hosted inspection message (`0x83F0`) returns a version
 marker, active/cache character counts, a monotonic count of physical characters
@@ -226,7 +242,7 @@ longer than the two-second deferred-input lifetime, to detect delayed capture.
 The mandatory `run-security-mutation.ps1` gate temporarily makes the production
 UIA property helper report `NotSecure`, compiles a separate test executable, and
 restores both source bytes and the protected executable before continuing. It
-runs the same six browser cases with `-SecurityOnly`. The gate accepts only a
+runs the same seven browser cases with `-SecurityOnly`. The gate accepts only a
 nonzero exit containing the specific journal-capture assertion; build failures,
 missing inspection support, provider setup errors and timeouts do not count.
 No setting or feature to disable protection is added to release builds.

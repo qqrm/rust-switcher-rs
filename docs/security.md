@@ -42,7 +42,7 @@ non-password verdict. A sticky history marker survives cache restoration,
 conversion extraction, deletion, and trimming, so an empty buffer is not
 mistaken for a segment that has never received input.
 Confirmed password metadata always takes the strict rejection path, including
-an untouched segment; later ordinary metadata cannot authorize password-era keys.
+an untouched segment; later ordinary metadata cannot reopen that rejected context.
 
 ### Immediate focus changes
 
@@ -50,13 +50,23 @@ For pointer-driven focus changes, the UIA worker resolves the release position
 once and freezes the nearest explicitly keyboard-focusable control as its
 anchor. It accepts metadata only after that exact element becomes focused,
 within the existing provider deadline. A different focused field or ancestor
-cannot replace the anchor. Capture still rejects a changed element or unknown
-password metadata. Confirming an anchor cannot authorize raw snapshots already
-waiting for that confirmation: completion is serialized with snapshot admission,
-and pending input is rejected while its incomplete marker is retained. Native
-Edit/RichEdit style checks do not use this UIA waiting path.
-Hit testing is asynchronous; it does not establish the
-identity of an element replaced before the worker resolves that position.
+cannot replace the anchor. A raw snapshot records the UIA identity revision
+published for its native target before the hook entered. Its later,
+fresh password check must report the same identity. Publishing a new identity
+cannot reassign older queued keys to that field. Input for an already known,
+unchanged ordinary element can survive an overlapping pointer observation;
+an unclassified or changed identity cannot authorize it. Native Edit/RichEdit
+style checks do not use this UIA identity path.
+
+This is best-effort protection based on observable metadata, not proof of the
+element that received a physical key. UIA observations can miss a transient
+focus change. For example, if an ordinary field B is known, focus moves to a
+password field A without any usable observation, and returns to B before the
+next query, an unchanged identity cannot reveal where an intervening key went.
+Asynchronous hit testing also cannot establish the identity of an element
+replaced before the worker resolves that position. Rejecting keys that overlap
+a pointer query avoids that ambiguity for those keys but also rejects ordinary
+typing after redundant clicks; this implementation does not make that tradeoff.
 
 A click can move between browser fields before their asynchronous accessibility
 notification reaches Rust Switcher. If the first queued key observes a different
@@ -107,6 +117,14 @@ empty active and cached journals, an unavailable-prefix marker, and no physical
 character appended since the pointer-down boundary. A refusal must then recover
 through selection conversion and a fresh input segment in the same control.
 These cases do not insert a readiness wait before the tested first key.
+
+A separate delayed-focus case keeps password field A focused during a click on
+ordinary field B, sends one native key in the same input batch, and then moves
+focus to B. Trusted browser events must prove that A received the key before
+the actual focus event. The test requires unchanged capture counters and empty
+journals through conversion and the deferred-input lifetime, followed by exact
+conversion of a new ordinary segment. Invalid timing or ownership is a failed
+stimulus, not evidence of successful protection.
 
 `proptest` generates event histories and shrinks failing traces. Five portable
 properties compare real journal operations with an independent physical-input

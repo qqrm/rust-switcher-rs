@@ -201,6 +201,21 @@ public static class BrowserInput {
         var up = down; up.data.mouse.flags = 4;
         Send(new[] {down, up});
     }
+    public static InputTrace ClickThenTypeKey(IntPtr window, int x, int y, ushort key) {
+        RECT bounds;
+        if (GetForegroundWindow() != window || !GetWindowRect(window, out bounds) ||
+            x <= bounds.left || x >= bounds.right || y <= bounds.top || y >= bounds.bottom)
+            throw new InvalidOperationException("Click is outside the owned browser window");
+        if (!SetCursorPos(x, y)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not position fixture pointer");
+        var result = new InputTrace {before = Snapshot(window)};
+        var down = new INPUT(); down.type = 0; down.data.mouse.flags = 2;
+        var up = down; up.data.mouse.flags = 4;
+        // One ordered native batch: no CDP or guard observation between pointer and key.
+        Send(new[] {down, up, Event(key, false), Event(key, true)});
+        result.afterFirst = Snapshot(window);
+        result.afterRest = result.afterFirst;
+        return result;
+    }
 }
 '@
 if ([BrowserInput]::InputSize() -ne $(if ([IntPtr]::Size -eq 8) {40} else {28})) {
@@ -636,8 +651,8 @@ try {
     $securityStart = $results.Count
     & (Join-Path $PSScriptRoot 'browser-security-cases.ps1') -Sessions $sessions `
         -SwitcherProcess $switcher -Results $results -Failures $failures
-    if ($results.Count - $securityStart -ne 6) {
-        throw "Expected 6 browser password cases, found $($results.Count - $securityStart)"
+    if ($results.Count - $securityStart -ne 7) {
+        throw "Expected 7 browser password cases, found $($results.Count - $securityStart)"
     }
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
 } catch {

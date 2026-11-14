@@ -116,6 +116,50 @@ function Tap-PasswordChord([ushort]$Key, [int]$Count) {
     }
 }
 
+function Assert-DelayedPasswordStimulus($Proof, $Values) {
+    # Invalid timing or input ownership is a failed stimulus, never proof that
+    # password capture was blocked. Check this before any security sentinel.
+    if ($null -eq $Proof -or $null -eq $Values -or
+        $Proof.complete -isnot [bool] -or -not $Proof.complete -or
+        $Proof.prevented -isnot [bool] -or -not $Proof.prevented -or
+        $Proof.delayMs -ne 45 -or $Proof.downOwner -cne 'a' -or $Proof.finalOwner -cne 'b' -or
+        $Values.a -cne 'g' -or $Values.b -cne '') {
+        throw 'Delayed password stimulus did not preserve the real input owner'
+    }
+    foreach ($value in @($Proof.downAt, $Proof.focusAt)) {
+        if ($null -eq $value -or $value -is [string] -or
+            -not [double]::IsFinite([double]$value) -or $value -lt 0) {
+            throw 'Delayed password stimulus has invalid timestamps'
+        }
+    }
+    $delay = $Proof.focusAt - $Proof.downAt
+    if ($delay -lt 25 -or $delay -ge 75) {
+        throw "Delayed password focus was outside the 25..75 ms stimulus interval: $delay ms"
+    }
+    $previous = $Proof.downAt
+    foreach ($expected in @(
+        @{type = 'mouseup'; target = 'b'; key = ''; data = ''},
+        @{type = 'keydown'; target = 'a'; key = 'g'; data = ''},
+        @{type = 'input'; target = 'a'; key = ''; data = 'g'},
+        @{type = 'keyup'; target = 'a'; key = 'g'; data = ''},
+        @{type = 'focusin'; target = 'b'; key = ''; data = ''}
+    )) {
+        $events = @($Proof.events | Where-Object { $_.type -ceq $expected.type })
+        if ($events.Count -ne 1) { throw "Delayed password stimulus requires one $($expected.type) event" }
+        $event = $events[0]
+        if ($event.target -cne $expected.target -or $event.key -cne $expected.key -or
+            $event.data -cne $expected.data -or $event.trusted -isnot [bool] -or -not $event.trusted -or
+            $null -eq $event.at -or $event.at -is [string] -or -not [double]::IsFinite([double]$event.at) -or
+            $event.at -lt $previous -or
+            ($expected.type -ne 'focusin' -and $event.at -ge $Proof.focusAt) -or
+            ($expected.type -eq 'focusin' -and $event.at -ne $Proof.focusAt)) {
+            throw "Delayed password stimulus has invalid $($expected.type) ownership or ordering"
+        }
+        $previous = $event.at
+    }
+    return $delay
+}
+
 function Invoke-PasswordCase([string]$Name, [scriptblock]$Action) {
     $record = [ordered]@{name = "browser password $Name"; error = $null; details = @{}}
     try { & $Action $record.details } catch { $record.error = $_.Exception.Message }
@@ -213,6 +257,64 @@ Invoke-PasswordCase 'same native HWND keyboard transition' {
     if ($details.provider.focus -ne $nativeBefore) { throw 'Tab fixture did not preserve its native focus HWND' }
     Assert-PasswordStable 'ghbdtn' $before 2250
     $details.after = Assert-NoPasswordCapture $before
+}
+
+Invoke-PasswordCase 'delayed ordinary focus never captures the preceding password key' {
+    param($details)
+    Reset-PasswordFixture
+    Focus-BrowserEditor $session 'a'
+    $details.passwordProvider = Assert-BrowserPassword $true
+    Tap-BrowserKey 0x1B
+    $before = Read-SecurityState
+    Assert-NoPasswordCapture $before 1000 | Out-Null
+    $nativeBefore = [BrowserInput]::Snapshot($session.Handle)
+    Assert-BrowserTargetFocus $nativeBefore (Get-BrowserFocusSnapshot $session) 'a' ($session.Handle.ToInt64())
+    $expectedValues = @{}
+    foreach ($sessionId in @('a', 'b')) {
+        $values = Read-Browser $Sessions[$sessionId] 'fixture.values()'
+        foreach ($field in @('a', 'b', 'guard')) { $expectedValues["$sessionId/$field"] = $values.$field }
+    }
+    $point = Read-Browser $session "fixture.point('b')"
+    Read-Browser $session 'fixture.armDelayedFocus(45)' | Out-Null
+    $details.before = $before
+    $details.inputTrace = [BrowserInput]::ClickThenTypeKey($session.Handle, $point.x, $point.y, 0x47)
+    # Everything above prepares the stimulus. This first observation follows
+    # the entire native click/key batch and cannot make its input owner ready.
+    $details.immediateState = Read-SecurityState
+    Wait-Browser { (Read-Browser $session 'fixture.delayedFocusState()').complete } 'delayed ordinary browser focus'
+    $details.stimulus = Read-Browser $session 'fixture.delayedFocusState()'
+    $details.focusDelayMs = Assert-DelayedPasswordStimulus $details.stimulus (Read-Browser $session 'fixture.values()')
+    $details.focusAfter = Get-BrowserFocusSnapshot $session
+    foreach ($native in @($details.inputTrace.before, $details.inputTrace.afterFirst)) {
+        Assert-BrowserTargetFocus $native $details.focusAfter 'b' ($session.Handle.ToInt64())
+    }
+    Assert-BrowserTargetFocus $nativeBefore $details.focusAfter 'b' ($session.Handle.ToInt64())
+    $expectedValues['a/a'] = 'g'
+    Assert-BrowserOtherFields $Sessions $expectedValues
+    $details.ordinaryProvider = Assert-BrowserPassword $false 'b'
+    Assert-NoPasswordCapture $before 1000 | Out-Null
+    Tap-PasswordChord 0xA4 2
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-NoPasswordCapture $before | Out-Null
+        Assert-BrowserOtherFields $Sessions $expectedValues
+        Start-Sleep -Milliseconds 25
+    } while ($clock.ElapsedMilliseconds -lt 2250)
+    $details.after = Assert-NoPasswordCapture $before
+    $details.fieldsUnchanged = $true
+
+    # Recovery stays in the already focused ordinary field. Its explicit new
+    # segment must capture every fresh character without reading the password.
+    Assert-BrowserTargetFocus $nativeBefore (Get-BrowserFocusSnapshot $session) 'b' ($session.Handle.ToInt64())
+    Tap-BrowserKey 0x1B
+    Set-BrowserEnglish $session
+    Type-NormalFixture $session 'b' 'ghbdtn'
+    Tap-PasswordChord 0xA4 2
+    Wait-Browser { (Read-Browser $session 'fixture.values()').b -ceq 'привет' } 'ordinary recovery after delayed password focus'
+    $expectedValues['a/b'] = 'привет'
+    Assert-BrowserOtherFields $Sessions $expectedValues
+    Assert-BrowserTargetFocus $nativeBefore (Get-BrowserFocusSnapshot $session) 'b' ($session.Handle.ToInt64())
+    $details.recovery = @{password = 'g'; ordinary = 'привет'; after = Read-SecurityState}
 }
 
 Invoke-PasswordCase 'focused input changes from text to password' {
