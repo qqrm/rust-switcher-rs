@@ -71,12 +71,13 @@ a newer revision or a different target.
 The next successful observation must establish a fresh revision, so keys bound
 to the retired one remain rejected.
 
-A raw-input reset can supersede a query without changing the observed field.
-That old query cannot affect the new journal generation. It may retain its
-identity only if its explicit non-password metadata, UIA focus, native target,
-and deadline remain valid. A fully validated ordinary observation may likewise
-retain its identity when only reply delivery expires. Every later key still
-requires its own fresh validation; neither case reauthorizes older input.
+A raw-input reset can supersede a query without changing an already accepted
+field. That old query cannot affect the new journal generation. It may retain
+its identity only when the observed element matches the accepted owner and its
+explicit non-password metadata, UIA focus, native target, and deadline remain
+valid. A fully validated ordinary observation may likewise retain its identity
+when only reply delivery expires. Every later key still requires its own fresh
+validation; neither case reauthorizes older input.
 
 The provider remembers a changed ordinary element for journal ownership only
 after clearing that target's retained history under its generation check. If
@@ -87,6 +88,9 @@ generation changed first and acceptance fails, or the old prefix was cleared
 before it could be cached. Failed, sensitive, and superseded observations do not
 replace the last accepted COM identity. UIA calls finish before the journal lock
 is acquired, and the accepted COM interface is stored after that lock is released.
+If a changed field never completes acceptance, its provisional revision is
+retired, including when only a raw reset superseded otherwise valid metadata.
+Returning to the old accepted field cannot reuse that unaccepted field's token.
 
 This is best-effort protection based on observable metadata, not proof of the
 element that received a physical key. UIA observations can miss a transient

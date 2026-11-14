@@ -458,11 +458,12 @@ fn probe_observed_identity(
         return Verdict::UNKNOWN;
     }
     if !generation_is_current() {
-        // Navigation can supersede the old journal request while its ordinary
-        // element, native target and deadline remain valid. The old command
-        // cannot mutate the new journal, but retiring this still-valid identity
-        // would also invalidate new-generation keys that observed it in time.
-        if !denied {
+        // An unaccepted owner must not leave a publication that a later return
+        // to the accepted owner could reuse as "unchanged". Only an already
+        // accepted ordinary identity can survive this navigation cancellation.
+        if !denied && element_changed {
+            retire_identity(revision);
+        } else if !denied {
             tracing::debug!(
                 revision,
                 "secure input: superseded probe kept valid ordinary identity"
@@ -471,10 +472,10 @@ fn probe_observed_identity(
         return Verdict::UNKNOWN;
     }
     // Only an atomic discard for this target can authorize replacing the
-    // accepted identity. A pure raw reset may preserve the provisional identity
-    // while still preventing this old observation from committing its owner.
+    // accepted identity. A reset between the generation check and that discard
+    // must also retire the provisional owner, without restoring an older token.
     if !denied && !accept_identity() {
-        if !metadata_is_current() {
+        if element_changed || !metadata_is_current() {
             retire_identity(revision);
         }
         return Verdict::UNKNOWN;
@@ -1835,10 +1836,9 @@ mod tests {
             );
         } else if interruption == IdentityInterruption::RawResetBeforeAcceptance {
             assert_eq!(interrupted.status, Status::Unknown);
-            assert!(
-                publications
-                    .at_admission(request.target, publications.frontier())
-                    .is_some()
+            assert_eq!(
+                publications.at_admission(request.target, publications.frontier()),
+                None,
             );
             assert_eq!(accepted.get(), 'C');
         }
@@ -2006,6 +2006,188 @@ mod tests {
         ring_buffer::test_switch_foreground(202, 1_300);
         assert_eq!(ring_buffer::runs_snapshot(), other_runs);
         ring_buffer::clear_secure_input_data();
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum UnacceptedOwnerPause {
+        Metadata,
+        Acceptance,
+    }
+
+    fn run_unaccepted_owner_case(
+        pause: UnacceptedOwnerPause,
+        changed: bool,
+        retirement: bool,
+    ) -> usize {
+        use std::{cell::Cell, sync::mpsc};
+
+        enum Action {
+            Observe,
+            Capture {
+                generation: u64,
+                revision: Option<u64>,
+                pending: PendingCapture,
+            },
+        }
+
+        ring_buffer::clear_secure_input_data();
+        let old_generation = capture_generation();
+        let request = pointer_test_probe(old_generation);
+        let publications = Arc::new(IdentityPublications::new());
+        let accepted_revision = publications.publish(request.target, true, false);
+        let worker_publications = Arc::clone(&publications);
+        let (blocked, observing) = mpsc::channel();
+        let (finish, resume) = mpsc::channel();
+        let (completed, results) = mpsc::channel();
+        let worker = BoundedWorker::start_with_expiration(
+            "unaccepted-owner-test",
+            1,
+            move || {
+                let accepted = Cell::new('C');
+                move |action| {
+                    let appended = match action {
+                        Action::Observe => {
+                            let wait = || {
+                                blocked.send(()).unwrap();
+                                resume.recv_timeout(Duration::from_secs(2)).unwrap();
+                            };
+                            let observed = if changed { 'B' } else { 'C' };
+                            let result = probe_observed_identity(
+                                accepted.get() != observed,
+                                (|| validate_capture_generation(old_generation), || true),
+                                || worker_publications.publish(request.target, changed, false),
+                                |revision| {
+                                    // Disabling only orphan retirement reproduces the
+                                    // prior wrong-owner append through the same policy.
+                                    if retirement {
+                                        worker_publications.retire(request.target, revision);
+                                    }
+                                },
+                                || {
+                                    if pause == UnacceptedOwnerPause::Metadata {
+                                        wait();
+                                    }
+                                    Status::NotSecure
+                                },
+                                || true,
+                                || {
+                                    if pause == UnacceptedOwnerPause::Acceptance {
+                                        wait();
+                                    }
+                                    accept_observed_identity(request, changed, || {
+                                        accepted.set(observed);
+                                    })
+                                },
+                            );
+                            // B was ordinary, stable and natively current for the
+                            // entire observation. Only the raw reset canceled it.
+                            assert_eq!(accepted.get(), 'C');
+                            assert_eq!(complete_refresh(request, result, || true), Status::Unknown);
+                            None
+                        }
+                        Action::Capture {
+                            generation,
+                            revision,
+                            pending,
+                        } => {
+                            // Focus returns to C only after the B observation has
+                            // finished. Synthetic decoding isolates the production
+                            // identity policy from unrelated fake HWND validation.
+                            assert!(validate_capture_generation(generation));
+                            assert_eq!(accepted.get(), 'C');
+                            let current = Probe {
+                                generation,
+                                ..request
+                            };
+                            let fresh = probe_observed_identity(
+                                false,
+                                (|| validate_capture_generation(generation), || true),
+                                || worker_publications.publish(request.target, false, false),
+                                |revision| worker_publications.retire(request.target, revision),
+                                || Status::NotSecure,
+                                || true,
+                                || accept_observed_identity(current, false, || {}),
+                            );
+                            assert_eq!(fresh.status, Status::NotSecure);
+                            assert!(!fresh.element_changed);
+                            let appended = if capture_metadata_allows(revision, fresh) {
+                                ring_buffer::push_text("b");
+                                1
+                            } else {
+                                assert!(!identity_matches(revision, fresh.identity));
+                                reject_probe(current);
+                                0
+                            };
+                            drop(pending);
+                            Some(appended)
+                        }
+                    };
+                    completed.send(appended).unwrap();
+                    appended
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(worker.submit(Action::Observe, Duration::from_secs(2)));
+        observing.recv_timeout(Duration::from_secs(2)).unwrap();
+        ring_buffer::invalidate_capture_context();
+        let raw = capture_generation();
+        assert_ne!(raw, old_generation);
+        {
+            let frontier = publications.frontier();
+            let _dispatch = begin_capture_dispatch(raw).unwrap();
+            let revision = publications.at_admission(request.target, frontier);
+            assert!(revision.is_some());
+            assert_eq!(revision != Some(accepted_revision), changed);
+            assert!(worker.submit(
+                Action::Capture {
+                    generation: raw,
+                    revision,
+                    pending: PendingCapture::new(raw),
+                },
+                Duration::from_secs(2),
+            ));
+        }
+        finish.send(()).unwrap();
+        assert_eq!(results.recv_timeout(Duration::from_secs(2)).unwrap(), None);
+        let appended = results
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        if appended == 0 {
+            assert!(!validate_capture_generation(raw));
+            ring_buffer::push_text("late-suffix");
+            assert!(ring_buffer::runs_snapshot().is_empty());
+        } else {
+            assert!(validate_capture_generation(raw));
+            assert_eq!(
+                ring_buffer::runs_snapshot()
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+                "b"
+            );
+        }
+        assert!(!pending_capture_for_generation(raw));
+        ring_buffer::clear_secure_input_data();
+        appended
+    }
+
+    #[test]
+    fn unaccepted_publication_cannot_relabel_input_on_return_to_accepted_owner() {
+        let _guard = ring_buffer::test_guard();
+        for pause in [
+            UnacceptedOwnerPause::Metadata,
+            UnacceptedOwnerPause::Acceptance,
+        ] {
+            // The old policy appends the B-era key after focus returns to C.
+            assert_eq!(run_unaccepted_owner_case(pause, true, false), 1);
+            assert_eq!(run_unaccepted_owner_case(pause, true, true), 0);
+            // A navigation reset on the already accepted ordinary C preserves
+            // its valid publication and the new segment's first key.
+            assert_eq!(run_unaccepted_owner_case(pause, false, true), 1);
+        }
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
