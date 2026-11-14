@@ -2143,7 +2143,19 @@ mod secure_clear_tests {
             scan_code: 0,
             keyboard_state: [0; 256],
             layout: 0,
-            focus: focus_key_for_test(isize::MAX, 0).unwrap(),
+            // A null foreground can never be a current focus-cache key. Build
+            // it directly: the normal fixture helper offsets native handles.
+            focus: FocusCacheKey {
+                foreground_hwnd: 0,
+                focus_hwnd: 0,
+                caret_hwnd: 0,
+                caret_rect: CaretRectSignature {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+            },
             ctrl_or_alt_held: false,
             altgr_held: false,
             shift_held: false,
