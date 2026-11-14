@@ -206,8 +206,26 @@ Shift+Tab under the same native HWND, and changing the currently focused input
 from `text` to `password` without changing focus. No wait for the application's
 guard is inserted between the tested transition and the first password character. Last word, last sequence,
 selected text, their smart variants, and AutoConvert must preserve the complete
-password. Pause and CapsLock layout switching must remain functional. Returning
-to ordinary contenteditable must journal and convert all of `ghbdtn` to `привет`.
+password. Pause and CapsLock layout switching must remain functional. An explicit
+new segment in ordinary contenteditable must journal and convert all fresh
+`ghbdtn` to `привет`.
+
+Two ordinary-input prerequisites have an explicit first-burst outcome: the
+`keep` prefix before the focused input changes type, and `ghbdtn` on returning
+from a password to contenteditable. Their original immediate bursts are retained
+and recorded before recovery. They must either be completely captured or have
+an exact zero-capture refusal: full original text, unchanged native/DOM focus
+and other fields, empty active/cache journals, unavailable capture, and equality
+with both the pre-burst counter and the pointer-down baseline. Partial or
+transient capture fails. After ordinary UIA metadata is verified, Escape starts
+a new segment in the same field and fresh physical input is appended. The type
+change test requires `keepkeep` with exactly four fresh captured characters,
+then performs its existing value reset/type change immediately followed by the
+password key. The recovery test requires `ghbdtnпривет`, preserving the first
+burst and the neighboring password while converting exactly six fresh captured
+characters. These two paths have dedicated outcome checks. The six text-command
+positive controls, cache-seeding controls, and the 53-case ordinary matrix retain
+their existing strict assertions.
 
 The delayed-focus case starts with verified password field A focused. Ordinary
 field B cancels the click's default focus change and schedules its own focus

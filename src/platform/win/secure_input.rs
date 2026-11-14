@@ -133,6 +133,18 @@ impl IdentityPublications {
         targets.insert(target, revision);
         revision
     }
+
+    fn retire(&self, target: Target, revision: u64) {
+        let mut targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if targets.get(&target) == Some(&revision) {
+            targets.remove(&target);
+        }
+        // Never restore a previous revision. The provider can retain the COM
+        // element, but its next observation must mint a different publication.
+    }
 }
 
 impl Target {
@@ -388,12 +400,15 @@ impl Provider {
                 self.elements.insert(request.probe.target, element.clone());
                 PUBLISHED_IDENTITIES.publish(request.probe.target, element_changed, forget)
             },
+            |revision| PUBLISHED_IDENTITIES.retire(request.probe.target, revision),
             || element_status(&element),
             || {
                 // A property lookup can itself race a same-HWND DOM focus change.
                 unsafe { automation.GetFocusedElement() }
                     .ok()
-                    .and_then(|current| unsafe { automation.CompareElements(&element, &current) }.ok())
+                    .and_then(|current| {
+                        unsafe { automation.CompareElements(&element, &current) }.ok()
+                    })
                     .is_some_and(|same| same.as_bool())
             },
         )
@@ -404,6 +419,7 @@ fn probe_observed_identity(
     element_changed: bool,
     request_is_current: impl Fn() -> bool,
     publish_identity: impl FnOnce() -> u64,
+    retire_identity: impl Fn(u64),
     password_status: impl FnOnce() -> Status,
     remains_focused: impl FnOnce() -> bool,
 ) -> Verdict {
@@ -417,7 +433,18 @@ fn probe_observed_identity(
     // keep their original revision, and failed probes never roll it back.
     let revision = publish_identity();
     let status = password_status();
+    let denied = !status.is_allowed();
+    if denied {
+        // A coordinator may already have timed out with no pending input. Its
+        // clean observation keeps the raw epoch, so keys arriving afterward
+        // must not inherit this unconfirmed or sensitive publication. Retire
+        // before another provider call can stall or its result can be dropped.
+        retire_identity(revision);
+    }
     if !remains_focused() || !request_is_current() {
+        if !denied {
+            retire_identity(revision);
+        }
         return Verdict::UNKNOWN;
     }
     Verdict {
@@ -1504,6 +1531,7 @@ mod tests {
                                 true,
                                 || worker_current.load(Ordering::Acquire),
                                 || worker_publications.publish(request.target, true, false),
+                                |revision| worker_publications.retire(request.target, revision),
                                 || {
                                     if pause == ProbePause::Password {
                                         querying.send(()).unwrap();
@@ -1537,6 +1565,7 @@ mod tests {
                                     false,
                                     || validate_capture_generation(generation),
                                     || worker_publications.publish(request.target, false, false),
+                                    |revision| worker_publications.retire(request.target, revision),
                                     || Status::NotSecure,
                                     || true,
                                 );
@@ -1563,7 +1592,9 @@ mod tests {
         )
         .unwrap();
         assert!(worker.submit(Action::Refresh, Duration::from_secs(2)));
-        observation_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        observation_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
         let enqueue_capture = || {
             let frontier = publications.frontier();
             let _dispatch = begin_capture_dispatch(generation).unwrap();
@@ -1585,8 +1616,13 @@ mod tests {
         // Moving publication after the blocked query fails here: a later
         // snapshot would still carry A, although B's focus was already observed.
         let later_revision = enqueue_capture();
-        assert!(later_revision.is_some());
-        assert_ne!(later_revision, Some(old_revision));
+        if pause == ProbePause::Stability && !status.is_allowed() {
+            // Known denied metadata is retired before stability can stall.
+            assert_eq!(later_revision, None);
+        } else {
+            assert!(later_revision.is_some());
+            assert_ne!(later_revision, Some(old_revision));
+        }
         assert_eq!(enqueue_capture(), later_revision);
         assert!(ring_buffer::runs_snapshot().is_empty());
         request_current.store(current, Ordering::Release);
@@ -1646,11 +1682,243 @@ mod tests {
             true,
             || false,
             || panic!("a stale observation must not publish an identity"),
+            |_| panic!("a stale observation must not retire another identity"),
             || panic!("a stale observation must not query password metadata"),
             || panic!("a stale observation must not query focus"),
         );
         assert_eq!(verdict.status, Status::Unknown);
         assert!(matches!(verdict.identity, MetadataIdentity::Unavailable));
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum TimeoutPause {
+        Password,
+        Stability,
+        Reply,
+    }
+
+    fn run_clean_timeout_case(
+        pause: TimeoutPause,
+        status: Status,
+        stable: bool,
+        current_after_timeout: bool,
+        retirement: bool,
+    ) -> usize {
+        use std::{sync::mpsc, thread};
+
+        enum Query {
+            Observe,
+            FreshCapture,
+        }
+
+        ring_buffer::clear_secure_input_data();
+        let raw = capture_generation();
+        let request = pointer_test_probe(raw);
+        let publications = Arc::new(IdentityPublications::new());
+        let preceding = publications.publish(request.target, true, false);
+        let worker_publications = Arc::clone(&publications);
+        let current = Arc::new(AtomicBool::new(true));
+        let worker_current = Arc::clone(&current);
+        let (ready, initialized) = mpsc::channel();
+        let (blocked, block_observed) = mpsc::channel();
+        let (finish, resume) = mpsc::channel();
+        let provider = Arc::new(
+            BoundedWorker::start("clean-observation-timeout-test", move || {
+                ready.send(()).unwrap();
+                move |query| {
+                    let wait = || {
+                        blocked.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(2)).unwrap();
+                    };
+                    match query {
+                        Query::Observe => {
+                            let verdict = probe_observed_identity(
+                                true,
+                                || worker_current.load(Ordering::Acquire),
+                                || worker_publications.publish(request.target, true, false),
+                                |revision| {
+                                    if retirement {
+                                        worker_publications.retire(request.target, revision);
+                                    }
+                                },
+                                || {
+                                    if pause == TimeoutPause::Password {
+                                        wait();
+                                    }
+                                    status
+                                },
+                                || {
+                                    if pause == TimeoutPause::Stability {
+                                        wait();
+                                    }
+                                    stable
+                                },
+                            );
+                            if pause == TimeoutPause::Reply {
+                                // The helper's final check succeeded, but the
+                                // transport can still discard this result.
+                                assert_eq!(verdict.status, status);
+                                wait();
+                            }
+                            verdict
+                        }
+                        Query::FreshCapture => probe_observed_identity(
+                            false,
+                            || true,
+                            || worker_publications.publish(request.target, false, false),
+                            |revision| worker_publications.retire(request.target, revision),
+                            || Status::NotSecure,
+                            || true,
+                        ),
+                    }
+                }
+            })
+            .unwrap(),
+        );
+        initialized.recv_timeout(Duration::from_secs(2)).unwrap();
+        let requester = Arc::clone(&provider);
+        let response =
+            thread::spawn(move || requester.request(Query::Observe, Duration::from_millis(100)));
+        block_observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(response.join().unwrap().is_none());
+        assert!(!pending_capture_for_generation(raw));
+        assert!(ring_buffer::runs_snapshot().is_empty());
+
+        // The real transport timed out before any input. Isolate the pristine
+        // completion from fake native HWNDs: this equivalent empty-journal
+        // cleanup expires conversion guards while deliberately retaining G.
+        // A hard native-target rejection here would make the test vacuous.
+        let context = generation();
+        assert_eq!(
+            apply_refresh_metadata(request, Verdict::UNKNOWN, |probe| {
+                assert!(!pending_capture_for_generation(probe.generation));
+                ring_buffer::discard_changed_capture_context(probe.generation);
+            }),
+            Status::Unknown
+        );
+        assert!(validate_capture_generation(raw));
+        assert!(!validate_generation(context));
+
+        // A password-era key arrives only AFTER that clean timeout, while the
+        // provider is still finishing the old observation.
+        let frontier = publications.frontier();
+        let (captured, pending) = {
+            let _dispatch = begin_capture_dispatch(raw).unwrap();
+            let captured = publications.at_admission(request.target, frontier);
+            (captured, PendingCapture::new(raw))
+        };
+        if retirement && pause != TimeoutPause::Password && !status.is_allowed() {
+            // Secure/Unknown must retire before a stability call or reply can
+            // stall, rather than waiting to discover that the request expired.
+            assert_eq!(captured, None);
+        } else {
+            assert!(captured.is_some());
+            assert_ne!(captured, Some(preceding));
+        }
+        current.store(current_after_timeout, Ordering::Release);
+        finish.send(()).unwrap();
+        // The same element now reports ordinary text. The real provider FIFO
+        // finishes/drops the expired response before handling this fresh query.
+        let fresh = provider
+            .request(Query::FreshCapture, Duration::from_secs(2))
+            .unwrap();
+        let appended = if capture_metadata_allows(captured, fresh) {
+            ring_buffer::push_text("x");
+            assert!(!ring_buffer::runs_snapshot().is_empty());
+            1
+        } else {
+            reject_probe(request);
+            assert!(!validate_capture_generation(raw));
+            ring_buffer::push_text("late-suffix");
+            assert!(ring_buffer::runs_snapshot().is_empty());
+            0
+        };
+        drop(pending);
+        ring_buffer::clear_secure_input_data();
+        appended
+    }
+
+    #[test]
+    fn clean_timeout_cannot_preserve_a_later_password_capture_binding() {
+        let _guard = ring_buffer::test_guard();
+        for (pause, status, stable, current) in [
+            (TimeoutPause::Password, Status::Secure, true, false),
+            (TimeoutPause::Password, Status::Unknown, true, false),
+            (TimeoutPause::Password, Status::NotSecure, true, false),
+            (TimeoutPause::Stability, Status::NotSecure, false, true),
+            (TimeoutPause::Stability, Status::Secure, true, false),
+            (TimeoutPause::Reply, Status::Secure, true, true),
+            (TimeoutPause::Reply, Status::Unknown, true, true),
+        ] {
+            // Disabling retirement must reproduce an actual append after the
+            // clean timeout, not refusal caused by an invalid native target.
+            assert_eq!(
+                run_clean_timeout_case(pause, status, stable, current, false),
+                1
+            );
+            assert_eq!(
+                run_clean_timeout_case(pause, status, stable, current, true),
+                0
+            );
+        }
+        // A valid ordinary observation can outlive reply delivery; a later key
+        // still has matching observed identity and its own fresh allowed check.
+        assert_eq!(
+            run_clean_timeout_case(TimeoutPause::Reply, Status::NotSecure, true, true, true),
+            1
+        );
+    }
+
+    #[test]
+    fn retirement_never_removes_a_newer_or_another_targets_publication() {
+        let publications = IdentityPublications::new();
+        let target = pointer_test_probe(0).target;
+        let other = Target {
+            focus: target.focus + 1,
+            ..target
+        };
+        let old = publications.publish(target, true, false);
+        let other_revision = publications.publish(other, true, false);
+        let newer = publications.publish(target, true, false);
+        publications.retire(target, old);
+        publications.retire(other, newer);
+        assert_eq!(
+            publications.at_admission(target, publications.frontier()),
+            Some(newer)
+        );
+        assert_eq!(
+            publications.at_admission(other, publications.frontier()),
+            Some(other_revision)
+        );
+        publications.retire(target, newer);
+        assert_eq!(
+            publications.at_admission(target, publications.frontier()),
+            None
+        );
+        let next = publications.publish(target, false, false);
+        assert_ne!(next, old);
+        assert_ne!(next, newer);
+        publications.retire(target, newer);
+        assert_eq!(
+            publications.at_admission(target, publications.frontier()),
+            Some(next)
+        );
+        assert_eq!(
+            publications.at_admission(other, publications.frontier()),
+            Some(other_revision)
+        );
+        assert!(!capture_metadata_allows(
+            Some(old),
+            published_test_verdict(next, false)
+        ));
+        assert!(!capture_metadata_allows(
+            Some(newer),
+            published_test_verdict(next, false)
+        ));
+        assert!(capture_metadata_allows(
+            Some(next),
+            published_test_verdict(next, false)
+        ));
     }
 
     #[test]

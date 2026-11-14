@@ -63,6 +63,12 @@ stable-focus queries. Publication grants no capture permission: every key still
 requires its own fresh, explicit non-password result for that exact revision.
 A failed or sensitive metadata result retains the existing rejection path;
 published revisions are never rolled back to make older keys current again.
+The provider retires the matching revision on sensitive or unavailable metadata,
+unstable focus, and expired observations. Retirement does not depend on delivery
+of its reply: a timed-out worker result cannot leave a provisional identity
+usable by later input. It cannot remove a newer revision or a different target.
+The next successful observation must establish a fresh revision, so keys bound
+to the retired one remain rejected.
 
 This is best-effort protection based on observable metadata, not proof of the
 element that received a physical key. UIA observations can miss a transient
@@ -123,6 +129,17 @@ empty active and cached journals, an unavailable-prefix marker, and no physical
 character appended since the pointer-down boundary. A refusal must then recover
 through selection conversion and a fresh input segment in the same control.
 These cases do not insert a readiness wait before the tested first key.
+
+Two password scenarios also record the first ordinary burst used to prepare a
+dynamic type change or recover after leaving a password field. They require
+either complete capture or the same zero-capture refusal evidence; partial
+capture fails. A refused burst stays visible. An explicit new segment in that
+same field must then capture every fresh character, and the recovery scenario
+must convert that fresh text exactly without changing the neighboring password.
+The dynamic type change still follows a genuinely captured ordinary prefix,
+with no wait between changing the field to password and sending its first key.
+These two scenario preconditions do not expand the ordinary matrix's refusal
+whitelist or relax any password assertion.
 
 A separate delayed-focus case keeps password field A focused during a click on
 ordinary field B, sends one native key in the same input batch, and then moves

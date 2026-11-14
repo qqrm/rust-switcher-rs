@@ -87,6 +87,107 @@ function Type-NormalFixture($Target, [string]$Id, [string]$Text) {
     Wait-Browser { (Read-SecurityState).capturedChars -ge $before.capturedChars + $Text.Length } 'every ordinary character actually journaled'
 }
 
+function Assert-CompleteOrdinarySegment($Before, $After, [int]$Length) {
+    if ($Length -le 0 -or $After.capturedChars - $Before.capturedChars -ne $Length -or
+        $After.activeChars -ne $Length -or $After.cachedChars -ne 0 -or $After.captureUnavailable -ne 0) {
+        throw 'The new ordinary segment did not capture exactly its complete physical input'
+    }
+}
+
+function Get-OrdinaryTransitionOutcome([string]$Purpose, $Record, $Journal, [long]$Window) {
+    $expected = switch ($Purpose) {
+        'type-change-prefix' { @{field = 'a'; text = 'keep'} }
+        'password-recovery' { @{field = 'guard'; text = 'ghbdtn'} }
+        default { throw 'Ordinary transition refusal is limited to two password-test prerequisites' }
+    }
+    if ($Record.field -cne $expected.field -or $Record.text -cne $expected.text -or
+        $Record.actual -cne $expected.text -or $Record.otherFieldsUnchanged -isnot [bool] -or
+        -not $Record.otherFieldsUnchanged) {
+        throw 'Ordinary transition requires complete original input and unchanged other fields'
+    }
+    foreach ($native in @($Record.inputTrace.before, $Record.inputTrace.afterFirst, $Record.inputTrace.afterRest)) {
+        Assert-BrowserTargetFocus $native $Record.focusAfter $expected.field $Window
+    }
+    foreach ($object in @($Record.before, $Journal)) {
+        if ($null -eq $object) { throw 'Ordinary transition metadata is missing' }
+        foreach ($name in @('capturedChars')) {
+            $property = $object.PSObject.Properties[$name]
+            if ($null -eq $property -or $null -eq $property.Value -or
+                ($property.Value -isnot [long] -and $property.Value -isnot [int]) -or $property.Value -lt 0) {
+                throw 'Ordinary transition has an invalid physical capture counter'
+            }
+        }
+    }
+    foreach ($name in @('activeChars', 'cachedChars', 'pointerBaseline', 'captureUnavailable')) {
+        $property = $Journal.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value -or
+            ($property.Value -isnot [long] -and $property.Value -isnot [int]) -or $property.Value -lt 0) {
+            throw "Ordinary transition metadata is invalid: $name"
+        }
+    }
+    if ($Journal.pointerBaseline -ne $Record.before.capturedChars) {
+        throw 'Ordinary transition lost its pointer-down physical capture baseline'
+    }
+    if ($Journal.capturedChars -eq $Record.before.capturedChars -and $Journal.activeChars -eq 0 -and
+        $Journal.cachedChars -eq 0 -and $Journal.captureUnavailable -eq 1) {
+        return 'safe_focus_refusal'
+    }
+    Assert-CompleteOrdinarySegment $Record.before $Journal $expected.text.Length
+    return 'captured'
+}
+
+function Observe-OrdinaryTransition([string]$Purpose, [string]$Id, [string]$Text,
+    [hashtable]$ExpectedOther, [hashtable]$Record) {
+    # Preserve the original first burst: this is the same counter read and
+    # immediate physical input as Type-NormalFixture, with no readiness poll.
+    $Record.before = Read-SecurityState
+    $Record.field = $Id
+    $Record.text = $Text
+    $Record.inputTrace = [BrowserInput]::Type($session.Handle, $Text, 0, 0)
+    Wait-Browser { (Read-Browser $session 'fixture.values()').$Id -ceq $Text } 'complete initial ordinary transition input'
+    Wait-Browser {
+        $state = Read-BrowserJournalState $switcherHandle
+        $state.captureUnavailable -eq 1 -or $state.capturedChars -ge $Record.before.capturedChars + $Text.Length
+    } 'complete capture or explicit ordinary transition refusal'
+    $Record.actual = (Read-Browser $session 'fixture.values()').$Id
+    $Record.focusAfter = Get-BrowserFocusSnapshot $session
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    $Record.otherFieldsUnchanged = $true
+    $Record.journal = Read-BrowserJournalState $switcherHandle
+    $Record.outcome = Get-OrdinaryTransitionOutcome $Purpose $Record $Record.journal ($session.Handle.ToInt64())
+}
+
+function Start-FreshOrdinarySegment([string]$Id, [string]$Text, [hashtable]$Initial,
+    [hashtable]$ExpectedOther, [hashtable]$Recovery) {
+    $Recovery.provider = Assert-BrowserPassword $false $Id
+    Assert-BrowserTargetFocus $Initial.inputTrace.before (Get-BrowserFocusSnapshot $session) $Id ($session.Handle.ToInt64())
+    $Recovery.before = Read-BrowserJournalState $switcherHandle
+    if ($Recovery.before.capturedChars -ne $Initial.journal.capturedChars) {
+        throw 'Initial ordinary transition captured input after its recorded outcome'
+    }
+    # Keep the initial text. Escape explicitly starts a new segment in the
+    # same control; neither CDP replacement nor refocusing retries the burst.
+    Tap-BrowserKey 0x1B
+    Set-BrowserEnglish $session
+    $Recovery.inputTrace = [BrowserInput]::Type($session.Handle, $Text, 0, 0)
+    $Recovery.expected = $Initial.text + $Text
+    Wait-Browser { (Read-Browser $session 'fixture.values()').$Id -ceq $Recovery.expected } 'fresh ordinary input appended to the preserved first burst'
+    Wait-Browser {
+        $state = Read-BrowserJournalState $switcherHandle
+        $state.captureUnavailable -eq 1 -or $state.capturedChars -ge $Recovery.before.capturedChars + $Text.Length
+    } 'every fresh ordinary character captured in the new segment'
+    $Recovery.after = Read-BrowserJournalState $switcherHandle
+    Assert-CompleteOrdinarySegment $Recovery.before $Recovery.after $Text.Length
+    $Recovery.actual = (Read-Browser $session 'fixture.values()').$Id
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    $Recovery.otherFieldsUnchanged = $true
+    $Recovery.focusAfter = Get-BrowserFocusSnapshot $session
+    Assert-BrowserTargetFocus $Initial.inputTrace.before $Recovery.focusAfter $Id ($session.Handle.ToInt64())
+    foreach ($native in @($Recovery.inputTrace.before, $Recovery.inputTrace.afterFirst, $Recovery.inputTrace.afterRest)) {
+        Assert-BrowserTargetFocus $native $Recovery.focusAfter $Id ($session.Handle.ToInt64())
+    }
+}
+
 function Type-PasswordFixture([string]$Text, $Before) {
     # No polling of the application's guard precedes the first tested key.
     [BrowserInput]::Type($session.Handle, $Text, 0, 0) | Out-Null
@@ -320,11 +421,15 @@ Invoke-PasswordCase 'delayed ordinary focus never captures the preceding passwor
 Invoke-PasswordCase 'focused input changes from text to password' {
     param($details)
     Reset-PasswordFixture 'input'
+    $expectedOther = @{'a/b' = ''; 'a/guard' = ''; 'b/a' = ''; 'b/b' = ''; 'b/guard' = ''}
+    $details.initialOrdinary = @{}
+    $details.freshOrdinary = @{}
     Focus-BrowserEditor $session 'a'
+    Observe-OrdinaryTransition 'type-change-prefix' 'a' 'keep' $expectedOther $details.initialOrdinary
     # Establish the ordinary-field prerequisite before exercising the type
     # change. No observation is inserted between that change and password input.
-    $details.normalProvider = Assert-BrowserPassword $false
-    Type-NormalFixture $session 'a' 'keep'
+    Start-FreshOrdinarySegment 'a' 'keep' $details.initialOrdinary $expectedOther $details.freshOrdinary
+    $details.normalProvider = $details.freshOrdinary.provider
     $before = Read-SecurityState
     Read-Browser $session "fixture.set('a', ''); fixture.setType('a', 'password')" | Out-Null
     Type-PasswordFixture 'ghbdtn' $before | Out-Null
@@ -371,12 +476,17 @@ Invoke-PasswordCase 'ordinary custom field recovers with every character' {
     Type-PasswordFixture 'secretfixture' $before | Out-Null
     $details.passwordProvider = Assert-BrowserPassword $true
     Assert-PasswordStable 'secretfixture' $before 2250
+    $expectedOther = @{'a/a' = 'secretfixture'; 'a/b' = ''; 'b/a' = ''; 'b/b' = ''; 'b/guard' = ''}
+    $details.initialOrdinary = @{}
+    $details.freshOrdinary = @{}
     Focus-BrowserEditor $session 'guard'
-    Type-NormalFixture $session 'guard' 'ghbdtn'
-    $details.normalProvider = Assert-BrowserPassword $false 'guard'
+    Observe-OrdinaryTransition 'password-recovery' 'guard' 'ghbdtn' $expectedOther $details.initialOrdinary
+    Start-FreshOrdinarySegment 'guard' 'ghbdtn' $details.initialOrdinary $expectedOther $details.freshOrdinary
+    $details.normalProvider = $details.freshOrdinary.provider
     Tap-PasswordChord 0xA4 2
-    Wait-Browser { (Read-Browser $session 'fixture.values()').guard -eq 'привет' } 'all six ordinary characters convert after password focus'
-    if ((Read-Browser $session 'fixture.values()').a -ne 'secretfixture') { throw 'Normal conversion changed the neighboring password field' }
-    $details.result = 'ghbdtn -> привет'
+    Wait-Browser { (Read-Browser $session 'fixture.values()').guard -ceq 'ghbdtnпривет' } 'only the six fresh ordinary characters convert after password focus'
+    Assert-BrowserOtherFields $Sessions $expectedOther
+    Assert-BrowserTargetFocus $details.initialOrdinary.inputTrace.before (Get-BrowserFocusSnapshot $session) 'guard' ($session.Handle.ToInt64())
+    $details.result = 'preserved ghbdtn + fresh ghbdtn -> ghbdtnпривет'
     $details.after = Read-SecurityState
 }

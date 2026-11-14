@@ -21,13 +21,14 @@ $securityPath = Join-Path (Split-Path -Parent $HarnessPath) 'browser-security-ca
 $securityAst = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path -LiteralPath $securityPath), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors) { throw ($parseErrors | Out-String) }
-$stimulusHelpers = @($securityAst.FindAll({
-    param($node)
-    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Assert-DelayedPasswordStimulus'
-}, $false))
-if ($stimulusHelpers.Count -ne 1) { throw 'Expected one delayed-password stimulus validator' }
-. ([scriptblock]::Create($stimulusHelpers[0].Extent.Text))
+foreach ($name in @('Assert-DelayedPasswordStimulus', 'Assert-CompleteOrdinarySegment', 'Get-OrdinaryTransitionOutcome')) {
+    $helpers = @($securityAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $false))
+    if ($helpers.Count -ne 1) { throw "Expected one password acceptance helper named $name" }
+    . ([scriptblock]::Create($helpers[0].Extent.Text))
+}
 
 function New-FocusFixture {
     return @{native = [pscustomobject]@{foreground = 123; focus = 456; error = 0};
@@ -164,5 +165,83 @@ Assert-DelayedStimulusRejected 'input targeted ordinary field' { param($f) $f.Pr
 Assert-DelayedStimulusRejected 'input occurred after focus moved' { param($f) $f.Proof.events[2].at = 146.0 }
 Assert-DelayedStimulusRejected 'input event absent' { param($f) $f.Proof.events = @($f.Proof.events | Where-Object type -ne 'input') }
 Assert-DelayedStimulusRejected 'duplicate input event' { param($f) $f.Proof.events += $f.Proof.events[2] }
-if ($checks.Count -ne 53) { throw "Browser outcome regression discovery was incomplete: $($checks.Count)" }
+
+function New-OrdinaryTransitionFixture {
+    $focus = New-FocusFixture
+    $focus.dom.field = 'guard'
+    $focus.dom.activeId = 'guard'
+    return @{Purpose = 'password-recovery'; Record = @{
+        field = 'guard'; text = 'ghbdtn'; actual = 'ghbdtn'; otherFieldsUnchanged = $true;
+        before = [pscustomobject]@{capturedChars = [long]100}; focusAfter = $focus;
+        inputTrace = @{before = (New-FocusFixture).native; afterFirst = (New-FocusFixture).native;
+            afterRest = (New-FocusFixture).native}
+    }; Journal = [pscustomobject]@{capturedChars = [long]100; pointerBaseline = [long]100;
+        activeChars = 0; cachedChars = 0; captureUnavailable = 1}}
+}
+function Assert-OrdinaryTransitionRejected([string]$Name, [scriptblock]$Change) {
+    $fixture = New-OrdinaryTransitionFixture
+    & $Change $fixture
+    $rejected = $false
+    try { Get-OrdinaryTransitionOutcome $fixture.Purpose $fixture.Record $fixture.Journal 123 | Out-Null }
+    catch { $rejected = $true }
+    if (-not $rejected) { throw "Invalid ordinary transition was accepted: $Name" }
+    $checks.Add($Name)
+}
+foreach ($purpose in @('password-recovery', 'type-change-prefix')) {
+    $fixture = New-OrdinaryTransitionFixture
+    $fixture.Purpose = $purpose
+    if ($purpose -eq 'type-change-prefix') {
+        $fixture.Record.field = 'a'; $fixture.Record.text = 'keep'; $fixture.Record.actual = 'keep'
+        $fixture.Record.focusAfter.dom.field = 'a'; $fixture.Record.focusAfter.dom.activeId = 'a'
+    }
+    if ((Get-OrdinaryTransitionOutcome $purpose $fixture.Record $fixture.Journal 123) -cne 'safe_focus_refusal') {
+        throw 'A complete zero-capture ordinary refusal was not identified'
+    }
+    $checks.Add("verified initial refusal: $purpose")
+    $fixture.Journal.capturedChars += $fixture.Record.text.Length
+    $fixture.Journal.activeChars = $fixture.Record.text.Length
+    $fixture.Journal.captureUnavailable = 0
+    if ((Get-OrdinaryTransitionOutcome $purpose $fixture.Record $fixture.Journal 123) -cne 'captured') {
+        throw 'A complete initial ordinary capture was not identified'
+    }
+    $checks.Add("complete initial capture: $purpose")
+}
+Assert-OrdinaryTransitionRejected 'unrelated case cannot use ordinary refusal' { param($f) $f.Purpose = 'last-word-positive' }
+Assert-OrdinaryTransitionRejected 'wrong ordinary field' { param($f) $f.Record.field = 'a' }
+Assert-OrdinaryTransitionRejected 'ordinary input never arrived' { param($f) $f.Record.actual = '' }
+Assert-OrdinaryTransitionRejected 'partial ordinary input' { param($f) $f.Record.actual = 'hbdtn' }
+Assert-OrdinaryTransitionRejected 'ordinary neighbor changed' { param($f) $f.Record.otherFieldsUnchanged = $false }
+Assert-OrdinaryTransitionRejected 'ordinary native focus changed' { param($f) $f.Record.focusAfter.native.focus = 457 }
+Assert-OrdinaryTransitionRejected 'ordinary DOM focus changed' { param($f) $f.Record.focusAfter.dom.field = 'a' }
+Assert-OrdinaryTransitionRejected 'ordinary document blurred' { param($f) $f.Record.focusAfter.dom.documentFocused = $false }
+Assert-OrdinaryTransitionRejected 'partial physical capture before refusal' { param($f) $f.Journal.capturedChars++ }
+Assert-OrdinaryTransitionRejected 'transient complete capture before refusal' { param($f) $f.Journal.capturedChars += 6 }
+Assert-OrdinaryTransitionRejected 'ordinary refusal was not explicit' { param($f) $f.Journal.captureUnavailable = 0 }
+Assert-OrdinaryTransitionRejected 'ordinary refusal retains active text' { param($f) $f.Journal.activeChars = 1 }
+Assert-OrdinaryTransitionRejected 'ordinary refusal retains cached text' { param($f) $f.Journal.cachedChars = 1 }
+Assert-OrdinaryTransitionRejected 'ordinary pointer baseline differs' { param($f) $f.Journal.pointerBaseline-- }
+Assert-OrdinaryTransitionRejected 'ordinary metadata missing' { param($f) $f.Journal = $null }
+Assert-OrdinaryTransitionRejected 'ordinary counter missing' { param($f) $f.Journal.PSObject.Properties.Remove('capturedChars') }
+Assert-OrdinaryTransitionRejected 'ordinary counter null' { param($f) $f.Journal.capturedChars = $null }
+Assert-OrdinaryTransitionRejected 'ordinary counter string' { param($f) $f.Journal.capturedChars = '100' }
+
+$freshBefore = [pscustomobject]@{capturedChars = [long]100}
+$freshAfter = [pscustomobject]@{capturedChars = [long]106; activeChars = 6; cachedChars = 0; captureUnavailable = 0}
+Assert-CompleteOrdinarySegment $freshBefore $freshAfter 6
+$checks.Add('fresh segment captured exactly six characters')
+foreach ($change in @(
+    @{name = 'fresh segment lost one character'; property = 'capturedChars'; value = [long]105},
+    @{name = 'fresh segment captured an extra character'; property = 'capturedChars'; value = [long]107},
+    @{name = 'fresh segment journal is incomplete'; property = 'activeChars'; value = 5},
+    @{name = 'fresh segment remains unavailable'; property = 'captureUnavailable'; value = 1},
+    @{name = 'fresh segment retains another cache'; property = 'cachedChars'; value = 1}
+)) {
+    $after = [pscustomobject]@{capturedChars = [long]106; activeChars = 6; cachedChars = 0; captureUnavailable = 0}
+    $after.($change.property) = $change.value
+    $rejected = $false
+    try { Assert-CompleteOrdinarySegment $freshBefore $after 6 } catch { $rejected = $true }
+    if (-not $rejected) { throw "Invalid fresh ordinary segment accepted: $($change.name)" }
+    $checks.Add($change.name)
+}
+if ($checks.Count -ne 81) { throw "Browser outcome regression discovery was incomplete: $($checks.Count)" }
 Write-Output "PASS: $($checks.Count) browser outcome helper assertions"
