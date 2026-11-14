@@ -4,11 +4,13 @@
 //! The capture coordinator owns a bounded FIFO of event-time key snapshots.
 //! Only a fresh, explicit non-password result can authorize decoding. A hung
 //! provider receives handles and epochs, not queued key data.
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -49,7 +51,9 @@ const CAPTURE_LIFETIME: Duration = Duration::from_secs(2);
 const PROVIDER_TIMEOUT: Duration = Duration::from_millis(75);
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
-static PENDING_CAPTURES: AtomicUsize = AtomicUsize::new(0);
+// At most the bounded capture queue plus its current consumer can own entries.
+// Old queued work must not mark unrelated later native contexts incomplete.
+static PENDING_CAPTURES: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
 static WORKER: OnceLock<Option<BoundedWorker<Command, Status>>> = OnceLock::new();
 static FOCUS_HOOKS_READY: OnceLock<bool> = OnceLock::new();
 // UIA callbacks run on another thread. Preserve snapshot-to-submission ordering
@@ -119,12 +123,40 @@ struct Capture {
     target: Target,
     generation: u64,
     captured: Instant,
+    _pending: PendingCapture,
 }
 
-impl Drop for Capture {
-    fn drop(&mut self) {
-        PENDING_CAPTURES.fetch_sub(1, Ordering::AcqRel);
+struct PendingCapture(u64);
+
+impl PendingCapture {
+    fn new(generation: u64) -> Self {
+        let mut pending = PENDING_CAPTURES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *pending.entry(generation).or_default() += 1;
+        Self(generation)
     }
+}
+
+impl Drop for PendingCapture {
+    fn drop(&mut self) {
+        let mut pending = PENDING_CAPTURES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(count) = pending.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn pending_capture_for_generation(generation: u64) -> bool {
+    PENDING_CAPTURES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains_key(&generation)
 }
 
 #[derive(Clone, Copy)]
@@ -453,7 +485,7 @@ unsafe extern "system" fn focus_changed(
         || hwnd == foreground
         || unsafe { IsChild(foreground, hwnd) }.as_bool()
     {
-        ring_buffer::refresh_capture_focus(PENDING_CAPTURES.load(Ordering::Acquire) != 0);
+        ring_buffer::refresh_capture_focus(pending_capture_for_generation);
         enqueue_refresh();
     }
 }
@@ -665,19 +697,17 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
     if !target.is_current() {
         return;
     }
-    let Some(expected) = ring_buffer::capture_generation_for_key(
-        &key,
-        observed,
-        PENDING_CAPTURES.load(Ordering::Acquire) != 0,
-    ) else {
+    let Some(expected) =
+        ring_buffer::capture_generation_for_key(&key, observed, pending_capture_for_generation)
+    else {
         return;
     };
-    PENDING_CAPTURES.fetch_add(1, Ordering::AcqRel);
     let capture = Capture {
         key,
         target,
         generation: expected,
         captured: Instant::now(),
+        _pending: PendingCapture::new(expected),
     };
     let submitted = WORKER
         .get()
@@ -739,6 +769,28 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn pending_capture_ownership_stays_with_its_epoch_until_last_drop() {
+        let _guard = ring_buffer::test_guard();
+        let first_generation = capture_generation();
+        let first = PendingCapture::new(first_generation);
+        let first_tail = PendingCapture::new(first_generation);
+        ring_buffer::clear_secure_input_data();
+        let next_generation = capture_generation();
+        assert_ne!(first_generation, next_generation);
+        assert!(pending_capture_for_generation(first_generation));
+        assert!(!pending_capture_for_generation(next_generation));
+        let next = PendingCapture::new(next_generation);
+        drop(first);
+        assert!(pending_capture_for_generation(first_generation));
+        drop(first_tail);
+        assert!(!pending_capture_for_generation(first_generation));
+        assert!(pending_capture_for_generation(next_generation));
+        drop(next);
+        assert!(!pending_capture_for_generation(next_generation));
+        ring_buffer::clear_secure_input_data();
+    }
 
     #[test]
     fn uia_refresh_cannot_overtake_a_started_raw_snapshot() {

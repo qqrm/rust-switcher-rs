@@ -1518,10 +1518,18 @@ pub fn clear_secure_input_data() {
     with_journal_mut(|journal| clear_secure_journal(journal, true, false));
 }
 
-/// Mouse/navigation invalidates active input but retains unrelated editor caches.
+/// Mouse/navigation invalidates active input but retains unrelated editor caches
+/// and known native identity. A later same-HWND key must not invalidate a focus
+/// refresh already queued for the new DOM field in this reset epoch.
 #[cfg(windows)]
 pub fn invalidate_capture_context() {
-    with_journal_mut(|journal| clear_secure_journal(journal, false, false));
+    with_journal_mut(|journal| {
+        let foreground = journal.last_fg_hwnd;
+        let focus = journal.last_focus_key;
+        clear_secure_journal(journal, false, false);
+        journal.last_fg_hwnd = foreground;
+        journal.last_focus_key = focus;
+    });
 }
 
 /// Discard an extracted operation's remaining old active prefix after its
@@ -1544,12 +1552,13 @@ pub fn invalidate_capture_context_if_current(generation: u64) -> bool {
 pub fn capture_generation_for_key(
     key: &CapturedKey,
     observed_generation: u64,
-    pending_capture: bool,
+    pending_capture: impl FnOnce(u64) -> bool,
 ) -> Option<u64> {
     with_journal_mut(|journal| {
         if !key.is_current() {
             return None;
         }
+        let pending_capture = pending_capture(observed_generation);
         capture_generation_for_focus(
             journal,
             key.focus,
@@ -1586,11 +1595,11 @@ fn capture_generation_for_focus(
 /// Preserve ordinary native-editor cache restoration. A background UIA identity
 /// comparison distinguishes a real DOM focus change from duplicate WinEvents.
 #[cfg(windows)]
-pub fn refresh_capture_focus(pending_capture: bool) {
+pub fn refresh_capture_focus(pending_capture: impl FnOnce(u64) -> bool) {
     with_journal_mut(|journal| {
         let foreground = unsafe { GetForegroundWindow() };
         let key = current_focus_cache_key(foreground);
-        apply_secure_focus_transition(
+        refresh_capture_focus_with_pending(
             journal,
             foreground.0 as isize,
             key,
@@ -1598,6 +1607,20 @@ pub fn refresh_capture_focus(pending_capture: bool) {
             pending_capture,
         );
     });
+}
+
+#[cfg(windows)]
+fn refresh_capture_focus_with_pending(
+    journal: &mut InputJournal,
+    foreground: isize,
+    key: Option<FocusCacheKey>,
+    now_ms: u64,
+    pending_capture: impl FnOnce(u64) -> bool,
+) {
+    // The journal lock fixes the departing epoch before checking its pending
+    // work. A stale A capture cannot mark untouched B/C journals incomplete.
+    let pending_capture = pending_capture(secure_input_generation());
+    apply_secure_focus_transition(journal, foreground, key, now_ms, pending_capture);
 }
 
 #[cfg(windows)]
@@ -2008,6 +2031,99 @@ mod secure_clear_tests {
         });
         push_text("suffix");
         assert!(runs_snapshot().is_empty());
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn navigation_reset_keeps_queued_same_hwnd_focus_refresh_current_for_first_key() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let native = focus_key_for_test(101, 0).unwrap();
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(native), 1_000, false);
+            journal.push_text_internal("old-field", LayoutTag::En, RunOrigin::Physical);
+        });
+        let old_generation = secure_input_generation();
+        invalidate_capture_context();
+        assert!(!validate_secure_input_generation(old_generation));
+        let refresh_generation = secure_input_generation();
+        with_journal_mut(|journal| {
+            assert!(journal.runs.is_empty());
+            assert_eq!(journal.last_focus_key, Some(native));
+            // A UIA refresh is queued before this first raw key. Synchronizing
+            // the unchanged browser HWND must preserve that refresh's epoch.
+            assert_eq!(
+                capture_generation_for_focus(journal, native, refresh_generation, false, 1_010),
+                Some(refresh_generation)
+            );
+        });
+        discard_changed_capture_context(refresh_generation);
+        assert!(validate_secure_input_generation(refresh_generation));
+        with_journal_mut(|journal| {
+            journal.push_text_internal(".", LayoutTag::En, RunOrigin::Physical);
+            assert_eq!(journal.total_chars, 1);
+            assert!(!journal.capture_unavailable);
+        });
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn navigation_reset_does_not_reuse_refresh_for_a_different_native_target() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let a = focus_key_for_test(101, 0).unwrap();
+        let b = focus_key_for_test(202, 0).unwrap();
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(a), 1_000, false);
+        });
+        invalidate_capture_context();
+        let refresh_generation = secure_input_generation();
+        with_journal_mut(|journal| {
+            let captured =
+                capture_generation_for_focus(journal, b, refresh_generation, false, 1_010).unwrap();
+            assert_ne!(captured, refresh_generation);
+            assert!(!validate_secure_input_generation(refresh_generation));
+            assert_eq!(journal.last_focus_key, Some(b));
+        });
+        // Security rejection remains distinct from an explicit navigation
+        // boundary and still discards unidentifiable native provenance.
+        secure_capture_unavailable();
+        with_journal(|journal| {
+            assert!(journal.last_focus_key.is_none());
+            assert_eq!(journal.last_fg_hwnd, 0);
+            assert!(journal.capture_unavailable);
+        });
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn old_pending_capture_does_not_poison_intermediate_native_journals() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let a = focus_key_for_test(101, 0).unwrap();
+        let b = focus_key_for_test(202, 0).unwrap();
+        let c = focus_key_for_test(303, 0).unwrap();
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(a), 1_000, false);
+            journal.push_text_internal("prefix", LayoutTag::En, RunOrigin::Physical);
+            let a_generation = secure_input_generation();
+            // A is still in the bounded queue through several focus hops. Only
+            // its departing epoch owns that missing key; B and C saw no input.
+            let pending = |generation| generation == a_generation;
+            refresh_capture_focus_with_pending(journal, 202, Some(b), 1_010, pending);
+            assert!(!journal.capture_unavailable);
+            refresh_capture_focus_with_pending(journal, 303, Some(c), 1_020, pending);
+            assert!(!journal.capture_unavailable);
+            refresh_capture_focus_with_pending(journal, 202, Some(b), 1_030, pending);
+            assert!(!journal.capture_unavailable);
+            journal.push_text_internal(".", LayoutTag::En, RunOrigin::Physical);
+            assert_eq!(journal.total_chars, 1);
+            refresh_capture_focus_with_pending(journal, 101, Some(a), 1_040, pending);
+            assert!(journal.capture_unavailable);
+        });
         clear_secure_input_data();
     }
 
