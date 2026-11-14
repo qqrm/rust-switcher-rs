@@ -34,7 +34,7 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     );
 
     if should_invalidate {
-        crate::input::ring_buffer::invalidate();
+        super::secure_input::invalidate_context();
     }
 
     let h = HOOK_HANDLE.load(Ordering::Relaxed);

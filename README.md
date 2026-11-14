@@ -16,6 +16,7 @@ These downloads contain no typed text, selections, or input history.
 - Convert selected text using keyboard layouts configured in Windows
 - Convert the last typed sequence via a hotkey ("smart" conversion also handles selection)
 - Auto-convert the last word while typing (can be disabled in Settings; runtime toggle starts paused)
+- Exclude recognized password fields from capture and conversion, including custom controls that expose their password property through Windows accessibility
 - Automatically discover added and removed Windows layouts, including variants of the same language
 - Load language models on demand, with local scoring and verified offline caches
 - Tray icon and quick actions menu

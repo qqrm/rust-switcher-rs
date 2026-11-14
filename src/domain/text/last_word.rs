@@ -108,6 +108,9 @@ pub fn autoconvert_last_word(state: &mut AppState) {
         }
     };
     sleep_before_convert(state);
+    if !crate::platform::win::secure_input::protect_current_context().is_allowed() {
+        return;
+    }
     let target = FocusTarget::capture();
     let Some(payload) = take_last_word_payload() else {
         tracing::trace!("journal: no last word");
@@ -135,9 +138,19 @@ pub fn autoconvert_last_word(state: &mut AppState) {
             return;
         }
         if apply_last_word_replacement(&payload, &plan.text, restore.target).is_ok() {
-            crate::input_journal::push_runs(plan.runs);
-            crate::input_journal::push_runs(payload.suffix_runs.iter().cloned());
-            crate::input_journal::mark_last_token_autoconverted();
+            if !crate::input_journal::push_runs_if_generation(
+                payload.security_generation,
+                plan.runs
+                    .into_iter()
+                    .chain(payload.suffix_runs.iter().cloned()),
+            ) {
+                return;
+            }
+            if !crate::input_journal::mark_last_token_autoconverted_if_generation(
+                payload.security_generation,
+            ) {
+                return;
+            }
             restore.commit();
             if let Some(target) = restore.target.filter(|target| target.is_current()) {
                 let _ = layouts::activate_layout_for_window(plan.target, target.foreground_hwnd());
@@ -157,13 +170,19 @@ pub fn autoconvert_last_word(state: &mut AppState) {
         tracing::trace!(reason = %reason.as_str(), "autoconvert skip: decision");
         return;
     }
-    tracing::trace!(word = %payload.run.text, converted = %converted, "autoconvert decision");
+    tracing::trace!(word_len = payload.run_len, "autoconvert decision");
     if let Err(err) = apply_last_word_replacement(&payload, &converted, restore.target) {
         tracing::warn!(error = %err.as_str(), "autoconvert apply failed");
         return;
     }
-    update_journal(&payload, &converted);
-    crate::input_journal::mark_last_token_autoconverted();
+    if !update_journal(&payload, &converted) {
+        return;
+    }
+    if !crate::input_journal::mark_last_token_autoconverted_if_generation(
+        payload.security_generation,
+    ) {
+        return;
+    }
     restore.commit();
     match switch_keyboard_layout() {
         Ok(()) => tracing::trace!("layout switched (autoconvert)"),
@@ -190,6 +209,7 @@ struct JournalRestore<'a> {
     payload: &'a LastRunPayload,
     committed: bool,
     target: Option<FocusTarget>,
+    security_generation: u64,
 }
 impl<'a> JournalRestore<'a> {
     fn new(payload: &'a LastRunPayload, target: Option<FocusTarget>) -> Self {
@@ -197,26 +217,38 @@ impl<'a> JournalRestore<'a> {
             payload,
             committed: false,
             target,
+            security_generation: payload.security_generation,
         }
     }
     fn commit(&mut self) {
         self.committed = true;
     }
     fn target_is_current(&self) -> bool {
-        self.target.is_some_and(FocusTarget::is_current)
+        crate::platform::win::secure_input::validate_generation(self.security_generation)
+            && self.target.is_some_and(FocusTarget::is_current)
     }
 }
 impl Drop for JournalRestore<'_> {
     fn drop(&mut self) {
-        if self.committed {
+        if self.committed
+            || !crate::platform::win::secure_input::validate_generation(self.security_generation)
+        {
+            return;
+        }
+        if self.target.is_some()
+            && !crate::platform::win::secure_input::protect_current_context().is_allowed()
+        {
             return;
         }
         if self.target.is_some() && !self.target_is_current() {
-            crate::input::ring_buffer::invalidate();
+            crate::platform::win::secure_input::invalidate_context_if_current(
+                self.security_generation,
+            );
             return;
         }
-        restore_journal_original(self.payload);
-        tracing::trace!("autoconvert: journal restored");
+        if restore_journal_original(self.payload) {
+            tracing::trace!("autoconvert: journal restored");
+        }
     }
 }
 
@@ -225,6 +257,7 @@ struct JournalRestoreSequence<'a> {
     payload: &'a LastSequencePayload,
     committed: bool,
     target: Option<FocusTarget>,
+    security_generation: u64,
 }
 impl<'a> JournalRestoreSequence<'a> {
     fn new(payload: &'a LastSequencePayload, target: Option<FocusTarget>) -> Self {
@@ -232,22 +265,33 @@ impl<'a> JournalRestoreSequence<'a> {
             payload,
             committed: false,
             target,
+            security_generation: payload.security_generation,
         }
     }
     fn commit(&mut self) {
         self.committed = true;
     }
     fn target_is_current(&self) -> bool {
-        self.target.is_some_and(FocusTarget::is_current)
+        crate::platform::win::secure_input::validate_generation(self.security_generation)
+            && self.target.is_some_and(FocusTarget::is_current)
     }
 }
 impl Drop for JournalRestoreSequence<'_> {
     fn drop(&mut self) {
-        if self.committed {
+        if self.committed
+            || !crate::platform::win::secure_input::validate_generation(self.security_generation)
+        {
+            return;
+        }
+        if self.target.is_some()
+            && !crate::platform::win::secure_input::protect_current_context().is_allowed()
+        {
             return;
         }
         if self.target.is_some() && !self.target_is_current() {
-            crate::input::ring_buffer::invalidate();
+            crate::platform::win::secure_input::invalidate_context_if_current(
+                self.security_generation,
+            );
             return;
         }
         restore_journal_original_sequence(self.payload);
@@ -550,6 +594,9 @@ fn convert_last_word_impl(state: &mut AppState, switch_layout: bool, mode: Direc
         return true;
     }
     sleep_before_convert(state);
+    if !crate::platform::win::secure_input::protect_current_context().is_allowed() {
+        return true;
+    }
     let target = FocusTarget::capture();
     let Some(payload) = take_last_word_payload() else {
         tracing::info!("journal: no last word");
@@ -574,8 +621,14 @@ fn convert_last_word_impl(state: &mut AppState, switch_layout: bool, mode: Direc
         if plan.text == payload.run.text
             || apply_last_word_conversion(&payload, &plan.text, restore.target)
         {
-            crate::input_journal::push_runs(plan.runs);
-            crate::input_journal::push_runs(payload.suffix_runs.iter().cloned());
+            if !crate::input_journal::push_runs_if_generation(
+                payload.security_generation,
+                plan.runs
+                    .into_iter()
+                    .chain(payload.suffix_runs.iter().cloned()),
+            ) {
+                return true;
+            }
             restore.commit();
             if switch_layout
                 && let Some(target) = restore.target.filter(|target| target.is_current())
@@ -586,13 +639,15 @@ fn convert_last_word_impl(state: &mut AppState, switch_layout: bool, mode: Direc
         return true;
     }
     if matches!(mode, DirectionMode::TextFirst) && smart::text_looks_correct(&payload.run.text) {
-        tracing::trace!(text = %payload.run.text, "smart convert skipped: text already looks correct");
+        tracing::trace!("smart convert skipped: text already looks correct");
         return true;
     }
     let converted = convert_with_mode(&payload.run.text, &payload.run.layout, mode);
-    tracing::trace!(%converted, "converted");
+    tracing::trace!(converted_len = converted.chars().count(), "converted");
     if apply_last_word_conversion(&payload, &converted, restore.target) {
-        update_journal(&payload, &converted);
+        if !update_journal(&payload, &converted) {
+            return true;
+        }
         restore.commit();
         if switch_layout {
             match switch_keyboard_layout() {
@@ -618,6 +673,9 @@ fn convert_last_sequence_impl(state: &mut AppState, switch_layout: bool, mode: D
         return;
     }
     sleep_before_convert(state);
+    if !crate::platform::win::secure_input::protect_current_context().is_allowed() {
+        return;
+    }
     let target = FocusTarget::capture();
     let Some(payload) = take_last_sequence_payload() else {
         tracing::info!("journal: no last sequence");
@@ -646,9 +704,17 @@ fn convert_last_sequence_impl(state: &mut AppState, switch_layout: bool, mode: D
         if plan.text == payload.seq_text
             || apply_last_sequence_conversion(&payload, &plan.text, restore.target)
         {
-            crate::input_journal::push_runs(payload.prefix_runs.iter().cloned());
-            crate::input_journal::push_runs(plan.runs);
-            crate::input_journal::push_runs(payload.suffix_runs.iter().cloned());
+            if !crate::input_journal::push_runs_if_generation(
+                payload.security_generation,
+                payload
+                    .prefix_runs
+                    .iter()
+                    .cloned()
+                    .chain(plan.runs)
+                    .chain(payload.suffix_runs.iter().cloned()),
+            ) {
+                return;
+            }
             restore.commit();
             if switch_layout
                 && let Some(target) = restore.target.filter(|target| target.is_current())
@@ -659,13 +725,15 @@ fn convert_last_sequence_impl(state: &mut AppState, switch_layout: bool, mode: D
         return;
     }
     if matches!(mode, DirectionMode::TextFirst) && smart::text_looks_correct(&payload.seq_text) {
-        tracing::trace!(text = %payload.seq_text, "smart convert skipped: text already looks correct");
+        tracing::trace!("smart convert skipped: text already looks correct");
         return;
     }
     let converted = convert_sequence_runs(&payload.runs, mode);
-    tracing::trace!(%converted, "converted");
+    tracing::trace!(converted_len = converted.chars().count(), "converted");
     if apply_last_sequence_conversion(&payload, &converted, restore.target) {
-        update_journal_sequence(&payload, &converted, mode);
+        if !update_journal_sequence(&payload, &converted, mode) {
+            return;
+        }
         restore.commit();
         if switch_layout {
             match switch_keyboard_layout() {
@@ -688,6 +756,7 @@ fn sleep_before_convert(_state: &AppState) {
     thread::sleep(Duration::from_millis(u64::from(delay_ms)));
 }
 struct LastRunPayload {
+    security_generation: u64,
     run: InputRun,
     suffix_runs: Vec<InputRun>,
     suffix_text: String,
@@ -698,6 +767,7 @@ struct LastRunPayload {
 }
 
 struct LastSequencePayload {
+    security_generation: u64,
     prefix_runs: Vec<InputRun>,
     runs: Vec<InputRun>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -720,7 +790,9 @@ fn suffix_text_and_meta(suffix_runs: &[InputRun]) -> (String, usize, bool, bool)
     (text, len, spaces_only, has_newline)
 }
 fn take_last_word_payload() -> Option<LastRunPayload> {
-    let (run, suffix_runs) = crate::input_journal::take_last_layout_run_with_suffix()?;
+    let security_generation = crate::platform::win::secure_input::generation();
+    let (run, suffix_runs) =
+        crate::input_journal::take_last_layout_run_with_suffix_if_generation(security_generation)?;
     if run.kind != RunKind::Text || run.text.is_empty() {
         return None;
     }
@@ -728,10 +800,8 @@ fn take_last_word_payload() -> Option<LastRunPayload> {
         suffix_text_and_meta(&suffix_runs);
     let run_len = run.text.chars().count();
     tracing::trace!(
-        run_text = %run.text,
         run_layout = ?run.layout,
         run_origin = ?run.origin,
-        suffix_text = %suffix_text,
         run_len,
         suffix_len,
         suffix_spaces_only,
@@ -739,6 +809,7 @@ fn take_last_word_payload() -> Option<LastRunPayload> {
         "journal extracted run"
     );
     Some(LastRunPayload {
+        security_generation,
         run,
         suffix_runs,
         suffix_text,
@@ -753,7 +824,9 @@ fn join_runs_text(runs: &[InputRun]) -> String {
 }
 
 fn take_last_sequence_payload() -> Option<LastSequencePayload> {
-    let (runs, suffix_runs) = crate::input_journal::take_last_sequence_with_suffix()?;
+    let security_generation = crate::platform::win::secure_input::generation();
+    let (runs, suffix_runs) =
+        crate::input_journal::take_last_sequence_with_suffix_if_generation(security_generation)?;
     let last = runs.last()?;
     if last.kind != RunKind::Text {
         return None;
@@ -768,9 +841,7 @@ fn take_last_sequence_payload() -> Option<LastSequencePayload> {
     let seq_len = seq_text.chars().count();
     let seq_has_newline = seq_text.contains('\n') || seq_text.contains('\r');
     tracing::trace!(
-        seq_text = %seq_text,
         seq_layout = ?layout,
-        suffix_text = %suffix_text,
         seq_len,
         suffix_len,
         suffix_spaces_only,
@@ -780,6 +851,7 @@ fn take_last_sequence_payload() -> Option<LastSequencePayload> {
     );
 
     Some(LastSequencePayload {
+        security_generation,
         prefix_runs: Vec::new(),
         runs,
         layout,
@@ -852,17 +924,26 @@ fn flipped_layout(layout: LayoutTag) -> LayoutTag {
         other => other,
     }
 }
-/// Updates the input journal to match what was inserted.
-fn restore_journal_original_sequence(p: &LastSequencePayload) {
-    crate::input_journal::push_runs(p.prefix_runs.iter().cloned());
-    crate::input_journal::push_runs(p.runs.iter().cloned());
-    crate::input_journal::push_runs(p.suffix_runs.iter().cloned());
+/// Restore the complete extracted batch only to its original security context.
+fn restore_journal_original_sequence(p: &LastSequencePayload) -> bool {
+    if !crate::input_journal::push_runs_if_generation(
+        p.security_generation,
+        p.prefix_runs
+            .iter()
+            .chain(&p.runs)
+            .chain(&p.suffix_runs)
+            .cloned(),
+    ) {
+        return false;
+    }
     tracing::trace!("journal restored (original sequence metadata)");
+    true
 }
 
-fn update_journal_sequence(p: &LastSequencePayload, converted: &str, mode: DirectionMode) {
-    crate::input_journal::push_runs(p.prefix_runs.iter().cloned());
-    crate::input_journal::push_runs(p.runs.iter().map(|run| {
+fn update_journal_sequence(p: &LastSequencePayload, converted: &str, mode: DirectionMode) -> bool {
+    // Complete conversion before taking the journal mutex; the final batch is
+    // then checked and appended atomically with its original protection token.
+    let converted_runs = p.runs.iter().map(|run| {
         let text = match run.kind {
             RunKind::Whitespace => run.text.clone(),
             RunKind::Text => convert_with_mode(&run.text, &run.layout, mode),
@@ -880,24 +961,48 @@ fn update_journal_sequence(p: &LastSequencePayload, converted: &str, mode: Direc
             origin: RunOrigin::Programmatic,
             kind: run.kind,
         }
-    }));
-    crate::input_journal::push_runs(p.suffix_runs.iter().cloned());
-    tracing::trace!(%converted, "journal updated (sequence)");
+    });
+    let runs: Vec<_> = p
+        .prefix_runs
+        .iter()
+        .cloned()
+        .chain(converted_runs)
+        .chain(p.suffix_runs.iter().cloned())
+        .collect();
+    if !crate::input_journal::push_runs_if_generation(p.security_generation, runs) {
+        return false;
+    }
+    tracing::trace!(
+        converted_len = converted.chars().count(),
+        "journal updated (sequence)"
+    );
+    true
 }
-fn restore_journal_original(p: &LastRunPayload) {
-    crate::input_journal::push_run(p.run.clone());
-    crate::input_journal::push_runs(p.suffix_runs.iter().cloned());
+fn restore_journal_original(p: &LastRunPayload) -> bool {
+    if !crate::input_journal::push_runs_if_generation(
+        p.security_generation,
+        std::iter::once(p.run.clone()).chain(p.suffix_runs.iter().cloned()),
+    ) {
+        return false;
+    }
     tracing::trace!("journal restored (original metadata)");
+    true
 }
-fn update_journal(p: &LastRunPayload, converted: &str) {
-    crate::input_journal::push_run(InputRun {
+fn update_journal(p: &LastRunPayload, converted: &str) -> bool {
+    let converted_run = InputRun {
         text: converted.to_string(),
         layout: flipped_layout(p.run.layout),
         origin: RunOrigin::Programmatic,
         kind: RunKind::Text,
-    });
-    crate::input_journal::push_runs(p.suffix_runs.iter().cloned());
+    };
+    if !crate::input_journal::push_runs_if_generation(
+        p.security_generation,
+        std::iter::once(converted_run).chain(p.suffix_runs.iter().cloned()),
+    ) {
+        return false;
+    }
     tracing::trace!("journal updated");
+    true
 }
 #[cfg(test)]
 mod tests {
@@ -917,6 +1022,101 @@ mod tests {
             .with_minimum_relative_distance(0.20)
             .build()
     }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn journal_traces_contain_metadata_but_not_input_or_conversion_text() {
+        let _guard = test_lock();
+        ring_buffer::invalidate();
+        ring_buffer::push_text("TracePrivacy-48291 ");
+        let word = take_last_word_payload().expect("word payload");
+        restore_journal_original(&word);
+        let sequence = take_last_sequence_payload().expect("sequence payload");
+        update_journal_sequence(
+            &sequence,
+            "ConvertedPrivacy-48291",
+            DirectionMode::LayoutFirst,
+        );
+
+        assert!(logs_contain("journal extracted run"));
+        assert!(logs_contain("journal extracted sequence"));
+        assert!(logs_contain("journal updated (sequence)"));
+        assert!(!logs_contain("TracePrivacy-48291"));
+        assert!(!logs_contain("ConvertedPrivacy-48291"));
+        ring_buffer::invalidate();
+    }
+
+    #[test]
+    fn secure_input_generation_prevents_restoring_extracted_word() {
+        let _guard = test_lock();
+        ring_buffer::invalidate();
+        ring_buffer::push_text("PrivateFixture ");
+        let payload = take_last_word_payload().expect("word payload");
+        crate::platform::win::secure_input::clear_sensitive_context();
+        // A guard constructed after invalidation still belongs to the payload's
+        // original context, rather than sampling and accepting the new token.
+        let restore = JournalRestore::new(&payload, None);
+        drop(restore);
+
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        assert!(ring_buffer::take_last_layout_run_with_suffix().is_none());
+    }
+
+    #[test]
+    fn secure_input_generation_prevents_restoring_extracted_sequence() {
+        let _guard = test_lock();
+        ring_buffer::invalidate();
+        ring_buffer::push_text("Private Fixture ");
+        let payload = take_last_sequence_payload().expect("sequence payload");
+        let restore = JournalRestoreSequence::new(&payload, None);
+
+        crate::platform::win::secure_input::clear_sensitive_context();
+        drop(restore);
+
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        assert!(ring_buffer::take_last_sequence_with_suffix().is_none());
+    }
+
+    #[test]
+    fn late_conversion_cannot_append_word_or_suffix_to_a_new_context() {
+        let _guard = test_lock();
+        ring_buffer::invalidate();
+        ring_buffer::push_text("old-private-word  ");
+        let payload = take_last_word_payload().expect("word payload");
+
+        crate::platform::win::secure_input::clear_sensitive_context();
+        ring_buffer::push_text("current-context");
+        assert!(!update_journal(&payload, "old-conversion"));
+        assert!(!restore_journal_original(&payload));
+
+        assert_eq!(
+            join_runs_text(&ring_buffer::runs_snapshot()),
+            "current-context"
+        );
+    }
+
+    #[test]
+    fn late_conversion_cannot_append_sequence_or_suffix_to_a_new_context() {
+        let _guard = test_lock();
+        ring_buffer::invalidate();
+        ring_buffer::push_text("old private sequence  ");
+        let payload = take_last_sequence_payload().expect("sequence payload");
+
+        crate::platform::win::secure_input::clear_sensitive_context();
+        ring_buffer::push_text("current-context");
+        assert!(!update_journal_sequence(
+            &payload,
+            "old converted sequence",
+            DirectionMode::LayoutFirst,
+        ));
+        assert!(!restore_journal_original_sequence(&payload));
+
+        assert_eq!(
+            join_runs_text(&ring_buffer::runs_snapshot()),
+            "current-context"
+        );
+    }
+
     #[test]
     fn ru_layout_punctuation_run_converts_ru_to_en() {
         let _guard = test_lock();
@@ -1033,6 +1233,7 @@ mod tests {
     fn convert_candidate_converts_entire_run_without_punct_peel() {
         let _guard = test_lock();
         let payload = LastRunPayload {
+            security_generation: crate::platform::win::secure_input::generation(),
             run: InputRun {
                 text: "ghbdtn,".to_string(),
                 layout: LayoutTag::En,

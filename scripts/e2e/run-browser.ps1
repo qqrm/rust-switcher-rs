@@ -1,4 +1,7 @@
-param([Parameter(Mandatory = $true)][string]$DebugExe)
+param(
+    [Parameter(Mandatory = $true)][string]$DebugExe,
+    [switch]$SecurityOnly
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -20,8 +23,9 @@ $connections = [System.Collections.Generic.List[System.IDisposable]]::new()
 $switcherOutput = $null
 $switcherErrors = $null
 $failure = $null
-$script:requestId = 0
 
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -32,10 +36,12 @@ using System.Text;
 using System.Threading;
 public sealed class BrowserSocket : IDisposable {
     private readonly ClientWebSocket socket = new ClientWebSocket();
+    private int requestId;
     public BrowserSocket(string address) {
         using (var timeout = new CancellationTokenSource(5000))
             socket.ConnectAsync(new Uri(address), timeout.Token).GetAwaiter().GetResult();
     }
+    public int NextRequestId() { return Interlocked.Increment(ref requestId); }
     public void Send(string message) {
         using (var timeout = new CancellationTokenSource(5000)) {
             var bytes = Encoding.UTF8.GetBytes(message);
@@ -96,6 +102,10 @@ public static class BrowserInput {
     [DllImport("user32.dll", SetLastError=true)] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out RECT rect);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr w, IntPtr l,
+        uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr window, uint message, UIntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr LoadKeyboardLayout(string layout, uint flags);
     private static INPUT Event(ushort key, bool up) {
@@ -117,6 +127,19 @@ public static class BrowserInput {
         var title = new StringBuilder(512);
         GetWindowText(window, title, title.Capacity);
         return title.ToString();
+    }
+    public static string ClassOf(IntPtr window) {
+        var name = new StringBuilder(256);
+        if (window == IntPtr.Zero || GetClassName(window, name, name.Capacity) == 0)
+            throw new InvalidOperationException("Focused native window has no class name");
+        return name.ToString();
+    }
+    public static long SecurityMetadata(IntPtr window, uint selector) {
+        UIntPtr result;
+        if (window == IntPtr.Zero || SendMessageTimeout(window, 0x83F0, new UIntPtr(selector),
+            IntPtr.Zero, 2, 200, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Debug security metadata did not respond");
+        return checked((long)result.ToUInt64());
     }
     public static IntPtr LayoutOf(IntPtr window) {
         uint process;
@@ -192,8 +215,9 @@ function Wait-Browser([scriptblock]$Condition, [string]$Description, [int]$Milli
     throw "Timed out: $Description"
 }
 function Invoke-Cdp($Connection, [string]$Method, [hashtable]$Arguments = @{}) {
-    $script:requestId++
-    $id = $script:requestId
+    # The security cases run in a child script scope. CDP state belongs to the
+    # connection, so invoking this helper from another script cannot reset it.
+    $id = $Connection.NextRequestId()
     $Connection.Send((@{id = $id; method = $Method; params = $Arguments} | ConvertTo-Json -Depth 8 -Compress))
     do {
         $reply = $Connection.Receive() | ConvertFrom-Json
@@ -249,6 +273,7 @@ try {
     $info.UseShellExecute = $false
     foreach ($argument in @('--no-first-run', '--no-default-browser-check', '--disable-background-networking',
         '--disable-component-update', '--disable-sync', '--disable-extensions', '--force-device-scale-factor=1',
+        '--force-renderer-accessibility',
         '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--window-size=1000,800',
         "--user-data-dir=$browserProfile", $fixtureUrl)) { $info.ArgumentList.Add($argument) }
     $browser = [System.Diagnostics.Process]::Start($info)
@@ -313,10 +338,8 @@ try {
     $switcherProfile = Join-Path $runRoot 'switcher-profile'
     $configDirectory = Join-Path $switcherProfile 'RustSwitcherDebug'
     New-Item -ItemType Directory -Path $configDirectory | Out-Null
-    @'
-delay_ms = 100
-smarter_hotkeys_enabled = true
-'@ | Set-Content -LiteralPath (Join-Path $configDirectory 'config.json') -Encoding utf8NoBOM
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'browser-config.toml') `
+        -Destination (Join-Path $configDirectory 'config.json')
     $switcherInfo = [System.Diagnostics.ProcessStartInfo]::new($DebugExe)
     $switcherInfo.UseShellExecute = $false
     $switcherInfo.CreateNoWindow = $true
@@ -341,26 +364,29 @@ smarter_hotkeys_enabled = true
         commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID} | ConvertTo-Json -Compress | Write-Output
 
     $cases = [System.Collections.Generic.List[object]]::new()
-    foreach ($kind in @('input', 'textarea', 'editable', 'shadow', 'iframe')) {
-        foreach ($sample in @(@{Text = 'ghbdtn'; Expected = 'привет'}, @{Text = '.ghbdtn'; Expected = 'юпривет'})) {
-            foreach ($gap in @(0, 30)) {
-                $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = $sample.Text; Expected = $sample.Expected; Gap = $gap; Repeat = 1})
+    if (-not $SecurityOnly) {
+        foreach ($kind in @('input', 'textarea', 'editable', 'shadow', 'iframe')) {
+            foreach ($sample in @(@{Text = 'ghbdtn'; Expected = 'привет'}, @{Text = '.ghbdtn'; Expected = 'юпривет'})) {
+                foreach ($gap in @(0, 30)) {
+                    $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = $sample.Text; Expected = $sample.Expected; Gap = $gap; Repeat = 1})
+                }
+            }
+            $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.'; Expected = 'ю'; Gap = 0; Repeat = 1})
+        }
+        foreach ($mode in @('tab', 'click', 'window', 'ctrl-release', 'alt-release')) {
+            foreach ($kind in @('textarea', 'editable')) {
+                $cases.Add(@{Kind = $kind; Mode = $mode; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 0; Repeat = 1})
             }
         }
-        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.'; Expected = 'ю'; Gap = 0; Repeat = 1})
-    }
-    foreach ($mode in @('tab', 'click', 'window', 'ctrl-release', 'alt-release')) {
         foreach ($kind in @('textarea', 'editable')) {
-            $cases.Add(@{Kind = $kind; Mode = $mode; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 0; Repeat = 1})
+            $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = 'a' * 101; Expected = 'ф' * 101; Gap = 0; Repeat = 1})
+            $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.' + ('a' * 100); Expected = 'ю' + ('ф' * 100); Gap = 0; Repeat = 1})
         }
-    }
-    foreach ($kind in @('textarea', 'editable')) {
-        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = 'a' * 101; Expected = 'ф' * 101; Gap = 0; Repeat = 1})
-        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.' + ('a' * 100); Expected = 'ю' + ('ф' * 100); Gap = 0; Repeat = 1})
-    }
-    foreach ($repeat in 1..6) {
-        $cases.Add(@{Kind = 'editable'; Mode = 'fresh'; Text = 'ghbdtn'; Expected = 'привет'; Gap = 1; Repeat = $repeat})
-        $cases.Add(@{Kind = 'textarea'; Mode = 'fresh'; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 1; Repeat = $repeat})
+        foreach ($repeat in 1..6) {
+            $cases.Add(@{Kind = 'editable'; Mode = 'fresh'; Text = 'ghbdtn'; Expected = 'привет'; Gap = 1; Repeat = $repeat})
+            $cases.Add(@{Kind = 'textarea'; Mode = 'fresh'; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 1; Repeat = $repeat})
+        }
+        if ($cases.Count -ne 51) { throw "Expected 51 ordinary browser cases, found $($cases.Count)" }
     }
 
     foreach ($case in $cases) {
@@ -468,6 +494,12 @@ smarter_hotkeys_enabled = true
         $results.Add([pscustomobject]$record)
         $record | ConvertTo-Json -Depth 6 -Compress | Write-Output
         if ($null -eq $record.error) { Write-Output "PASS: $name" } else { Write-Output "FAIL: $name" }
+    }
+    $securityStart = $results.Count
+    & (Join-Path $PSScriptRoot 'browser-security-cases.ps1') -Sessions $sessions `
+        -SwitcherProcess $switcher -Results $results -Failures $failures
+    if ($results.Count - $securityStart -ne 6) {
+        throw "Expected 6 browser password cases, found $($results.Count - $securityStart)"
     }
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
 } catch {

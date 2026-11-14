@@ -1276,6 +1276,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

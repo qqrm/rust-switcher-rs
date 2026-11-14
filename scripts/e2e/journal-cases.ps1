@@ -126,6 +126,7 @@ try {
             observedReleaseDelayMs = $null; input = $case.Text; expected = $case.Expected
             sourceFocusRequests = $null
             actualBefore = $null; actualAfter = $null; otherEditorsUnchanged = $null; error = $null
+            journalAfterFailure = $null; journalMetadataError = $null
         }
         $heldModifier = [ushort]0
         $value = $null
@@ -241,6 +242,18 @@ try {
             }
         } catch {
             $record.error = $_.Exception.Message
+            # Read only after an assertion has already failed. A pre-input
+            # metadata round trip could conceal the first-key focus race.
+            try {
+                if ([HostedInput]::SecurityMetadata($appHandle, 0) -ne 0x52535031) {
+                    throw 'Journal metadata endpoint is unavailable'
+                }
+                $record.journalAfterFailure = [ordered]@{
+                    activeChars = [HostedInput]::SecurityMetadata($appHandle, 1)
+                    cachedChars = [HostedInput]::SecurityMetadata($appHandle, 2)
+                    physicalAppendCount = [HostedInput]::SecurityMetadata($appHandle, 3)
+                }
+            } catch { $record.journalMetadataError = $_.Exception.Message }
             # Preserve exact strings even when an assertion times out.
             if ($null -ne $value) {
                 try { $record.actualAfter = $value.Current.Value } catch { }

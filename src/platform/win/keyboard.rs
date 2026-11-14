@@ -20,16 +20,13 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::SystemInformation::GetTickCount64,
     UI::WindowsAndMessaging::{
-        CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, PostMessageW,
+        CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
         SetWindowsHookExW, WH_KEYBOARD_LL,
     },
 };
 
 use self::vk::{is_keydown_msg, is_keyup_msg, mod_bit_for_vk, normalize_vk};
-use crate::{
-    input,
-    platform::win::keyboard::{keydown::handle_keydown, keyup::handle_keyup},
-};
+use crate::platform::win::keyboard::{keydown::handle_keydown, keyup::handle_keyup};
 
 static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -53,6 +50,11 @@ fn main_hwnd() -> Option<HWND> {
     } else {
         Some(HWND(raw as *mut _))
     }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn allows_e2e_metadata() -> bool {
+    e2e_scope::allows_foreground(unsafe { GetForegroundWindow() })
 }
 
 #[cfg(debug_assertions)]
@@ -165,21 +167,7 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     };
 
     if is_keydown && matches!(decision.as_ref(), Ok(HookDecision::Pass)) {
-        let typed = input::ring_buffer::record_keydown(kb, vk);
-
-        if typed.is_some()
-            && crate::input::ring_buffer::last_char_triggers_autoconvert()
-            && let Some(hwnd) = main_hwnd()
-        {
-            let _ = unsafe {
-                PostMessageW(
-                    Some(hwnd),
-                    crate::platform::ui::error_notifier::WM_APP_AUTOCONVERT,
-                    WPARAM(0),
-                    LPARAM(0),
-                )
-            };
-        }
+        super::secure_input::record_keydown(kb, vk);
     }
 
     match decision {
@@ -221,6 +209,7 @@ pub fn install(hwnd: HWND, state: &mut crate::app::AppState) {
     }
 
     crate::input::ring_buffer::warm_decoder();
+    super::secure_input::initialize(hwnd);
     crate::domain::text::multilang::warm();
 
     match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(proc), None, 0) } {

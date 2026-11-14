@@ -1,0 +1,47 @@
+# Every shortcut exercised by browser-security-cases.ps1 is explicit. Missing
+# Option fields deserialize as None; Config::default() does not fill this file.
+delay_ms = 100
+smarter_hotkeys_enabled = true
+autoconvert_feature_enabled = true
+
+[hotkey_convert_last_word_sequence]
+first = { mods = 4, mods_vks = 4 }
+second = { mods = 4, mods_vks = 4 }
+max_gap_ms = 1000
+
+[hotkey_convert_last_sequence_sequence]
+first = { mods = 1, mods_vks = 16 }
+second = { mods = 1, mods_vks = 16 }
+max_gap_ms = 1000
+
+[hotkey_convert_selection_sequence]
+first = { mods = 4, mods_vks = 4 }
+second = { mods = 4, mods_vks = 4 }
+max_gap_ms = 1000
+
+[hotkey_switch_layout_sequence]
+first = { mods = 0, mods_vks = 0, vk = 20 }
+max_gap_ms = 1000
+
+[hotkey_pause_sequence]
+first = { mods = 2, mods_vks = 2 }
+second = { mods = 2, mods_vks = 2 }
+max_gap_ms = 1000
+
+[smart_hotkey_convert_last_word_sequence]
+first = { mods = 4, mods_vks = 4 }
+second = { mods = 4, mods_vks = 4 }
+third = { mods = 4, mods_vks = 4 }
+max_gap_ms = 1000
+
+[smart_hotkey_convert_last_sequence_sequence]
+first = { mods = 1, mods_vks = 16 }
+second = { mods = 1, mods_vks = 16 }
+third = { mods = 1, mods_vks = 16 }
+max_gap_ms = 1000
+
+[smart_hotkey_convert_selection_sequence]
+first = { mods = 4, mods_vks = 4 }
+second = { mods = 4, mods_vks = 4 }
+third = { mods = 4, mods_vks = 4 }
+max_gap_ms = 1000

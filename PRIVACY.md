@@ -1,6 +1,6 @@
 # Rust Switcher privacy policy
 
-Last updated: November 4, 2026. This policy describes Rust Switcher,
+Last updated: November 14, 2026. This policy describes Rust Switcher,
 published by [QQRM](https://github.com/qqrm), including its portable Windows
 release. It covers the application itself; GitHub, package managers, Windows,
 and applications in which you type have their own data handling practices.
@@ -36,8 +36,29 @@ therefore not a limit on all text accessed during selection detection.
 
 Converted text is sent back to the focused application using simulated
 keyboard input. That application may store or transmit it according to its
-own settings and policies. Rust Switcher does not guarantee that sensitive
-fields, including password fields, are excluded from keyboard processing.
+own settings and policies.
+
+Rust Switcher excludes recognized password fields from its input journal and
+text conversion. Standard Windows Edit/RichEdit password styles and the focused
+control's UI Automation `IsPassword` property are checked without reading the
+password. Custom controls are supported when their accessibility provider
+correctly exposes that property. A missing property, unavailable provider,
+timeout, or obsolete focus result blocks capture and conversion; ordinary typing
+and layout switching remain available. Password detection clears the active
+journal, all cached journals, and pending decoder composition.
+
+UI Automation runs on a separate worker. The keyboard hook can briefly queue
+bounded raw keyboard snapshots for validation before decoding and journal
+insertion. Snapshots contain key codes, keyboard state, layout, and focus
+metadata, and can therefore represent sensitive input. They are not written to
+disk or diagnostic logs, are discarded on rejection or expiry, and are not sent
+to the UI Automation provider. Clearing memory does not securely overwrite it.
+
+An application that incorrectly reports a password field as ordinary text,
+unreported focus changes, and focus changes between the final check and Windows
+input delivery remain limitations. This is a best-effort application safeguard,
+not a security boundary against other software running under the same account.
+See [security behavior and tests](docs/security.md).
 
 ## Memory and retention
 
@@ -151,11 +172,10 @@ text if you do not want Rust Switcher to process that input.
 
 The published release does not enable tracing output. Debug builds with the
 `debug-tracing` feature can write diagnostics to standard error, controlled
-by `RUST_LOG`. These diagnostics may include original and converted text,
-keyboard layouts, and window or caret information. A terminal, development
-tool, or redirection configured by the developer may retain that output.
-Avoid sensitive input during such sessions and remove captured logs when
-they are no longer needed.
+by `RUST_LOG`. Diagnostics contain lengths, operation status, keyboard layouts,
+and window or caret metadata; original, selected, converted, and journal text
+are excluded. A terminal, development tool, or redirection configured by the
+developer may retain these metadata logs.
 
 ## Transmission and security
 

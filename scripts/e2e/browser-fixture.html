@@ -43,9 +43,9 @@
     return element;
   }
   function editor(doc, kind, id) {
-    const element = doc.createElement(kind === 'editable' ? 'div' : kind);
+    const element = doc.createElement(kind === 'editable' ? 'div' : kind === 'password' ? 'input' : kind);
     if (kind === 'editable') element.contentEditable = 'true';
-    if (kind === 'input') element.type = 'text';
+    if (kind === 'input' || kind === 'password') element.type = kind === 'password' ? 'password' : 'text';
     element.id = id;
     element.spellcheck = false;
     element.setAttribute('autocapitalize', 'off');
@@ -64,7 +64,9 @@
         let host = root;
         let doc = document;
         let editorKind = kind;
-        if (kind === 'shadow') {
+        if (kind === 'secure') {
+          editorKind = id === 'a' ? 'password' : id === 'b' ? 'input' : 'editable';
+        } else if (kind === 'shadow') {
           const shell = document.createElement('div');
           shell.id = 'shadow-host';
           root.append(shell);
@@ -92,6 +94,24 @@
       return true;
     },
     set(id, value) { write(fields[id], value); return true; },
+    setType(id, type) {
+      if (fields[id].tagName !== 'INPUT' || !['text', 'password'].includes(type)) {
+        throw new Error('Only an owned input may change password type');
+      }
+      fields[id].type = type;
+      return true;
+    },
+    select(id) {
+      const element = fields[id];
+      if (element.isContentEditable) {
+        const range = element.ownerDocument.createRange();
+        range.selectNodeContents(element);
+        const selection = element.ownerDocument.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } else element.setSelectionRange(0, element.value.length);
+      return deepActive() === element && document.hasFocus();
+    },
     focus(id) {
       const element = fields[id];
       element.focus();
