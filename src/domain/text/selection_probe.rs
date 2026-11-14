@@ -23,6 +23,7 @@ use windows::{
     },
 };
 use crate::utils::bounded_worker::BoundedWorker;
+use crate::platform::win::secure_input;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const MESSAGE_TIMEOUT_MS: u32 = 50;
@@ -35,10 +36,12 @@ pub(super) struct FocusTarget {
     focus: usize,
     thread: u32,
     process: u32,
+    security_generation: u64,
 }
 
 impl FocusTarget {
     pub(super) fn capture() -> Option<Self> {
+        let security_generation = secure_input::generation();
         let foreground = unsafe { GetForegroundWindow() };
         if foreground.0.is_null() { return None; }
         let thread = unsafe { GetWindowThreadProcessId(foreground, None) };
@@ -52,10 +55,11 @@ impl FocusTarget {
         }
         let mut process = 0;
         let focus_thread = unsafe { GetWindowThreadProcessId(info.hwndFocus, Some(&mut process)) };
-        if process == 0 || focus_thread == 0 { return None; }
+        if process == 0 || focus_thread == 0
+            || !secure_input::validate_generation(security_generation) { return None; }
         Some(Self {
             foreground: foreground.0 as usize, focus: info.hwndFocus.0 as usize,
-            thread: focus_thread, process,
+            thread: focus_thread, process, security_generation,
         })
     }
 
@@ -204,6 +208,12 @@ impl ProbeState {
         }
         let Some(automation) = self.automation.as_ref() else { return Ok(SelectionProbe::Blocked); };
         let element = unsafe { automation.GetFocusedElement() }?;
+        // Check the provider's explicit password property before asking it for text.
+        // A missing property must not become a default FALSE authorization.
+        if !secure_input::element_status(&element).is_allowed() {
+            secure_input::clear_sensitive_context_if_current(target.security_generation);
+            return Ok(SelectionProbe::Blocked);
+        }
         let pattern: IUIAutomationTextPattern = match unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) } {
             Ok(pattern) => pattern,
             // Preserve fallback for an explicitly unsupported pattern only.
@@ -242,6 +252,10 @@ impl ProbeState {
         if selection.identity != SelectionIdentity::Automation(snapshot.generation) { return Ok(false); }
         let element = unsafe { automation.GetFocusedElement() }?;
         if !unsafe { automation.CompareElements(&snapshot.element, &element) }?.as_bool() {
+            return Ok(false);
+        }
+        if !secure_input::element_status(&element).is_allowed() {
+            secure_input::clear_sensitive_context_if_current(selection.target.security_generation);
             return Ok(false);
         }
         let pattern: IUIAutomationTextPattern = unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) }?;
@@ -285,6 +299,10 @@ fn same_native_selection(selection: &CapturedSelection) -> bool {
 fn probe_native(target: FocusTarget, max_chars: usize) -> SelectionProbe {
     if !target.is_current() { return SelectionProbe::Blocked; }
     let hwnd = target.focus_hwnd();
+    if secure_input::win32_password_state(hwnd) != Some(false) {
+        secure_input::clear_sensitive_context_if_current(target.security_generation);
+        return SelectionProbe::Blocked;
+    }
     let mut start = 0u32;
     let mut end = 0u32;
     // System messages below WM_USER marshal these pointers across processes.

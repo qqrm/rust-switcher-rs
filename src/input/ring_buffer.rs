@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::sync::MutexGuard;
 use std::{
     collections::VecDeque,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(windows)]
@@ -31,6 +34,12 @@ use windows::Win32::{
 };
 
 static JOURNAL: OnceLock<Mutex<InputJournal>> = OnceLock::new();
+static SECURE_INPUT_GENERATION: AtomicU64 = AtomicU64::new(1);
+// Conversion/restoration guards also expire on UIA descendant changes, while
+// raw keys queued after that focus event keep their ordered capture epoch.
+static SECURE_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+#[cfg(debug_assertions)]
+static PHYSICAL_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_CAPACITY_CHARS: usize = 4096;
 #[cfg(windows)]
 static JOURNAL_CACHE: OnceLock<Mutex<HashMap<FocusCacheKey, CachedJournal>>> = OnceLock::new();
@@ -835,20 +844,19 @@ pub fn warm_decoder() {
     let _ = layout_decode::warm();
 }
 
-#[cfg(windows)]
-fn current_foreground_layout_tag() -> LayoutTag {
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        return LayoutTag::Unknown;
-    }
-
-    let tid = unsafe { GetWindowThreadProcessId(fg, None) };
-    let hkl = unsafe { GetKeyboardLayout(tid) };
-    layout_tag_from_hkl(hkl)
+#[cfg(test)]
+pub fn mark_last_token_autoconverted() {
+    let _ = mark_last_token_autoconverted_if_generation(secure_context_generation());
 }
 
-pub fn mark_last_token_autoconverted() {
-    with_journal_mut(|j| j.last_token_autoconverted = true);
+pub fn mark_last_token_autoconverted_if_generation(generation: u64) -> bool {
+    with_journal_mut(|journal| {
+        if !validate_secure_context_generation(generation) {
+            return false;
+        }
+        journal.last_token_autoconverted = true;
+        true
+    })
 }
 
 #[cfg(any(test, windows))]
@@ -956,56 +964,102 @@ fn apply_keyboard_state_overrides(state: &mut [u8; 256], overrides: KeyboardStat
     }
 }
 
+/// Event-time state only. This deliberately contains no decoded text, and must
+/// never be formatted or logged. A delayed worker cannot resample modifiers or
+/// the keyboard layout after the user's next input has already arrived.
 #[cfg(windows)]
-fn decode_typed_text(kb: &KBDLLHOOKSTRUCT, vk: VIRTUAL_KEY) -> Option<DecodedText> {
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        mark_capture_unavailable();
-        return None;
-    }
-
-    let tid = unsafe { GetWindowThreadProcessId(fg, None) };
-    let hkl = unsafe { GetKeyboardLayout(tid) };
-    let layout = layout_tag_from_hkl(hkl);
-
-    let Some(focus) = current_focus_cache_key(fg) else {
-        mark_capture_unavailable();
-        return None;
-    };
-
-    let mut state = [0u8; 256];
-    if unsafe { GetKeyboardState(&mut state) }.is_err() {
-        mark_capture_unavailable();
-        return None;
-    }
-
-    apply_keyboard_state_overrides(&mut state, current_keyboard_state_overrides());
-    let ctrl_or_alt_held = mods_ctrl_or_alt_down();
-    let altgr_held = altgr_down();
-    // AltGr is printable input on many layouts. Restore only its *physical*
-    // state after clearing stale Ctrl/Alt bits; ordinary shortcuts stay filtered.
-    if altgr_held {
-        for modifier in [VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RMENU] {
-            set_key_down_state(&mut state, modifier, true);
-        }
-    }
-    let decoded = layout_decode::decode(
-        u32::from(vk.0),
-        kb.scanCode,
-        state,
-        hkl.0 as usize,
-        (focus.foreground_hwnd as usize, focus.focus_hwnd as usize),
-    );
-    if !with_journal_mut(|journal| {
-        journal.invalidate_if_foreground_changed();
-        journal.accept_decoded_focus(focus)
-    }) {
-        return None;
-    }
-    capture_decode_result(decoded, layout, focus, ctrl_or_alt_held, altgr_held)
+#[derive(Clone)]
+pub struct CapturedKey {
+    vk: VIRTUAL_KEY,
+    scan_code: u32,
+    keyboard_state: [u8; 256],
+    layout: usize,
+    focus: FocusCacheKey,
+    ctrl_or_alt_held: bool,
+    altgr_held: bool,
+    shift_held: bool,
 }
 
 #[cfg(windows)]
+impl CapturedKey {
+    pub fn is_current(&self) -> bool {
+        let foreground = unsafe { GetForegroundWindow() };
+        current_focus_cache_key(foreground)
+            .is_some_and(|current| same_focus_identity(self.focus, current))
+    }
+}
+
+#[cfg(windows)]
+pub fn capture_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<CapturedKey> {
+    if kb.flags.contains(LLKHF_INJECTED) && !allow_injected_input_for_e2e() {
+        return None;
+    }
+    let vk = VIRTUAL_KEY(u16::try_from(vk).ok()?);
+    if is_modifier_vk(vk) {
+        return None;
+    }
+    let foreground = unsafe { GetForegroundWindow() };
+    let Some(focus) = current_focus_cache_key(foreground) else {
+        mark_capture_unavailable();
+        return None;
+    };
+    let thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+    let layout = unsafe { GetKeyboardLayout(thread) }.0 as usize;
+    let mut keyboard_state = [0u8; 256];
+    if unsafe { GetKeyboardState(&mut keyboard_state) }.is_err() {
+        mark_capture_unavailable();
+        return None;
+    }
+    let overrides = current_keyboard_state_overrides();
+    apply_keyboard_state_overrides(&mut keyboard_state, overrides);
+    let ctrl_or_alt_held = mods_ctrl_or_alt_down();
+    let altgr_held = altgr_down();
+    if altgr_held {
+        for modifier in [VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RMENU] {
+            set_key_down_state(&mut keyboard_state, modifier, true);
+        }
+    }
+    Some(CapturedKey {
+        vk,
+        scan_code: kb.scanCode,
+        keyboard_state,
+        layout,
+        focus,
+        ctrl_or_alt_held,
+        altgr_held,
+        shift_held: overrides.shift_down,
+    })
+}
+
+#[cfg(windows)]
+fn decode_captured_key(key: &CapturedKey, generation: u64) -> Option<DecodedText> {
+    if !validate_secure_input_generation(generation) || !key.is_current() {
+        return None;
+    }
+    let decoded = layout_decode::decode(
+        u32::from(key.vk.0),
+        key.scan_code,
+        key.keyboard_state,
+        key.layout,
+        (
+            key.focus.foreground_hwnd as usize,
+            key.focus.focus_hwnd as usize,
+        ),
+    );
+    if !validate_secure_input_generation(generation) || !key.is_current() {
+        return None;
+    }
+    capture_decode_result_guarded(
+        decoded,
+        layout_tag_from_hkl(HKL(key.layout as *mut _)),
+        key.focus,
+        key.ctrl_or_alt_held,
+        key.altgr_held,
+        generation,
+    )
+}
+
+#[cfg(all(test, windows))]
 fn capture_decode_result(
     decoded: layout_decode::DecodeResult,
     layout: LayoutTag,
@@ -1013,13 +1067,43 @@ fn capture_decode_result(
     ctrl_or_alt_held: bool,
     altgr_held: bool,
 ) -> Option<DecodedText> {
+    capture_decode_result_guarded(
+        decoded,
+        layout,
+        focus,
+        ctrl_or_alt_held,
+        altgr_held,
+        secure_input_generation(),
+    )
+}
+
+#[cfg(windows)]
+fn capture_decode_result_guarded(
+    decoded: layout_decode::DecodeResult,
+    layout: LayoutTag,
+    focus: FocusCacheKey,
+    ctrl_or_alt_held: bool,
+    altgr_held: bool,
+    generation: u64,
+) -> Option<DecodedText> {
+    if !validate_secure_input_generation(generation) {
+        return None;
+    }
     match decoded {
         layout_decode::DecodeResult::Text(text) => {
             if text.chars().any(char::is_control) {
-                invalidate();
+                reject_secure_capture(generation);
                 return None;
             }
-            with_journal_mut(|journal| journal.pending_dead_key = false);
+            if !with_journal_mut(|journal| {
+                if !validate_secure_input_generation(generation) {
+                    return false;
+                }
+                journal.pending_dead_key = false;
+                true
+            }) {
+                return None;
+            }
             Some(DecodedText {
                 text,
                 layout,
@@ -1027,7 +1111,11 @@ fn capture_decode_result(
             })
         }
         layout_decode::DecodeResult::PendingDeadKey => {
-            with_journal_mut(|journal| journal.pending_dead_key = true);
+            with_journal_mut(|journal| {
+                if validate_secure_input_generation(generation) {
+                    journal.pending_dead_key = true;
+                }
+            });
             None
         }
         layout_decode::DecodeResult::NoText => {
@@ -1035,14 +1123,14 @@ fn capture_decode_result(
             // dead key. Preserve both that composition and the captured prefix;
             // resetting here would make the next glyph differ from the editor.
             if ctrl_or_alt_held && !altgr_held {
-                invalidate();
+                reject_secure_capture(generation);
             }
             None
         }
         layout_decode::DecodeResult::Unavailable => {
             // Do not retain a suffix after an unknown first character: that would
             // make a later conversion look successful while leaving its prefix.
-            mark_capture_unavailable();
+            reject_secure_capture(generation);
             None
         }
     }
@@ -1050,25 +1138,32 @@ fn capture_decode_result(
 
 #[cfg(windows)]
 fn mark_capture_unavailable() {
-    layout_decode::reset();
-    with_journal_mut(|journal| {
-        journal.clear();
-        journal.capture_unavailable = true;
-    });
+    secure_capture_unavailable();
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
-    if kb.flags.contains(LLKHF_INJECTED) && !allow_injected_input_for_e2e() {
+    if vk == u32::from(VK_TAB.0) {
+        invalidate();
         return None;
     }
+    let key = capture_keydown(kb, vk)?;
+    record_captured_keydown(&key, secure_input_generation())
+}
 
-    let vk_u16 = u16::try_from(vk).ok()?;
-    let vk = VIRTUAL_KEY(vk_u16);
-    if is_modifier_vk(vk) {
+/// Apply only a freshly authorized snapshot. Generation checks occur under the
+/// journal lock as well, so a security clear cannot be followed by a late append.
+#[cfg(windows)]
+pub fn record_captured_keydown(key: &CapturedKey, generation: u64) -> Option<String> {
+    if !validate_secure_input_generation(generation) || !key.is_current() {
         return None;
     }
-    with_journal_mut(InputJournal::invalidate_if_foreground_changed);
+    let vk = key.vk;
+    with_journal_mut(|journal| {
+        if validate_secure_input_generation(generation) {
+            journal.invalidate_if_foreground_changed();
+        }
+    });
 
     enum JournalAction {
         Clear,
@@ -1097,7 +1192,7 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
         VK_END => action = Some(JournalAction::MoveCaretEnd),
         VK_BACK => action = Some(JournalAction::Backspace),
         VK_RETURN => {
-            let layout = current_foreground_layout_tag();
+            let layout = layout_tag_from_hkl(HKL(key.layout as *mut _));
             output = Some("\n".to_string());
             action = Some(JournalAction::PushText {
                 text: "\n".to_string(),
@@ -1108,10 +1203,10 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
         _ => {}
     }
 
-    if should_clear_for_ctrl_alt_combo(vk, mods_ctrl_or_alt_down() && !altgr_down()) {
+    if should_clear_for_ctrl_alt_combo(vk, key.ctrl_or_alt_held && !key.altgr_held) {
         action = Some(JournalAction::Clear);
     }
-    if matches!(vk, VK_LEFT | VK_RIGHT | VK_END) && key_is_down(VK_SHIFT) {
+    if matches!(vk, VK_LEFT | VK_RIGHT | VK_END) && key.shift_held {
         // Shift navigation extends a selection; it does not move a collapsed
         // caret. Its next edit can replace many glyphs, which the journal does
         // not track. Start fresh instead of authorizing deletion of stale text.
@@ -1119,7 +1214,7 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
     }
 
     if action.is_none() {
-        let decoded = decode_typed_text(kb, vk)?;
+        let decoded = decode_captured_key(key, generation)?;
         decoded_focus = Some(decoded.focus);
         output = Some(decoded.text.clone());
         action = Some(JournalAction::PushText {
@@ -1130,6 +1225,10 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
     }
 
     with_journal_mut(|j| {
+        if !validate_secure_input_generation(generation) || !key.is_current() {
+            output = None;
+            return;
+        }
         j.invalidate_if_foreground_changed();
         if let Some(focus) = decoded_focus
             && !j.accept_decoded_focus(focus)
@@ -1172,6 +1271,11 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
                     if text.chars().any(char::is_alphanumeric) {
                         j.last_token_autoconverted = false;
                     }
+                    #[cfg(debug_assertions)]
+                    if origin == RunOrigin::Physical && !j.capture_unavailable {
+                        PHYSICAL_CAPTURE_COUNT
+                            .fetch_add(text.chars().count() as u64, Ordering::Relaxed);
+                    }
                     j.push_text_internal(&text, layout, origin);
                 }
             }
@@ -1181,9 +1285,20 @@ pub fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) -> Option<String> {
     output
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn take_last_layout_run_with_suffix() -> Option<(InputRun, Vec<InputRun>)> {
+    take_last_layout_run_with_suffix_if_generation(secure_context_generation())
+}
+
+#[must_use]
+pub fn take_last_layout_run_with_suffix_if_generation(
+    generation: u64,
+) -> Option<(InputRun, Vec<InputRun>)> {
     with_journal_mut(|j| {
+        if !validate_secure_context_generation(generation) {
+            return None;
+        }
         #[cfg(windows)]
         if j.last_fg_hwnd != 0 {
             j.invalidate_if_foreground_changed();
@@ -1207,9 +1322,20 @@ pub fn take_last_programmatic_sequence_with_suffix() -> Option<(Vec<InputRun>, V
     with_journal_mut(|j| j.take_last_programmatic_sequence_with_suffix())
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn take_last_sequence_with_suffix() -> Option<(Vec<InputRun>, Vec<InputRun>)> {
+    take_last_sequence_with_suffix_if_generation(secure_context_generation())
+}
+
+#[must_use]
+pub fn take_last_sequence_with_suffix_if_generation(
+    generation: u64,
+) -> Option<(Vec<InputRun>, Vec<InputRun>)> {
     with_journal_mut(|j| {
+        if !validate_secure_context_generation(generation) {
+            return None;
+        }
         #[cfg(windows)]
         if j.last_fg_hwnd != 0 {
             j.invalidate_if_foreground_changed();
@@ -1226,12 +1352,26 @@ pub fn push_text(s: &str) {
     with_journal_mut(|j| j.push_text_internal(s, LayoutTag::Unknown, RunOrigin::Programmatic));
 }
 
+#[cfg(test)]
 pub fn push_run(run: InputRun) {
-    with_journal_mut(|j| j.push_run(run));
+    let _ = push_runs_if_generation(secure_context_generation(), [run]);
 }
 
+#[cfg(test)]
 pub fn push_runs(runs: impl IntoIterator<Item = InputRun>) {
-    with_journal_mut(|j| j.push_runs(runs));
+    let _ = push_runs_if_generation(secure_context_generation(), runs);
+}
+
+/// Restore or record a conversion atomically with its protection token. A
+/// concurrent sensitive-context clear cannot be undone by a later append.
+pub fn push_runs_if_generation(generation: u64, runs: impl IntoIterator<Item = InputRun>) -> bool {
+    with_journal_mut(|journal| {
+        if !validate_secure_context_generation(generation) {
+            return false;
+        }
+        journal.push_runs(runs);
+        true
+    })
 }
 
 #[cfg(test)]
@@ -1262,7 +1402,7 @@ pub fn runs_snapshot() -> Vec<InputRun> {
     with_journal(|j| j.runs.iter().cloned().collect())
 }
 
-#[cfg(any(test, windows))]
+#[cfg(test)]
 pub fn invalidate() {
     #[cfg(windows)]
     layout_decode::reset();
@@ -1276,6 +1416,421 @@ pub fn invalidate() {
     });
     #[cfg(all(test, windows))]
     clear_foreground_cache_for_test();
+}
+
+/// Epoch shared by pending input, conversion guards and security probes.
+pub fn secure_input_generation() -> u64 {
+    SECURE_INPUT_GENERATION.load(Ordering::Acquire)
+}
+
+pub fn validate_secure_input_generation(generation: u64) -> bool {
+    secure_input_generation() == generation
+}
+
+pub fn secure_context_generation() -> u64 {
+    SECURE_CONTEXT_GENERATION.load(Ordering::Acquire)
+}
+
+pub fn validate_secure_context_generation(generation: u64) -> bool {
+    secure_context_generation() == generation
+}
+
+/// Advance the epoch and clear the journal while holding its lock. A key
+/// stamped with the new epoch cannot append until the matching clear completes.
+#[cfg(any(test, windows))]
+fn clear_secure_journal(journal: &mut InputJournal, clear_cached: bool, unavailable: bool) {
+    SECURE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    #[cfg(windows)]
+    layout_decode::reset();
+    journal.clear();
+    journal.capture_unavailable = unavailable;
+    #[cfg(windows)]
+    {
+        journal.last_fg_hwnd = 0;
+        journal.last_focus_key = None;
+        if clear_cached {
+            with_journal_cache_mut(HashMap::clear);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = clear_cached;
+}
+
+/// Discard every retained context and private decoder composition atomically
+/// with the security epoch used by deferred capture and conversion guards.
+#[cfg(any(test, windows))]
+pub fn clear_secure_input_data() {
+    with_journal_mut(|journal| clear_secure_journal(journal, true, false));
+}
+
+/// Mouse/navigation invalidates active input but retains unrelated editor caches.
+#[cfg(windows)]
+pub fn invalidate_capture_context() {
+    with_journal_mut(|journal| clear_secure_journal(journal, false, false));
+}
+
+/// Discard an extracted operation's remaining old active prefix after its
+/// native target changed, without invalidating a newer context or other caches.
+#[cfg(any(test, windows))]
+pub fn invalidate_capture_context_if_current(generation: u64) -> bool {
+    with_journal_mut(|journal| {
+        if !validate_secure_context_generation(generation) {
+            return false;
+        }
+        clear_secure_journal(journal, false, false);
+        true
+    })
+}
+
+/// Preserve ordinary native-editor cache restoration. A background UIA identity
+/// comparison distinguishes a real DOM focus change from duplicate WinEvents.
+#[cfg(windows)]
+pub fn refresh_capture_focus(pending_capture: bool) {
+    with_journal_mut(|journal| {
+        let foreground = unsafe { GetForegroundWindow() };
+        let key = current_focus_cache_key(foreground);
+        apply_secure_focus_transition(
+            journal,
+            foreground.0 as isize,
+            key,
+            unsafe { GetTickCount64() },
+            pending_capture,
+        );
+    });
+}
+
+#[cfg(windows)]
+fn apply_secure_focus_transition(
+    journal: &mut InputJournal,
+    foreground: isize,
+    key: Option<FocusCacheKey>,
+    now_ms: u64,
+    pending_capture: bool,
+) {
+    let same_native_target = match (journal.last_focus_key, key) {
+        (Some(previous), Some(current)) => same_focus_identity(previous, current),
+        (None, None) => journal.last_fg_hwnd == foreground,
+        _ => false,
+    };
+    if !same_native_target {
+        // A queued suffix from the departing editor is about to be cancelled.
+        // Cache its incomplete-prefix marker so a later return cannot authorize
+        // deleting fewer characters than the real editor contains.
+        if pending_capture {
+            journal.capture_unavailable = true;
+        }
+        SECURE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        layout_decode::reset();
+    }
+    // Duplicate focus events for the same native target preserve both the epoch
+    // and queued keys. A fresh UIA identity comparison handles DOM descendants.
+    journal.switch_foreground(foreground, key, now_ms);
+}
+
+/// A fresh UIA observation found a different descendant of this native target.
+/// The focus-event epoch already excludes old queued keys; retain that epoch so
+/// keys captured after the event do not lose their first character.
+#[cfg(windows)]
+pub fn discard_changed_capture_context(generation: u64) {
+    with_journal_mut(|journal| {
+        if !validate_secure_input_generation(generation) {
+            return;
+        }
+        SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        layout_decode::reset();
+        journal.clear();
+        if let Some(current) = journal.last_focus_key {
+            with_journal_cache_mut(|cache| {
+                cache.retain(|key, _| !same_focus_identity(*key, current))
+            });
+        }
+    });
+}
+
+/// A missing event invalidates the whole prefix, not merely the lost character.
+#[cfg(windows)]
+pub fn secure_capture_unavailable() {
+    with_journal_mut(|journal| clear_secure_journal(journal, true, true));
+}
+
+/// An old provider result must not clear or poison a newer editor's journal.
+#[cfg(windows)]
+pub fn reject_secure_capture(generation: u64) {
+    with_journal_mut(|journal| {
+        if validate_secure_input_generation(generation) {
+            clear_secure_journal(journal, true, true);
+        }
+    });
+}
+
+/// Reject a delayed selection/property result only for the conversion context
+/// it actually inspected, including a UIA descendant sharing the same HWND.
+#[cfg(windows)]
+pub fn reject_secure_context(generation: u64) {
+    with_journal_mut(|journal| {
+        if validate_secure_context_generation(generation) {
+            clear_secure_journal(journal, true, true);
+        }
+    });
+}
+
+/// Debug-only, aggregate counters for acceptance tests. Reading these values
+/// never runs detection, clears state, or exposes any typed text.
+#[cfg(debug_assertions)]
+pub fn secure_input_test_metadata() -> (usize, usize, u64) {
+    let active = with_journal_mut(|journal| journal.total_chars);
+    #[cfg(windows)]
+    let cached =
+        with_journal_cache_mut(|cache| cache.values().map(|entry| entry.journal.total_chars).sum());
+    #[cfg(not(windows))]
+    let cached = 0;
+    (
+        active,
+        cached,
+        PHYSICAL_CAPTURE_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod secure_clear_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn secure_clear_rejects_old_generation_and_removes_active_text() {
+        let _guard = test_guard();
+        push_text("must-not-survive");
+        let previous = secure_input_generation();
+        clear_secure_input_data();
+        assert!(!validate_secure_input_generation(previous));
+        assert!(runs_snapshot().is_empty());
+        assert!(take_last_sequence_with_suffix().is_none());
+    }
+
+    #[test]
+    fn late_restore_cannot_repopulate_a_cleared_security_context() {
+        let _guard = test_guard();
+        let previous = secure_context_generation();
+        clear_secure_input_data();
+        assert!(!push_runs_if_generation(
+            previous,
+            [InputRun {
+                text: "late-private-text".into(),
+                layout: LayoutTag::En,
+                origin: RunOrigin::Programmatic,
+                kind: RunKind::Text,
+            }]
+        ));
+        assert!(runs_snapshot().is_empty());
+    }
+
+    #[test]
+    fn stale_extraction_and_completion_leave_the_new_context_untouched() {
+        let _guard = test_guard();
+        let previous = secure_context_generation();
+        clear_secure_input_data();
+        push_text("current field");
+        let current = secure_context_generation();
+        let before = runs_snapshot();
+        assert!(take_last_layout_run_with_suffix_if_generation(previous).is_none());
+        assert!(take_last_sequence_with_suffix_if_generation(previous).is_none());
+        assert!(!mark_last_token_autoconverted_if_generation(previous));
+        assert!(!invalidate_capture_context_if_current(previous));
+        assert_eq!(runs_snapshot(), before);
+        assert!(!last_token_autoconverted());
+        assert!(take_last_layout_run_with_suffix_if_generation(current).is_some());
+        assert!(mark_last_token_autoconverted_if_generation(current));
+        clear_secure_input_data();
+    }
+
+    #[test]
+    fn concurrent_security_clear_cannot_leave_the_tail_of_a_restored_batch() {
+        use std::{sync::mpsc, thread, time::Duration};
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let generation = secure_context_generation();
+        let (between_runs, paused) = mpsc::sync_channel(0);
+        let (resume, continue_batch) = mpsc::sync_channel(0);
+        let append = thread::spawn(move || {
+            let runs = ["first-private-run", "second-private-run"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    if index == 1 {
+                        // The first run has been appended; pause before the next.
+                        between_runs.send(()).unwrap();
+                        continue_batch.recv().unwrap();
+                    }
+                    InputRun {
+                        text: text.into(),
+                        layout: LayoutTag::En,
+                        origin: RunOrigin::Programmatic,
+                        kind: RunKind::Text,
+                    }
+                });
+            push_runs_if_generation(generation, runs)
+        });
+        paused.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (clearing, started) = mpsc::sync_channel(0);
+        let (cleared, finished) = mpsc::sync_channel(1);
+        let clear = thread::spawn(move || {
+            clearing.send(()).unwrap();
+            clear_secure_input_data();
+            cleared.send(()).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A fragmented per-run append would let the clear finish at this point,
+        // then incorrectly restore the second private run after the clear.
+        let clear_waited_for_batch = finished.recv_timeout(Duration::from_millis(50)).is_err();
+        resume.send(()).unwrap();
+        assert!(append.join().unwrap());
+        clear.join().unwrap();
+        assert!(clear_waited_for_batch);
+        assert!(runs_snapshot().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uia_focus_change_expires_guards_without_dropping_post_focus_keys() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let capture_epoch = secure_input_generation();
+        let guard_token = secure_context_generation();
+        discard_changed_capture_context(capture_epoch);
+        assert!(validate_secure_input_generation(capture_epoch));
+        assert!(!validate_secure_context_generation(guard_token));
+        push_text("new-field");
+        reject_secure_context(guard_token);
+        assert!(!runs_snapshot().is_empty());
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_native_focus_keeps_caches_but_same_hwnd_focus_discards_its_text() {
+        let _guard = test_guard();
+        invalidate();
+        test_switch_foreground(101, 1_000);
+        push_text("first-editor");
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 202, focus_key_for_test(202, 0), 1_100, false)
+        });
+        push_text("second-editor");
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, focus_key_for_test(101, 0), 1_200, false)
+        });
+        assert_eq!(
+            runs_snapshot()
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "first-editor"
+        );
+        // Duplicate native focus notifications must retain restored text.
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, focus_key_for_test(101, 0), 1_300, false)
+        });
+        assert_eq!(
+            runs_snapshot()
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "first-editor"
+        );
+        // Only a fresh UIA identity change in this HWND invalidates that editor.
+        discard_changed_capture_context(secure_input_generation());
+        assert!(runs_snapshot().is_empty());
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 202, focus_key_for_test(202, 0), 1_400, false)
+        });
+        assert_eq!(
+            runs_snapshot()
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "second-editor"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn focus_cancellation_never_restores_a_prefix_with_a_missing_pending_key() {
+        let _guard = test_guard();
+        invalidate();
+        test_switch_foreground(101, 1_000);
+        push_text("abc");
+        let epoch = secure_input_generation();
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, focus_key_for_test(101, 0), 1_010, true)
+        });
+        // Duplicate notifications neither cancel the pending d nor lose abc.
+        assert!(validate_secure_input_generation(epoch));
+        assert!(!with_journal(|journal| journal.capture_unavailable));
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 202, focus_key_for_test(202, 0), 1_020, true)
+        });
+        assert!(!validate_secure_input_generation(epoch));
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, focus_key_for_test(101, 0), 1_030, false)
+        });
+        assert!(with_journal(|journal| journal.capture_unavailable));
+        assert!(
+            with_journal_mut(|journal| {
+                if journal.capture_unavailable {
+                    None
+                } else {
+                    journal.take_last_sequence_with_suffix()
+                }
+            })
+            .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delayed_key_from_a_cleared_epoch_is_not_decoded_or_appended() {
+        let _guard = test_guard();
+        let previous = secure_input_generation();
+        let key = CapturedKey {
+            vk: VIRTUAL_KEY(0x41),
+            scan_code: 0x1e,
+            keyboard_state: [0; 256],
+            layout: 0,
+            focus: FocusCacheKey {
+                foreground_hwnd: 1,
+                focus_hwnd: 2,
+                caret_hwnd: 0,
+                caret_rect: CaretRectSignature {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+            },
+            ctrl_or_alt_held: false,
+            altgr_held: false,
+            shift_held: false,
+        };
+        clear_secure_input_data();
+        assert!(record_captured_keydown(&key, previous).is_none());
+        assert!(runs_snapshot().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secure_clear_prevents_cached_control_restoration() {
+        let _guard = test_guard();
+        invalidate();
+        test_switch_foreground(101, 1_000);
+        push_text("cached-text");
+        test_switch_foreground(202, 1_100);
+        push_text("active-text");
+        clear_secure_input_data();
+        test_switch_foreground(101, 1_200);
+        assert!(runs_snapshot().is_empty());
+    }
 }
 
 #[cfg(all(test, windows))]

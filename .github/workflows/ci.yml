@@ -99,15 +99,18 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Cargo fmt --check
         run: cargo +nightly fmt --check
-      - name: Validate Windows updater PowerShell syntax
+      - name: Validate PowerShell helper syntax
         shell: pwsh
         run: |
-          $tokens = $null
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path scripts/windows-updater.ps1), [ref]$tokens, [ref]$parseErrors
-          ) | Out-Null
-          if ($parseErrors) { throw ($parseErrors | Out-String) }
+          foreach ($path in @('scripts/windows-updater.ps1', 'scripts/e2e/run-browser.ps1',
+              'scripts/e2e/browser-security-cases.ps1', 'scripts/e2e/run-security-mutation.ps1')) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path), [ref]$tokens, [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors) { throw ($parseErrors | Out-String) }
+          }
       - name: Cargo clippy
         run: cargo +nightly clippy --all-targets --all-features -- -D warnings
       - name: Cargo build (debug-tracing)
@@ -177,6 +180,13 @@ jobs:
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: ./scripts/e2e/run-browser.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe
+
+      - name: Reject a build with UIA password protection removed
+        timeout-minutes: 8
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/run-security-mutation.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe
 
       - name: Verify real crate packaging and tokenless publisher preflight
         shell: pwsh
