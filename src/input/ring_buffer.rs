@@ -1491,50 +1491,61 @@ pub fn validate_secure_context_generation(generation: u64) -> bool {
     secure_context_generation() == generation
 }
 
+#[cfg(any(test, windows))]
+#[derive(Clone, Copy)]
+enum ResetReason {
+    /// Start an empty active segment while retaining other editors' histories.
+    Navigation,
+    /// Purge potentially sensitive text from every retained context.
+    SensitiveInput,
+    /// A missing or unverified key makes the remaining segment incomplete.
+    CaptureRejected,
+}
+
 /// Advance the epoch and clear the journal while holding its lock. A key
 /// stamped with the new epoch cannot append until the matching clear completes.
 #[cfg(any(test, windows))]
-fn clear_secure_journal(journal: &mut InputJournal, clear_cached: bool, unavailable: bool) {
+fn clear_secure_journal(journal: &mut InputJournal, reason: ResetReason) {
     SECURE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
     SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
     #[cfg(windows)]
     layout_decode::reset();
     journal.clear();
-    journal.capture_unavailable = unavailable;
+    journal.capture_unavailable = matches!(reason, ResetReason::CaptureRejected);
     #[cfg(windows)]
     {
         journal.last_fg_hwnd = 0;
         journal.last_focus_key = None;
-        if clear_cached {
+        if !matches!(reason, ResetReason::Navigation) {
             with_journal_cache_mut(HashMap::clear);
         }
     }
-    #[cfg(not(windows))]
-    let _ = clear_cached;
 }
 
 /// Discard every retained context and private decoder composition atomically
 /// with the security epoch used by deferred capture and conversion guards.
 #[cfg(any(test, windows))]
 pub fn clear_secure_input_data() {
-    with_journal_mut(|journal| clear_secure_journal(journal, true, false));
+    with_journal_mut(|journal| clear_secure_journal(journal, ResetReason::SensitiveInput));
 }
 
 /// Mouse/navigation invalidates active input but retains unrelated editor caches
 /// and known native identity. A later same-HWND key must not invalidate a focus
 /// refresh already queued for the new DOM field in this reset epoch.
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 pub fn invalidate_capture_context() {
     with_journal_mut(invalidate_capture_journal);
 }
 
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 fn invalidate_capture_journal(journal: &mut InputJournal) {
-    let foreground = journal.last_fg_hwnd;
-    let focus = journal.last_focus_key;
-    clear_secure_journal(journal, false, false);
-    journal.last_fg_hwnd = foreground;
-    journal.last_focus_key = focus;
+    #[cfg(windows)]
+    let previous_native_target = (journal.last_fg_hwnd, journal.last_focus_key);
+    clear_secure_journal(journal, ResetReason::Navigation);
+    #[cfg(windows)]
+    {
+        (journal.last_fg_hwnd, journal.last_focus_key) = previous_native_target;
+    }
 }
 
 /// Keep the debug baseline on the same boundary as the pointer's input reset.
@@ -1560,7 +1571,7 @@ pub fn invalidate_capture_context_if_current(generation: u64) -> bool {
         if !validate_secure_context_generation(generation) {
             return false;
         }
-        clear_secure_journal(journal, false, false);
+        clear_secure_journal(journal, ResetReason::Navigation);
         true
     })
 }
@@ -1691,17 +1702,23 @@ fn apply_secure_focus_transition(
 }
 
 /// A fresh UIA observation found a different descendant of this native target.
-/// The focus-event epoch already excludes old queued keys; retain that epoch so
-/// keys captured after the event do not lose their first character.
-#[cfg(windows)]
+/// Discard old text without advancing the raw epoch of ordered pending keys.
+/// Retaining that epoch also retains evidence of any missing physical input.
+#[cfg(any(test, windows))]
 pub fn discard_changed_capture_context(generation: u64) {
     with_journal_mut(|journal| {
         if !validate_secure_input_generation(generation) {
             return;
         }
         SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        #[cfg(windows)]
         layout_decode::reset();
+        // This observation retains the raw epoch. It cannot make a suffix
+        // complete after an earlier key in that epoch was rejected.
+        let capture_unavailable = journal.capture_unavailable;
         journal.clear();
+        journal.capture_unavailable = capture_unavailable;
+        #[cfg(windows)]
         if let Some(current) = journal.last_focus_key {
             with_journal_cache_mut(|cache| {
                 cache.retain(|key, _| !same_focus_identity(*key, current))
@@ -1713,15 +1730,15 @@ pub fn discard_changed_capture_context(generation: u64) {
 /// A missing event invalidates the whole prefix, not merely the lost character.
 #[cfg(windows)]
 pub fn secure_capture_unavailable() {
-    with_journal_mut(|journal| clear_secure_journal(journal, true, true));
+    with_journal_mut(|journal| clear_secure_journal(journal, ResetReason::CaptureRejected));
 }
 
 /// An old provider result must not clear or poison a newer editor's journal.
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 pub fn reject_secure_capture(generation: u64) {
     with_journal_mut(|journal| {
         if validate_secure_input_generation(generation) {
-            clear_secure_journal(journal, true, true);
+            clear_secure_journal(journal, ResetReason::CaptureRejected);
         }
     });
 }
@@ -1747,7 +1764,7 @@ fn reject_secure_capture_with_current_focus(
         if !validate_secure_input_generation(generation) {
             return;
         }
-        clear_secure_journal(journal, true, true);
+        clear_secure_journal(journal, ResetReason::CaptureRejected);
         // Sample after the epoch change while holding the journal lock. An old
         // request can expire after a new target's first raw key was sampled;
         // labelling that rejection with its old target could allow the new
@@ -1765,11 +1782,11 @@ fn reject_secure_capture_with_current_focus(
 
 /// Reject a delayed selection/property result only for the conversion context
 /// it actually inspected, including a UIA descendant sharing the same HWND.
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 pub fn reject_secure_context(generation: u64) {
     with_journal_mut(|journal| {
         if validate_secure_context_generation(generation) {
-            clear_secure_journal(journal, true, true);
+            clear_secure_journal(journal, ResetReason::CaptureRejected);
         }
     });
 }
@@ -1802,6 +1819,10 @@ pub fn secure_input_test_pointer_metadata() -> (u64, bool) {
         )
     })
 }
+
+#[cfg(test)]
+#[path = "ring_buffer_properties.rs"]
+mod property_tests;
 
 #[cfg(test)]
 mod secure_clear_tests {

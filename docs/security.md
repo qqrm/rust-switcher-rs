@@ -25,7 +25,24 @@ input can expose the correct property; a custom control with no usable metadata
 cannot be authorized for capture. A provider that explicitly mislabels secret
 content as ordinary text cannot be corrected by this mechanism.
 
+Journal reset reasons are explicit. Navigation clears the active segment and
+advances its guards while retaining unrelated editor histories. Sensitive input
+purges all retained histories. Rejected capture also marks the active segment
+incomplete, so later keys cannot make a missing prefix convertible. A pointer
+release only requests fresh metadata; it does not reset any of those states.
+An observation that retains the raw-input epoch also retains its incomplete
+marker, even when the UIA descendant changes. Only a new input boundary can
+start a complete segment after capture has lost a key.
+
 ### Immediate focus changes
+
+For pointer-driven focus changes, the UIA worker resolves the release position
+once and freezes the nearest explicitly keyboard-focusable control as its
+anchor. It accepts metadata only after that exact element becomes focused,
+within the existing provider deadline. A different focused field or ancestor
+cannot replace the anchor. Capture still rejects a changed element or unknown
+password metadata. Hit testing is asynchronous; it does not establish the
+identity of an element replaced before the worker resolves that position.
 
 A click can move between browser fields before their asynchronous accessibility
 notification reaches Rust Switcher. If the first queued key observes a different
@@ -76,6 +93,15 @@ empty active and cached journals, an unavailable-prefix marker, and no physical
 character appended since the pointer-down boundary. A refusal must then recover
 through selection conversion and a fresh input segment in the same control.
 These cases do not insert a readiness wait before the tested first key.
+
+`proptest` generates event histories and shrinks failing traces. Three portable
+properties compare real journal operations with an independent physical-input
+model, insert stale conversion callbacks into a newer context, and ensure
+metadata observations cannot reopen an incomplete raw generation. Windows
+properties cover queued keys across three native owners and require arbitrary
+pointer releases/moves to preserve every retained prefix and guard. The models
+include input delivered to an editor but lost by capture; a captured suffix is
+never accepted as the complete physical sequence.
 
 The debug fixture exposes only aggregate counters, including a cumulative count
 of characters actually appended from physical input. That counter detects

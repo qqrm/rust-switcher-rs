@@ -49,7 +49,7 @@ foreach ($kind in @('textarea', 'editable')) {
     Assert-BrowserSafeFocusRefusal $fixture.Case $fixture.Record $fixture.Journal 'b' 123
     $checks.Add("valid $kind click proof")
 }
-foreach ($mode in @('fresh', 'tab', 'window', 'ctrl-release', 'alt-release')) {
+foreach ($mode in @('fresh', 'tab', 'click-layout', 'window', 'ctrl-release', 'alt-release')) {
     Assert-RefusalRejected "$mode cannot refuse" { param($f) $f.Case.Mode = $mode }
 }
 Assert-RefusalRejected 'other editor type cannot refuse' { param($f) $f.Case.Kind = 'input' }

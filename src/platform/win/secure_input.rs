@@ -16,7 +16,7 @@ use std::{
 };
 
 use windows::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, SetLastError, WIN32_ERROR, WPARAM},
+    Foundation::{GetLastError, HWND, LPARAM, POINT, SetLastError, WIN32_ERROR, WPARAM},
     System::{
         Com::{
             CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -28,7 +28,8 @@ use windows::Win32::{
         Accessibility::{
             CUIAutomation, HWINEVENTHOOK, IUIAutomation, IUIAutomationElement,
             IUIAutomationFocusChangedEventHandler, IUIAutomationFocusChangedEventHandler_Impl,
-            SetWinEventHook, UIA_IsPasswordPropertyId,
+            SetWinEventHook, UIA_IsKeyboardFocusablePropertyId, UIA_IsPasswordPropertyId,
+            UIA_PROPERTY_ID,
         },
         Input::KeyboardAndMouse::VIRTUAL_KEY,
         WindowsAndMessaging::{
@@ -50,6 +51,9 @@ use crate::{
 const CAPTURE_QUEUE_CAPACITY: usize = 512;
 const CAPTURE_LIFETIME: Duration = Duration::from_secs(2);
 const PROVIDER_TIMEOUT: Duration = Duration::from_millis(75);
+const POINTER_ANCESTOR_LIMIT: usize = 8;
+const POINTER_FOCUS_ATTEMPTS: usize = 75;
+const POINTER_FOCUS_INTERVAL: Duration = Duration::from_millis(1);
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 // At most the bounded capture queue plus its current consumer can own entries.
@@ -166,11 +170,32 @@ struct Probe {
     generation: u64,
 }
 
+#[derive(Clone, Copy)]
+enum ProbeSource {
+    Focused,
+    Pointer(POINT),
+}
+
+struct ProviderRequest {
+    probe: Probe,
+    source: ProbeSource,
+    deadline: Instant,
+}
+
+impl ProviderRequest {
+    fn is_current(&self) -> bool {
+        Instant::now() < self.deadline
+            && validate_capture_generation(self.probe.generation)
+            && self.probe.target.is_current()
+    }
+}
+
 enum Command {
     Capture(Box<Capture>),
     /// FIFO barrier: all earlier captures finish or are invalidated first.
     Protect(Probe),
     Refresh(Probe),
+    PointerRefresh { probe: Probe, point: POINT },
 }
 
 #[derive(Clone, Copy)]
@@ -268,20 +293,21 @@ impl Provider {
         }
     }
 
-    fn probe(&mut self, request: Probe) -> Verdict {
-        if !self.apartment.0
-            || !validate_capture_generation(request.generation)
-            || !request.target.is_current()
-        {
+    fn probe(&mut self, request: ProviderRequest) -> Verdict {
+        if !self.apartment.0 || !request.is_current() {
             return Verdict::UNKNOWN;
         }
         let Some(automation) = &self.automation else {
             return Verdict::UNKNOWN;
         };
-        let Ok(element) = (unsafe { automation.GetFocusedElement() }) else {
+        let element = match request.source {
+            ProbeSource::Focused => unsafe { automation.GetFocusedElement() }.ok(),
+            ProbeSource::Pointer(point) => pointer_element(automation, &request, point),
+        };
+        let Some(element) = element else {
             return Verdict::UNKNOWN;
         };
-        let element_changed = self.elements.get(&request.target).is_none_or(|previous| {
+        let element_changed = self.elements.get(&request.probe.target).is_none_or(|previous| {
             !unsafe { automation.CompareElements(previous, &element) }
                 .is_ok_and(|same| same.as_bool())
         });
@@ -291,21 +317,110 @@ impl Provider {
             .ok()
             .and_then(|current| unsafe { automation.CompareElements(&element, &current) }.ok())
             .is_some_and(|same| same.as_bool());
-        if !stable
-            || !validate_capture_generation(request.generation)
-            || !request.target.is_current()
-        {
+        if !stable || !request.is_current() {
             return Verdict::UNKNOWN;
         }
-        if self.elements.len() >= 64 && !self.elements.contains_key(&request.target) {
+        if self.elements.len() >= 64 && !self.elements.contains_key(&request.probe.target) {
             self.elements.clear();
         }
-        self.elements.insert(request.target, element);
+        self.elements.insert(request.probe.target, element);
         Verdict {
             status,
             element_changed,
         }
     }
+}
+
+/// Freeze the clicked control before observing focus. A different focused
+/// ancestor must never replace a password field's anchor while delivery lags.
+fn pointer_element(
+    automation: &IUIAutomation,
+    request: &ProviderRequest,
+    point: POINT,
+) -> Option<IUIAutomationElement> {
+    let Ok(hit) = (unsafe { automation.ElementFromPoint(point) }) else {
+        tracing::debug!(reason = "hit_test_unavailable", "secure input: pointer anchor rejected");
+        return None;
+    };
+    let Ok(walker) = (unsafe { automation.ControlViewWalker() }) else {
+        tracing::debug!(reason = "tree_unavailable", "secure input: pointer anchor rejected");
+        return None;
+    };
+    let Some(anchor) = focusable_pointer_anchor(
+        hit,
+        |element| {
+            if !request.is_current() {
+                return None;
+            }
+            element_boolean_property(element, UIA_IsKeyboardFocusablePropertyId)
+        },
+        |element| {
+            if !request.is_current() {
+                return None;
+            }
+            unsafe { walker.GetParentElement(element) }.ok()
+        },
+    ) else {
+        tracing::debug!(reason = "focusable_anchor_unavailable", "secure input: pointer anchor rejected");
+        return None;
+    };
+    let focused = wait_for_pointer_focus(
+        anchor,
+        |anchor| {
+            if !request.is_current() {
+                return None;
+            }
+            let focused = unsafe { automation.GetFocusedElement() }.ok()?;
+            unsafe { automation.CompareElements(anchor, &focused) }
+                .ok()
+                .map(|same| same.as_bool())
+        },
+        || {
+            if !request.is_current() {
+                return false;
+            }
+            // Only the provider worker waits for this observable condition.
+            // One deadline includes hit testing, traversal and focus delivery.
+            std::thread::sleep(
+                POINTER_FOCUS_INTERVAL.min(request.deadline.saturating_duration_since(Instant::now())),
+            );
+            request.is_current()
+        },
+    );
+    if focused.is_none() {
+        tracing::debug!(reason = "anchored_focus_unavailable", "secure input: pointer anchor rejected");
+    }
+    focused
+}
+
+fn focusable_pointer_anchor<E>(
+    mut element: E,
+    mut focusable: impl FnMut(&E) -> Option<bool>,
+    mut parent: impl FnMut(&E) -> Option<E>,
+) -> Option<E> {
+    for _ in 0..POINTER_ANCESTOR_LIMIT {
+        if focusable(&element)? {
+            return Some(element);
+        }
+        element = parent(&element)?;
+    }
+    None
+}
+
+fn wait_for_pointer_focus<E>(
+    anchor: E,
+    mut focused: impl FnMut(&E) -> Option<bool>,
+    mut wait: impl FnMut() -> bool,
+) -> Option<E> {
+    for _ in 0..POINTER_FOCUS_ATTEMPTS {
+        if focused(&anchor)? {
+            return Some(anchor);
+        }
+        if !wait() {
+            return None;
+        }
+    }
+    None
 }
 
 impl Drop for Provider {
@@ -323,26 +438,32 @@ impl Drop for Provider {
 /// return a non-BOOL reserved value, not a trustworthy `false`.
 /// Caller must be on a UIA worker, never on an input hook.
 pub(crate) fn element_status(element: &IUIAutomationElement) -> Status {
-    let Ok(mut value) =
-        (unsafe { element.GetCurrentPropertyValueEx(UIA_IsPasswordPropertyId, true) })
-    else {
-        return Status::Unknown;
-    };
-    let status = variant_status(&value);
-    let _ = unsafe { VariantClear(&raw mut value) };
-    status
+    match element_boolean_property(element, UIA_IsPasswordPropertyId) {
+        Some(true) => Status::Secure,
+        Some(false) => Status::NotSecure,
+        None => Status::Unknown,
+    }
 }
 
-fn variant_status(value: &VARIANT) -> Status {
+fn element_boolean_property(
+    element: &IUIAutomationElement,
+    property: UIA_PROPERTY_ID,
+) -> Option<bool> {
+    let Ok(mut value) = (unsafe { element.GetCurrentPropertyValueEx(property, true) })
+    else {
+        return None;
+    };
+    let result = variant_boolean(&value);
+    let _ = unsafe { VariantClear(&raw mut value) };
+    result
+}
+
+fn variant_boolean(value: &VARIANT) -> Option<bool> {
     let value = unsafe { &value.Anonymous.Anonymous };
     if value.vt != VT_BOOL {
-        return Status::Unknown;
+        return None;
     }
-    if unsafe { value.Anonymous.boolVal }.0 != 0 {
-        Status::Secure
-    } else {
-        Status::NotSecure
-    }
+    Some(unsafe { value.Anonymous.boolVal }.0 != 0)
 }
 
 /// This fallback applies only to known standard Edit/RichEdit window classes.
@@ -469,8 +590,16 @@ pub(crate) fn invalidate_pointer_context() {
 
 /// Queue the pointer's focus probe after the press, without resetting the epoch
 /// or input already captured while the button was held.
-pub(crate) fn refresh_pointer_context() {
-    let queued = enqueue_refresh();
+pub(crate) fn refresh_pointer_context(point: POINT) {
+    let generation = capture_generation();
+    let queued = if let (Some(Some(worker)), Some(target)) = (WORKER.get(), Target::capture()) {
+        worker.submit(
+            Command::PointerRefresh { probe: Probe { target, generation }, point },
+            CAPTURE_LIFETIME,
+        )
+    } else {
+        false
+    };
     tracing::debug!(queued, "secure input: pointer release refresh");
 }
 
@@ -559,7 +688,11 @@ pub(crate) fn initialize(hwnd: HWND) {
     enqueue_refresh();
 }
 
-fn verdict(provider: Option<&BoundedWorker<Probe, Verdict>>, request: Probe) -> Verdict {
+fn verdict(
+    provider: Option<&BoundedWorker<ProviderRequest, Verdict>>,
+    request: Probe,
+    source: ProbeSource,
+) -> Verdict {
     if !validate_capture_generation(request.generation) || !request.target.is_current() {
         return Verdict::UNKNOWN;
     }
@@ -573,11 +706,23 @@ fn verdict(provider: Option<&BoundedWorker<Probe, Verdict>>, request: Probe) -> 
         return Verdict::UNKNOWN;
     }
     provider
-        .and_then(|worker| worker.request(request, PROVIDER_TIMEOUT))
+        .and_then(|worker| {
+            worker.request(
+                ProviderRequest {
+                    probe: request,
+                    source,
+                    deadline: Instant::now() + PROVIDER_TIMEOUT,
+                },
+                PROVIDER_TIMEOUT,
+            )
+        })
         .unwrap_or(Verdict::UNKNOWN)
 }
 
-fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Command) -> Status {
+fn process_command(
+    provider: Option<&BoundedWorker<ProviderRequest, Verdict>>,
+    command: Command,
+) -> Status {
     match command {
         Command::Capture(capture) => {
             if !capture_is_current(&capture) {
@@ -589,6 +734,7 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
                     target: capture.target,
                     generation: capture.generation,
                 },
+                ProbeSource::Focused,
             );
             if !capture_is_current(&capture) {
                 return Status::Unknown;
@@ -628,7 +774,7 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
             result.status
         }
         Command::Protect(request) => {
-            let result = verdict(provider, request);
+            let result = verdict(provider, request, ProbeSource::Focused);
             if !validate_capture_generation(request.generation) || !request.target.is_current() {
                 return Status::Unknown;
             }
@@ -640,23 +786,31 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
             }
             result.status
         }
-        Command::Refresh(request) => {
-            let result = verdict(provider, request);
-            if !validate_capture_generation(request.generation) || !request.target.is_current() {
-                return Status::Unknown;
-            }
-            if !result.status.is_allowed() {
-                tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
-                reject_probe(request);
-            } else if result.element_changed {
-                tracing::debug!("secure input: focused UIA element changed");
-                ring_buffer::discard_changed_capture_context(request.generation);
-            }
-            result.status
+        Command::Refresh(request) => refresh_context(provider, request, ProbeSource::Focused),
+        Command::PointerRefresh { probe, point } => {
+            refresh_context(provider, probe, ProbeSource::Pointer(point))
         }
     }
 }
 
+fn refresh_context(
+    provider: Option<&BoundedWorker<ProviderRequest, Verdict>>,
+    request: Probe,
+    source: ProbeSource,
+) -> Status {
+    let result = verdict(provider, request, source);
+    if !validate_capture_generation(request.generation) || !request.target.is_current() {
+        return Status::Unknown;
+    }
+    if !result.status.is_allowed() {
+        tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
+        reject_probe(request);
+    } else if result.element_changed {
+        tracing::debug!("secure input: focused UIA element changed");
+        ring_buffer::discard_changed_capture_context(request.generation);
+    }
+    result.status
+}
 fn capture_is_current(capture: &Capture) -> bool {
     if !validate_capture_generation(capture.generation) {
         tracing::debug!(reason = "stale_epoch", "secure input: capture rejected");
@@ -982,19 +1136,113 @@ mod tests {
     #[test]
     fn only_explicit_boolean_false_authorizes_custom_input() {
         assert_eq!(
-            variant_status(&boolean_variant(false, VT_BOOL)),
-            Status::NotSecure
+            variant_boolean(&boolean_variant(false, VT_BOOL)),
+            Some(false)
         );
         assert_eq!(
-            variant_status(&boolean_variant(true, VT_BOOL)),
-            Status::Secure
+            variant_boolean(&boolean_variant(true, VT_BOOL)),
+            Some(true)
         );
         assert_eq!(
-            variant_status(&boolean_variant(false, VT_EMPTY)),
-            Status::Unknown
+            variant_boolean(&boolean_variant(false, VT_EMPTY)),
+            None
         );
         assert!(!Status::Unknown.is_allowed());
         assert!(!Status::Secure.is_allowed());
+    }
+
+    #[test]
+    fn pointer_anchor_stops_at_the_nearest_explicitly_focusable_control() {
+        let mut inspected = Vec::new();
+        let anchor = focusable_pointer_anchor(
+            0,
+            |element| {
+                inspected.push(*element);
+                Some(*element >= 1)
+            },
+            |element| Some(element + 1),
+        );
+        // 0 is a text descendant, 1 the clicked control, 2 its focusable root.
+        assert_eq!(anchor, Some(1));
+        assert_eq!(inspected, [0, 1]);
+        // Unknown is not a false property that permits climbing to the root.
+        assert_eq!(focusable_pointer_anchor(0, |_| None, |_| panic!("unknown anchor")), None);
+    }
+
+    #[test]
+    fn pointer_anchor_traversal_cannot_escape_its_bound() {
+        let mut inspected = 0;
+        let anchor = focusable_pointer_anchor(
+            0,
+            |_| {
+                inspected += 1;
+                Some(false)
+            },
+            |element| Some(element + 1),
+        );
+        assert_eq!(anchor, None);
+        assert_eq!(inspected, POINTER_ANCESTOR_LIMIT);
+    }
+
+    #[test]
+    fn pointer_refresh_waits_for_its_frozen_anchor_not_the_previous_focus() {
+        let mut focus = [0, 0, 1].into_iter();
+        let mut waits = 0;
+        assert_eq!(
+            wait_for_pointer_focus(
+                1,
+                |anchor| focus.next().map(|focused| *anchor == focused),
+                || { waits += 1; true },
+            ),
+            Some(1)
+        );
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn pointer_refresh_never_rebinds_a_password_anchor_to_another_field_or_root() {
+        // Anchor 1 may be a password control; 2 is a plain field or focusable
+        // ancestor. Matching the latter would authorize keys from the former.
+        let mut focus = [0, 2, 2].into_iter();
+        let mut observed = Vec::new();
+        let result = wait_for_pointer_focus(
+            1,
+            |anchor| {
+                observed.push(*anchor);
+                focus.next().map(|focused| *anchor == focused)
+            },
+            || true,
+        );
+        assert_eq!(result, None);
+        assert!(observed.iter().all(|anchor| *anchor == 1));
+    }
+
+    #[test]
+    fn pointer_refresh_stops_on_unknown_focus_or_expiration() {
+        assert_eq!(
+            wait_for_pointer_focus(1, |_| None, || panic!("unknown focus")),
+            None
+        );
+        let mut observations = 0;
+        assert_eq!(
+            wait_for_pointer_focus(
+                1,
+                |_| { observations += 1; Some(false) },
+                || false,
+            ),
+            None
+        );
+        assert_eq!(observations, 1);
+        observations = 0;
+        assert_eq!(
+            wait_for_pointer_focus(
+                1,
+                |_| { observations += 1; Some(false) },
+                || true,
+            ),
+            None
+        );
+        assert_eq!(observations, POINTER_FOCUS_ATTEMPTS);
     }
 
     #[test]

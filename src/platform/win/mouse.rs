@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::Win32::{
-    Foundation::{LPARAM, LRESULT, WPARAM},
+    Foundation::{LPARAM, LRESULT, POINT, WPARAM},
     UI::WindowsAndMessaging::{
         CallNextHookEx, HC_ACTION, HHOOK, MSLLHOOKSTRUCT, SetWindowsHookExW, WH_MOUSE_LL,
         WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
@@ -20,10 +20,10 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     }
 
     let msg = u32::try_from(wparam.0);
-    let _ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+    let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
 
     if let Ok(msg) = msg {
-        update_input_context(msg);
+        update_input_context(msg, ms.pt);
     }
 
     let h = HOOK_HANDLE.load(Ordering::Relaxed);
@@ -31,14 +31,14 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { CallNextHookEx(hook, code, wparam, lparam) }
 }
 
-fn update_input_context(message: u32) {
+fn update_input_context(message: u32, point: POINT) {
     match message {
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN
         | WM_MBUTTONDBLCLK => {
             super::secure_input::invalidate_pointer_context();
         }
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
-            super::secure_input::refresh_pointer_context();
+            super::secure_input::refresh_pointer_context(point);
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => super::secure_input::invalidate_context(),
         _ => {}
@@ -56,6 +56,10 @@ pub fn install() {
         tracing::info!("WH_MOUSE_LL installed");
     }
 }
+
+#[cfg(test)]
+#[path = "mouse_properties.rs"]
+mod property_tests;
 
 #[cfg(test)]
 mod tests {
@@ -76,7 +80,7 @@ mod tests {
             ring_buffer::clear_secure_input_data();
             ring_buffer::push_text("previous-field");
             let previous = secure_input::generation();
-            update_input_context(down);
+            update_input_context(down, POINT::default());
             assert!(!secure_input::validate_generation(previous));
             assert!(ring_buffer::runs_snapshot().is_empty());
 
@@ -84,7 +88,7 @@ mod tests {
             ring_buffer::push_text("new-field");
             let captured = ring_buffer::runs_snapshot();
             assert!(!captured.is_empty());
-            update_input_context(up);
+            update_input_context(up, POINT::default());
             assert!(secure_input::validate_generation(pressed));
             assert_eq!(ring_buffer::runs_snapshot(), captured);
         }
@@ -94,10 +98,10 @@ mod tests {
     #[test]
     fn pointer_release_cannot_reset_a_rejected_input_prefix() {
         let _guard = ring_buffer::test_guard();
-        update_input_context(WM_LBUTTONDOWN);
+        update_input_context(WM_LBUTTONDOWN, POINT::default());
         ring_buffer::secure_capture_unavailable();
         let rejected = secure_input::generation();
-        update_input_context(WM_LBUTTONUP);
+        update_input_context(WM_LBUTTONUP, POINT::default());
         assert!(secure_input::validate_generation(rejected));
         ring_buffer::push_text("incomplete-suffix");
         assert!(ring_buffer::runs_snapshot().is_empty());

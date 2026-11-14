@@ -119,12 +119,13 @@ or contact a text service. The debug PID allowlist admits only this browser
 process. CDP prepares and reads the fixture; all tested text, modifier events,
 Tab navigation, physical mouse clicks and Double Alt use native input delivery.
 
-The 51 cases cover five editor types, a single period, words with a leading
+The 53 cases cover five editor types, a single period, words with a leading
 period, 0/1/30 ms first-key gaps, repeated fast typing, and transitions between
-fields/windows while Ctrl or Alt is released. Textarea and contenteditable cases
-also require complete conversion of 101 characters, both with a leading letter
+fields/windows while Ctrl or Alt is released. Two click cases switch the layout
+with CapsLock and restore English before typing and Double Alt. Textarea and
+contenteditable cases also require complete conversion of 101 characters, both with a leading letter
 and a leading period. All cases check exact input and unchanged neighboring/source
-fields in both windows. The 49 cases outside immediate-click transitions require
+fields in both windows. The 51 cases outside immediate-click transitions require
 the exact converted output. The two click cases allow the verified conservative
 refusal described below as well as exact conversion. Their original input timing
 and first-key gaps are unchanged. Original input and Double Alt are never retried. Native focus,

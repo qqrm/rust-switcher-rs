@@ -485,7 +485,7 @@ try {
             }
             $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.'; Expected = 'ю'; Gap = 0; Repeat = 1})
         }
-        foreach ($mode in @('tab', 'click', 'window', 'ctrl-release', 'alt-release')) {
+        foreach ($mode in @('tab', 'click', 'click-layout', 'window', 'ctrl-release', 'alt-release')) {
             foreach ($kind in @('textarea', 'editable')) {
                 $cases.Add(@{Kind = $kind; Mode = $mode; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 0; Repeat = 1})
             }
@@ -498,7 +498,7 @@ try {
             $cases.Add(@{Kind = 'editable'; Mode = 'fresh'; Text = 'ghbdtn'; Expected = 'привет'; Gap = 1; Repeat = $repeat})
             $cases.Add(@{Kind = 'textarea'; Mode = 'fresh'; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 1; Repeat = $repeat})
         }
-        if ($cases.Count -ne 51) { throw "Expected 51 ordinary browser cases, found $($cases.Count)" }
+        if ($cases.Count -ne 53) { throw "Expected 53 ordinary browser cases, found $($cases.Count)" }
     }
 
     foreach ($case in $cases) {
@@ -525,7 +525,7 @@ try {
             $expectedOther = @{'a/a' = ''; 'a/b' = 'b-sentinel'; 'a/guard' = 'guard-sentinel';
                 'b/a' = ''; 'b/b' = 'b-sentinel'; 'b/guard' = 'guard-sentinel'}
             $destinationId = 'a'
-            if ($case.Mode -in @('tab', 'click', 'window')) {
+            if ($case.Mode -in @('tab', 'click', 'click-layout', 'window')) {
                 [BrowserInput]::Type($sessions.a.Handle, 'keep', 0, 0) | Out-Null
                 Wait-Browser { (Read-Browser $sessions.a 'fixture.values()').a -eq 'keep' } 'source field text'
                 $expectedOther['a/a'] = 'keep'
@@ -542,6 +542,14 @@ try {
                         [BrowserInput]::Click($destination.Handle, $point.x, $point.y)
                     }
                     Wait-Browser { Read-Browser $destination "fixture.focused('b')" } 'second DOM field focus'
+                    if ($case.Mode -eq 'click-layout') {
+                        # A protected layout command can be the first action
+                        # after a click. It must not poison the next text key.
+                        Tap-BrowserKey 0x14
+                        Wait-Browser { [BrowserInput]::LayoutOf($destination.Handle) -ne $english } 'CapsLock after click'
+                        Tap-BrowserKey 0x14
+                        Wait-Browser { [BrowserInput]::LayoutOf($destination.Handle) -eq $english } 'CapsLock restores English before typing'
+                    }
                 }
             } elseif ($case.Mode -in @('ctrl-release', 'alt-release')) {
                 # The shortcut is consumed by the source field; no text is altered.
