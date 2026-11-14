@@ -23,7 +23,6 @@ $connections = [System.Collections.Generic.List[System.IDisposable]]::new()
 $switcherOutput = $null
 $switcherErrors = $null
 $failure = $null
-$script:requestId = 0
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -37,10 +36,12 @@ using System.Text;
 using System.Threading;
 public sealed class BrowserSocket : IDisposable {
     private readonly ClientWebSocket socket = new ClientWebSocket();
+    private int requestId;
     public BrowserSocket(string address) {
         using (var timeout = new CancellationTokenSource(5000))
             socket.ConnectAsync(new Uri(address), timeout.Token).GetAwaiter().GetResult();
     }
+    public int NextRequestId() { return Interlocked.Increment(ref requestId); }
     public void Send(string message) {
         using (var timeout = new CancellationTokenSource(5000)) {
             var bytes = Encoding.UTF8.GetBytes(message);
@@ -214,8 +215,9 @@ function Wait-Browser([scriptblock]$Condition, [string]$Description, [int]$Milli
     throw "Timed out: $Description"
 }
 function Invoke-Cdp($Connection, [string]$Method, [hashtable]$Arguments = @{}) {
-    $script:requestId++
-    $id = $script:requestId
+    # The security cases run in a child script scope. CDP state belongs to the
+    # connection, so invoking this helper from another script cannot reset it.
+    $id = $Connection.NextRequestId()
     $Connection.Send((@{id = $id; method = $Method; params = $Arguments} | ConvertTo-Json -Depth 8 -Compress))
     do {
         $reply = $Connection.Receive() | ConvertFrom-Json

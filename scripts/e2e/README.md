@@ -131,6 +131,11 @@ the JSON results so a journal failure can be distinguished from incorrect input
 or browser focus setup. A failure stays red while the remaining cases collect
 evidence. Missing browsers or desktop capabilities also fail instead of skipping.
 
+`test-browser-cdp.ps1` checks the production CDP helpers without a browser or
+Windows input. It invokes them through a child script under StrictMode, verifies
+connection-owned request IDs, and checks event filtering and error propagation.
+This runs in the PowerShell CI gate before the interactive scenarios.
+
 The separate focus unit regressions reproduce a caret-owner change under
 unchanged keyboard focus after the first glyph, and assert that changing the
 focused control still starts a separate journal. This tests the state transition

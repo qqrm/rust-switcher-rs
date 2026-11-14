@@ -147,6 +147,12 @@ public static class HostedInput {
         UIntPtr result;
         return SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 2, 500, out result) != IntPtr.Zero;
     }
+    public static long SecurityMetadata(IntPtr window, uint selector) {
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0x83F0, new UIntPtr(selector), IntPtr.Zero, 2, 200, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Journal metadata read failed");
+        return unchecked((long)result.ToUInt64());
+    }
     public static void ArmFixture(IntPtr window, uint mode) {
         UIntPtr result;
         if (SendMessageTimeout(window, 0x8011, new UIntPtr(mode), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
@@ -190,6 +196,7 @@ function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode, [u
     if ($JournalFixturePid -ne 0) {
         if (-not $DebugMode) { throw 'Only the debug app can allow a journal fixture PID' }
         $info.Environment['RUST_SWITCHER_E2E_TARGET_PID'] = $JournalFixturePid.ToString()
+        $info.Environment['RUST_LOG'] = 'warn,rust_switcher_debug::platform::win::secure_input=debug,rust_switcher_debug::input::ring_buffer=debug,rust_switcher_debug::domain::text::last_word=debug'
     }
     if ($DebugMode) {
         $info.Environment['RUST_SWITCHER_E2E_PLAYGROUND'] = '1'

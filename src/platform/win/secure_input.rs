@@ -289,6 +289,14 @@ fn reject_capture(expected: u64) {
     ring_buffer::reject_secure_capture(expected);
 }
 
+fn reject_probe(request: Probe) {
+    ring_buffer::reject_secure_capture_for_focus(
+        request.generation,
+        request.target.foreground,
+        request.target.focus,
+    );
+}
+
 /// Token for in-flight conversion, selection and restoration operations.
 pub(crate) fn generation() -> u64 {
     ring_buffer::secure_context_generation()
@@ -395,7 +403,11 @@ pub(crate) fn initialize(hwnd: HWND) {
             move || move |command| process_command(provider.as_ref(), command),
             |command| {
                 if let Command::Capture(capture) = command {
-                    reject_capture(capture.generation);
+                    tracing::debug!(reason = "queue_expired", "secure input: capture rejected");
+                    reject_probe(Probe {
+                        target: capture.target,
+                        generation: capture.generation,
+                    });
                 }
             },
         )
@@ -439,7 +451,12 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
                 return Status::Unknown;
             }
             if !result.status.is_allowed() || result.element_changed {
-                reject_capture(capture.generation);
+                tracing::debug!(status = ?result.status, element_changed = result.element_changed,
+                    "secure input: capture metadata rejected");
+                reject_probe(Probe {
+                    target: capture.target,
+                    generation: capture.generation,
+                });
                 return result.status;
             }
             let typed = ring_buffer::record_captured_keydown(&capture.key, capture.generation);
@@ -467,7 +484,9 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
                 return Status::Unknown;
             }
             if !result.status.is_allowed() || result.element_changed {
-                reject_capture(request.generation);
+                tracing::debug!(status = ?result.status, element_changed = result.element_changed,
+                    "secure input: conversion metadata rejected");
+                reject_probe(request);
                 return Status::Unknown;
             }
             result.status
@@ -478,8 +497,10 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
                 return Status::Unknown;
             }
             if !result.status.is_allowed() {
-                reject_capture(request.generation);
+                tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
+                reject_probe(request);
             } else if result.element_changed {
+                tracing::debug!("secure input: focused UIA element changed");
                 ring_buffer::discard_changed_capture_context(request.generation);
             }
             result.status
@@ -489,13 +510,21 @@ fn process_command(provider: Option<&BoundedWorker<Probe, Verdict>>, command: Co
 
 fn capture_is_current(capture: &Capture) -> bool {
     if !validate_capture_generation(capture.generation) {
+        tracing::debug!(reason = "stale_epoch", "secure input: capture rejected");
         return false;
     }
-    if capture.captured.elapsed() >= CAPTURE_LIFETIME
-        || !capture.target.is_current()
-        || !capture.key.is_current()
-    {
-        reject_capture(capture.generation);
+    let expired = capture.captured.elapsed() >= CAPTURE_LIFETIME;
+    let target_current = capture.target.is_current() && capture.key.is_current();
+    if expired || !target_current {
+        tracing::debug!(
+            expired,
+            target_current,
+            "secure input: capture context rejected"
+        );
+        reject_probe(Probe {
+            target: capture.target,
+            generation: capture.generation,
+        });
         return false;
     }
     true
@@ -525,10 +554,16 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
     let Some(key) = ring_buffer::capture_keydown(kb, vk) else {
         return;
     };
-    if !target.is_current() { return; }
+    if !target.is_current() {
+        return;
+    }
     let Some(expected) = ring_buffer::capture_generation_for_key(
-        &key, observed, PENDING_CAPTURES.load(Ordering::Acquire) != 0,
-    ) else { return; };
+        &key,
+        observed,
+        PENDING_CAPTURES.load(Ordering::Acquire) != 0,
+    ) else {
+        return;
+    };
     PENDING_CAPTURES.fetch_add(1, Ordering::AcqRel);
     let capture = Capture {
         key,
@@ -541,7 +576,10 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         .and_then(Option::as_ref)
         .is_some_and(|worker| worker.submit(Command::Capture(Box::new(capture)), CAPTURE_LIFETIME));
     if !submitted {
-        reject_capture(expected);
+        reject_probe(Probe {
+            target,
+            generation: expected,
+        });
     }
 }
 
@@ -570,7 +608,10 @@ pub(crate) fn protect_current_context() -> Status {
         return Status::Unknown;
     }
     if !status.is_allowed() {
-        reject_capture(expected);
+        reject_probe(Probe {
+            target,
+            generation: expected,
+        });
     }
     status
 }

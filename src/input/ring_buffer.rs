@@ -1092,7 +1092,11 @@ fn capture_decode_result_guarded(
     match decoded {
         layout_decode::DecodeResult::Text(text) => {
             if text.chars().any(char::is_control) {
-                reject_secure_capture(generation);
+                reject_secure_capture_for_focus(
+                    generation,
+                    focus.foreground_hwnd as usize,
+                    focus.focus_hwnd as usize,
+                );
                 return None;
             }
             if !with_journal_mut(|journal| {
@@ -1123,14 +1127,22 @@ fn capture_decode_result_guarded(
             // dead key. Preserve both that composition and the captured prefix;
             // resetting here would make the next glyph differ from the editor.
             if ctrl_or_alt_held && !altgr_held {
-                reject_secure_capture(generation);
+                reject_secure_capture_for_focus(
+                    generation,
+                    focus.foreground_hwnd as usize,
+                    focus.focus_hwnd as usize,
+                );
             }
             None
         }
         layout_decode::DecodeResult::Unavailable => {
             // Do not retain a suffix after an unknown first character: that would
             // make a later conversion look successful while leaving its prefix.
-            reject_secure_capture(generation);
+            reject_secure_capture_for_focus(
+                generation,
+                focus.foreground_hwnd as usize,
+                focus.focus_hwnd as usize,
+            );
             None
         }
     }
@@ -1276,6 +1288,12 @@ pub fn record_captured_keydown(key: &CapturedKey, generation: u64) -> Option<Str
                         PHYSICAL_CAPTURE_COUNT
                             .fetch_add(text.chars().count() as u64, Ordering::Relaxed);
                     }
+                    if j.capture_unavailable {
+                        tracing::debug!(
+                            reason = "capture_unavailable",
+                            "secure input: journal append rejected"
+                        );
+                    }
                     j.push_text_internal(&text, layout, origin);
                 }
             }
@@ -1304,6 +1322,11 @@ pub fn take_last_layout_run_with_suffix_if_generation(
             j.invalidate_if_foreground_changed();
         }
         if j.pending_dead_key || j.capture_unavailable {
+            tracing::debug!(
+                pending_dead_key = j.pending_dead_key,
+                capture_unavailable = j.capture_unavailable,
+                "secure input: journal extraction rejected"
+            );
             return None;
         }
         j.take_last_layout_run_with_suffix()
@@ -1341,6 +1364,11 @@ pub fn take_last_sequence_with_suffix_if_generation(
             j.invalidate_if_foreground_changed();
         }
         if j.pending_dead_key || j.capture_unavailable {
+            tracing::debug!(
+                pending_dead_key = j.pending_dead_key,
+                capture_unavailable = j.capture_unavailable,
+                "secure input: journal extraction rejected"
+            );
             return None;
         }
         j.take_last_sequence_with_suffix()
@@ -1611,6 +1639,43 @@ pub fn reject_secure_capture(generation: u64) {
     });
 }
 
+/// Keep a denied, known native target attached to its unavailable prefix. An
+/// unsupported startup control must not poison a different, later editor. This
+/// retains identity only; all text, cached journals and composition are purged.
+#[cfg(windows)]
+pub fn reject_secure_capture_for_focus(generation: u64, foreground: usize, focus: usize) {
+    reject_secure_capture_with_current_focus(generation, foreground, focus, || {
+        current_focus_cache_key(unsafe { GetForegroundWindow() })
+    });
+}
+
+#[cfg(windows)]
+fn reject_secure_capture_with_current_focus(
+    generation: u64,
+    foreground: usize,
+    focus: usize,
+    current_focus: impl FnOnce() -> Option<FocusCacheKey>,
+) {
+    with_journal_mut(|journal| {
+        if !validate_secure_input_generation(generation) {
+            return;
+        }
+        clear_secure_journal(journal, true, true);
+        // Sample after the epoch change while holding the journal lock. An old
+        // request can expire after a new target's first raw key was sampled;
+        // labelling that rejection with its old target could allow the new
+        // target's remaining suffix to look complete. Keep unknown origin in
+        // that case, so the first subsequent target inherits the rejection.
+        if let Some(current) = current_focus()
+            && current.foreground_hwnd as usize == foreground
+            && current.focus_hwnd as usize == focus
+        {
+            journal.last_fg_hwnd = current.foreground_hwnd;
+            journal.last_focus_key = Some(current);
+        }
+    });
+}
+
 /// Reject a delayed selection/property result only for the conversion context
 /// it actually inspected, including a UIA descendant sharing the same HWND.
 #[cfg(windows)]
@@ -1832,6 +1897,74 @@ mod secure_clear_tests {
             })
             .is_none()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn denied_startup_control_does_not_poison_the_first_different_editor() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        // No preceding physical key: the startup property refresh can inspect
+        // a non-text button before the first native editor ever receives input.
+        reject_secure_capture_with_current_focus(secure_input_generation(), 101, 10_101, || {
+            focus_key_for_test(101, 0)
+        });
+        assert!(with_journal(|journal| journal.capture_unavailable));
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, focus_key_for_test(101, 0), 1_000, false);
+        });
+        // The same denied target remains unavailable, including its first suffix.
+        assert!(with_journal(|journal| journal.capture_unavailable));
+        let observed = secure_input_generation();
+        let editor = focus_key_for_test(202, 0).unwrap();
+        let queued = with_journal_mut(|journal| {
+            capture_generation_for_focus(journal, editor, observed, false, 1_010)
+        })
+        .unwrap();
+        assert!(validate_secure_input_generation(queued));
+        assert!(!with_journal(|journal| journal.capture_unavailable));
+        push_text(".");
+        assert_eq!(with_journal(|journal| journal.total_chars), 1);
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn late_known_target_denial_preserves_a_newer_editor() {
+        let _guard = test_guard();
+        let stale = secure_input_generation();
+        clear_secure_input_data();
+        push_text("new-editor");
+        reject_secure_capture_with_current_focus(stale, 101, 10_101, || focus_key_for_test(101, 0));
+        assert!(!runs_snapshot().is_empty());
+        assert!(!with_journal(|journal| journal.capture_unavailable));
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn expired_old_target_denial_does_not_authorize_a_new_target_suffix() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let before = secure_input_generation();
+        let newer = focus_key_for_test(202, 0).unwrap();
+        // The first B key already sampled the old epoch. A's delayed rejection
+        // happens before B can stamp its capture, so that B key will be dropped.
+        reject_secure_capture_with_current_focus(before, 101, 10_101, || Some(newer));
+        assert!(!validate_secure_input_generation(before));
+        assert!(with_journal(|journal| journal.last_focus_key.is_none()));
+        let current = secure_input_generation();
+        with_journal_mut(|journal| {
+            assert_eq!(
+                capture_generation_for_focus(journal, newer, before, false, 1_000),
+                None
+            );
+            assert!(capture_generation_for_focus(journal, newer, current, false, 1_010).is_some());
+            assert!(journal.capture_unavailable);
+        });
+        push_text("suffix");
+        assert!(runs_snapshot().is_empty());
+        clear_secure_input_data();
     }
 
     #[cfg(windows)]
