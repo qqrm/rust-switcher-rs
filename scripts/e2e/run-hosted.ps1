@@ -21,6 +21,7 @@ $checks = [System.Collections.Generic.List[string]]::new()
 $scenarioFailures = [System.Collections.Generic.List[string]]::new()
 $journalCases = [System.Collections.Generic.List[object]]::new()
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+$switcherOutputTasks = [System.Collections.Generic.List[object]]::new()
 $failure = $null
 
 Add-Type -AssemblyName UIAutomationClient
@@ -195,6 +196,8 @@ function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode, [u
     $info.Environment.Remove('RUST_SWITCHER_E2E_TARGET_PID') | Out-Null
     if ($JournalFixturePid -ne 0) {
         if (-not $DebugMode) { throw 'Only the debug app can allow a journal fixture PID' }
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
         $info.Environment['RUST_SWITCHER_E2E_TARGET_PID'] = $JournalFixturePid.ToString()
         $info.Environment['RUST_LOG'] = 'warn,rust_switcher_debug::platform::win::secure_input=debug,rust_switcher_debug::input::ring_buffer=debug,rust_switcher_debug::domain::text::last_word=debug'
     }
@@ -207,6 +210,12 @@ function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode, [u
     }
     $process = [System.Diagnostics.Process]::Start($info)
     $ownedProcesses.Add($process)
+    if ($JournalFixturePid -ne 0) {
+        # Drain both pipes from startup so diagnostic output cannot block the
+        # app or add a synchronization roundtrip before a tested input event.
+        $switcherOutputTasks.Add($process.StandardOutput.ReadToEndAsync())
+        $switcherOutputTasks.Add($process.StandardError.ReadToEndAsync())
+    }
     return $process
 }
 function Find-AppWindow([System.Diagnostics.Process]$Process) {
@@ -632,6 +641,9 @@ try {
     } catch { $cleanupErrors.Add($_.Exception.Message) }
     foreach ($outputTask in @($fixtureStdout, $fixtureStderr, $journalFixtureStdout, $journalFixtureStderr)) {
         if ($null -ne $outputTask -and $outputTask.Wait(1000)) { Write-Output $outputTask.Result }
+    }
+    foreach ($outputTask in $switcherOutputTasks) {
+        if ($outputTask.Wait(1000)) { Write-Output $outputTask.Result }
     }
     $result = [ordered]@{ passed = $checks.ToArray(); journalCases = $journalCases.ToArray(); failures = $scenarioFailures.ToArray(); failure = $failure; cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID }
     $result | ConvertTo-Json -Depth 5 | Write-Output
