@@ -250,6 +250,10 @@ impl ProviderRequest {
             && validate_capture_generation(self.probe.generation)
             && self.probe.target.is_current()
     }
+
+    fn metadata_is_current(&self) -> bool {
+        Instant::now() < self.deadline && self.probe.target.is_current()
+    }
 }
 
 enum Command {
@@ -270,7 +274,7 @@ struct Verdict {
     identity: MetadataIdentity,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum MetadataIdentity {
     Native,
     Published(u64),
@@ -390,7 +394,8 @@ impl Provider {
             });
         probe_observed_identity(
             element_changed,
-            || request.is_current(),
+            || validate_capture_generation(request.probe.generation),
+            || request.metadata_is_current(),
             || {
                 let forget = self.elements.len() >= IDENTITY_CACHE_CAPACITY
                     && !self.elements.contains_key(&request.probe.target);
@@ -417,13 +422,14 @@ impl Provider {
 
 fn probe_observed_identity(
     element_changed: bool,
-    request_is_current: impl Fn() -> bool,
+    generation_is_current: impl Fn() -> bool,
+    metadata_is_current: impl Fn() -> bool,
     publish_identity: impl FnOnce() -> u64,
     retire_identity: impl Fn(u64),
     password_status: impl FnOnce() -> Status,
     remains_focused: impl FnOnce() -> bool,
 ) -> Verdict {
-    if !request_is_current() {
+    if !generation_is_current() || !metadata_is_current() {
         return Verdict::UNKNOWN;
     }
     // The exact focused element is known now. Publish its identity before
@@ -441,9 +447,22 @@ fn probe_observed_identity(
         // before another provider call can stall or its result can be dropped.
         retire_identity(revision);
     }
-    if !remains_focused() || !request_is_current() {
+    if !remains_focused() || !metadata_is_current() {
         if !denied {
             retire_identity(revision);
+        }
+        return Verdict::UNKNOWN;
+    }
+    if !generation_is_current() {
+        // Navigation can supersede the old journal request while its ordinary
+        // element, native target and deadline remain valid. The old command
+        // cannot mutate the new journal, but retiring this still-valid identity
+        // would also invalidate new-generation keys that observed it in time.
+        if !denied {
+            tracing::debug!(
+                revision,
+                "secure input: superseded probe kept valid ordinary identity"
+            );
         }
         return Verdict::UNKNOWN;
     }
@@ -882,6 +901,7 @@ fn process_command(
             if !capture_metadata_allows(capture.identity_revision, result) {
                 tracing::debug!(status = ?result.status, element_changed = result.element_changed,
                     identity_matches = identity_matches(capture.identity_revision, result.identity),
+                    captured_revision = ?capture.identity_revision, observed_identity = ?result.identity,
                     "secure input: capture metadata rejected");
                 reject_probe(Probe {
                     target: capture.target,
@@ -1529,6 +1549,7 @@ mod tests {
                             // blocked after the exact element was observed.
                             let verdict = probe_observed_identity(
                                 true,
+                                || validate_capture_generation(generation),
                                 || worker_current.load(Ordering::Acquire),
                                 || worker_publications.publish(request.target, true, false),
                                 |revision| worker_publications.retire(request.target, revision),
@@ -1564,6 +1585,7 @@ mod tests {
                                 let fresh = probe_observed_identity(
                                     false,
                                     || validate_capture_generation(generation),
+                                    || true,
                                     || worker_publications.publish(request.target, false, false),
                                     |revision| worker_publications.retire(request.target, revision),
                                     || Status::NotSecure,
@@ -1681,6 +1703,7 @@ mod tests {
         let verdict = probe_observed_identity(
             true,
             || false,
+            || panic!("a stale observation must not query native metadata"),
             || panic!("a stale observation must not publish an identity"),
             |_| panic!("a stale observation must not retire another identity"),
             || panic!("a stale observation must not query password metadata"),
@@ -1734,6 +1757,7 @@ mod tests {
                         Query::Observe => {
                             let verdict = probe_observed_identity(
                                 true,
+                                || validate_capture_generation(raw),
                                 || worker_current.load(Ordering::Acquire),
                                 || worker_publications.publish(request.target, true, false),
                                 |revision| {
@@ -1764,6 +1788,7 @@ mod tests {
                         }
                         Query::FreshCapture => probe_observed_identity(
                             false,
+                            || true,
                             || true,
                             || worker_publications.publish(request.target, false, false),
                             |revision| worker_publications.retire(request.target, revision),
@@ -1919,6 +1944,188 @@ mod tests {
             Some(next),
             published_test_verdict(next, false)
         ));
+    }
+
+    fn run_superseded_observation_case(
+        status: Status,
+        stable: bool,
+        deadline_valid: bool,
+        native_current: bool,
+        element_changed: bool,
+        old_policy: bool,
+    ) -> (usize, usize) {
+        use std::sync::mpsc;
+
+        enum Action {
+            Observe,
+            Capture {
+                generation: u64,
+                revision: Option<u64>,
+                pending: PendingCapture,
+            },
+        }
+
+        ring_buffer::clear_secure_input_data();
+        let old_generation = capture_generation();
+        let request = pointer_test_probe(old_generation);
+        let publications = Arc::new(IdentityPublications::new());
+        publications.publish(request.target, true, false);
+        let worker_publications = Arc::clone(&publications);
+        let deadline = Arc::new(AtomicBool::new(true));
+        let native = Arc::new(AtomicBool::new(true));
+        let worker_deadline = Arc::clone(&deadline);
+        let worker_native = Arc::clone(&native);
+        let (blocked, observing) = mpsc::channel();
+        let (finish, resume) = mpsc::channel();
+        let (completed, results) = mpsc::channel();
+        let worker = BoundedWorker::start_with_expiration(
+            "superseded-identity-test",
+            2,
+            move || {
+                move |action| {
+                    let appended = match action {
+                        Action::Observe => {
+                            let verdict = probe_observed_identity(
+                                element_changed,
+                                || validate_capture_generation(old_generation),
+                                || {
+                                    worker_deadline.load(Ordering::Acquire)
+                                        && worker_native.load(Ordering::Acquire)
+                                        // The old policy incorrectly included
+                                        // navigation in metadata invalidity.
+                                        && (!old_policy || validate_capture_generation(old_generation))
+                                },
+                                || worker_publications.publish(request.target, element_changed, false),
+                                |revision| worker_publications.retire(request.target, revision),
+                                || {
+                                    blocked.send(()).unwrap();
+                                    resume.recv_timeout(Duration::from_secs(2)).unwrap();
+                                    status
+                                },
+                                || stable,
+                            );
+                            assert_eq!(verdict.status, Status::Unknown);
+                            assert_eq!(complete_refresh(request, verdict, || true), Status::Unknown);
+                            0
+                        }
+                        Action::Capture { generation, revision, pending } => {
+                            let appended = if !validate_capture_generation(generation) {
+                                // An old key remains invalid after navigation,
+                                // even when its metadata revision was retained.
+                                0
+                            } else {
+                                let fresh = probe_observed_identity(
+                                    false,
+                                    || validate_capture_generation(generation),
+                                    || true,
+                                    || worker_publications.publish(request.target, false, false),
+                                    |revision| worker_publications.retire(request.target, revision),
+                                    || Status::NotSecure,
+                                    || true,
+                                );
+                                if capture_metadata_allows(revision, fresh) {
+                                    ring_buffer::push_text("x");
+                                    1
+                                } else {
+                                    reject_probe(Probe { generation, ..request });
+                                    0
+                                }
+                            };
+                            drop(pending);
+                            appended
+                        }
+                    };
+                    completed.send(appended).unwrap();
+                    appended
+                }
+            },
+            |_| {},
+        ).unwrap();
+        assert!(worker.submit(Action::Observe, Duration::from_secs(2)));
+        observing.recv_timeout(Duration::from_secs(2)).unwrap();
+        let enqueue = |generation| {
+            let frontier = publications.frontier();
+            let _dispatch = begin_capture_dispatch(generation).unwrap();
+            let revision = publications.at_admission(request.target, frontier);
+            assert!(revision.is_some());
+            assert!(worker.submit(
+                Action::Capture {
+                    generation,
+                    revision,
+                    pending: PendingCapture::new(generation),
+                },
+                Duration::from_secs(2)
+            ));
+            revision
+        };
+        let old_revision = enqueue(old_generation);
+        // A redundant pointer/navigation boundary advances the real raw epoch
+        // while the provider still observes the same native/UIA field.
+        ring_buffer::invalidate_capture_context();
+        let new_generation = capture_generation();
+        assert_ne!(old_generation, new_generation);
+        assert_eq!(enqueue(new_generation), old_revision);
+        deadline.store(deadline_valid, Ordering::Release);
+        native.store(native_current, Ordering::Release);
+        finish.send(()).unwrap();
+        assert_eq!(results.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        let old_appended = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        let new_appended = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!validate_capture_generation(old_generation));
+        if new_appended == 0 {
+            assert!(!validate_capture_generation(new_generation));
+            ring_buffer::push_text("late-suffix");
+            assert!(ring_buffer::runs_snapshot().is_empty());
+        } else {
+            assert!(validate_capture_generation(new_generation));
+            assert_eq!(
+                ring_buffer::runs_snapshot()
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+                "x"
+            );
+        }
+        ring_buffer::clear_secure_input_data();
+        (old_appended, new_appended)
+    }
+
+    #[test]
+    fn navigation_does_not_retire_otherwise_valid_observed_identity() {
+        let _guard = ring_buffer::test_guard();
+        for changed in [false, true] {
+            // The old retirement rule really refuses an otherwise valid new
+            // segment; retaining identity must not resurrect the old raw key.
+            assert_eq!(
+                run_superseded_observation_case(Status::NotSecure, true, true, true, changed, true),
+                (0, 0)
+            );
+            assert_eq!(
+                run_superseded_observation_case(
+                    Status::NotSecure,
+                    true,
+                    true,
+                    true,
+                    changed,
+                    false
+                ),
+                (0, 1)
+            );
+            for (status, stable, deadline, native) in [
+                (Status::Secure, true, true, true),
+                (Status::Unknown, true, true, true),
+                (Status::NotSecure, false, true, true),
+                (Status::NotSecure, true, false, true),
+                (Status::NotSecure, true, true, false),
+            ] {
+                assert_eq!(
+                    run_superseded_observation_case(
+                        status, stable, deadline, native, changed, false
+                    ),
+                    (0, 0)
+                );
+            }
+        }
     }
 
     #[test]

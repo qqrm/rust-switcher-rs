@@ -65,10 +65,18 @@ A failed or sensitive metadata result retains the existing rejection path;
 published revisions are never rolled back to make older keys current again.
 The provider retires the matching revision on sensitive or unavailable metadata,
 unstable focus, and expired observations. Retirement does not depend on delivery
-of its reply: a timed-out worker result cannot leave a provisional identity
-usable by later input. It cannot remove a newer revision or a different target.
+of its reply: a rejected or expired observation cannot leave its provisional
+identity usable merely because its reply was dropped. Retirement cannot remove
+a newer revision or a different target.
 The next successful observation must establish a fresh revision, so keys bound
 to the retired one remain rejected.
+
+A raw-input reset can supersede a query without changing the observed field.
+That old query cannot affect the new journal generation. It may retain its
+identity only if its explicit non-password metadata, UIA focus, native target,
+and deadline remain valid. A fully validated ordinary observation may likewise
+retain its identity when only reply delivery expires. Every later key still
+requires its own fresh validation; neither case reauthorizes older input.
 
 This is best-effort protection based on observable metadata, not proof of the
 element that received a physical key. UIA observations can miss a transient
