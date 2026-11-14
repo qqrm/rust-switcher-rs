@@ -521,13 +521,14 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         clear_sensitive_context();
         return;
     }
-    let expected = capture_generation();
+    let observed = capture_generation();
     let Some(key) = ring_buffer::capture_keydown(kb, vk) else {
         return;
     };
-    if !validate_capture_generation(expected) || !key.is_current() || !target.is_current() {
-        return;
-    }
+    if !target.is_current() { return; }
+    let Some(expected) = ring_buffer::capture_generation_for_key(
+        &key, observed, PENDING_CAPTURES.load(Ordering::Acquire) != 0,
+    ) else { return; };
     PENDING_CAPTURES.fetch_add(1, Ordering::AcqRel);
     let capture = Capture {
         key,

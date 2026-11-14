@@ -1483,6 +1483,52 @@ pub fn invalidate_capture_context_if_current(generation: u64) -> bool {
     })
 }
 
+/// Synchronize the raw event's native target before assigning its queue epoch.
+/// An out-of-context WinEvent can arrive after the keyboard hook; it must see
+/// this target as current instead of cancelling the first key queued for it.
+#[cfg(windows)]
+pub fn capture_generation_for_key(
+    key: &CapturedKey,
+    observed_generation: u64,
+    pending_capture: bool,
+) -> Option<u64> {
+    with_journal_mut(|journal| {
+        if !key.is_current() {
+            return None;
+        }
+        capture_generation_for_focus(
+            journal,
+            key.focus,
+            observed_generation,
+            pending_capture,
+            unsafe { GetTickCount64() },
+        )
+    })
+}
+
+#[cfg(windows)]
+fn capture_generation_for_focus(
+    journal: &mut InputJournal,
+    focus: FocusCacheKey,
+    observed_generation: u64,
+    pending_capture: bool,
+    now_ms: u64,
+) -> Option<u64> {
+    // This is only the event-time focus transition. Never reauthorize a raw key
+    // across a separate sensitive-context clear that happened during capture.
+    if !validate_secure_input_generation(observed_generation) {
+        return None;
+    }
+    apply_secure_focus_transition(
+        journal,
+        focus.foreground_hwnd,
+        Some(focus),
+        now_ms,
+        pending_capture,
+    );
+    Some(secure_input_generation())
+}
+
 /// Preserve ordinary native-editor cache restoration. A background UIA identity
 /// comparison distinguishes a real DOM focus change from duplicate WinEvents.
 #[cfg(windows)]
@@ -1517,7 +1563,7 @@ fn apply_secure_focus_transition(
         // A queued suffix from the departing editor is about to be cancelled.
         // Cache its incomplete-prefix marker so a later return cannot authorize
         // deleting fewer characters than the real editor contains.
-        if pending_capture {
+        if pending_capture && journal.last_focus_key.is_some() {
             journal.capture_unavailable = true;
         }
         SECURE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -1786,6 +1832,64 @@ mod secure_clear_tests {
             })
             .is_none()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_new_target_key_survives_a_delayed_native_focus_notification() {
+        let _guard = test_guard();
+        for departing_editor in [false, true] {
+            clear_secure_input_data();
+            if departing_editor {
+                test_switch_foreground(101, 1_000);
+                push_text("incomplete-old-prefix");
+            }
+            let observed = secure_input_generation();
+            let target = focus_key_for_test(202, 0).unwrap();
+            // The physical key already belongs to 202, before its focus event
+            // reaches this process. Stamp it after synchronizing that target.
+            let queued_epoch = with_journal_mut(|journal| {
+                capture_generation_for_focus(journal, target, observed, departing_editor, 1_010)
+            })
+            .unwrap();
+            with_journal_mut(|journal| {
+                // The first key is now pending, but is not departing input.
+                apply_secure_focus_transition(journal, 202, Some(target), 1_011, true);
+            });
+            assert!(validate_secure_input_generation(queued_epoch));
+            assert!(!with_journal(|journal| journal.capture_unavailable));
+            if departing_editor {
+                with_journal_mut(|journal| {
+                    apply_secure_focus_transition(
+                        journal,
+                        101,
+                        focus_key_for_test(101, 0),
+                        1_020,
+                        false,
+                    );
+                });
+                assert!(with_journal(|journal| journal.capture_unavailable));
+            }
+        }
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_synchronization_does_not_reauthorize_a_key_after_a_security_clear() {
+        let _guard = test_guard();
+        let stale = secure_input_generation();
+        clear_secure_input_data();
+        push_text("new-context");
+        let target = focus_key_for_test(202, 0).unwrap();
+        assert!(
+            with_journal_mut(|journal| {
+                capture_generation_for_focus(journal, target, stale, false, 1_010)
+            })
+            .is_none()
+        );
+        assert!(!runs_snapshot().is_empty());
+        clear_secure_input_data();
     }
 
     #[cfg(windows)]
