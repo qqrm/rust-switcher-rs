@@ -187,6 +187,9 @@ struct InputJournal {
     caret_from_end: usize,
     last_token_autoconverted: bool,
     capture_unavailable: bool,
+    // This segment has admitted input or held text. Extraction and metadata
+    // clears cannot make a previously used segment pristine again.
+    input_started: bool,
     pending_dead_key: bool,
     // Shrinking the buffer later cannot make a discarded prefix known again.
     prefix_truncated: bool,
@@ -205,6 +208,7 @@ impl InputJournal {
             caret_from_end: 0,
             last_token_autoconverted: false,
             capture_unavailable: false,
+            input_started: false,
             pending_dead_key: false,
             prefix_truncated: false,
             #[cfg(windows)]
@@ -216,6 +220,8 @@ impl InputJournal {
 
     #[cfg(any(test, windows))]
     fn clear(&mut self) {
+        // input_started is sticky within a segment, including while extracted
+        // text is owned by an in-flight conversion. Boundaries reset it explicitly.
         self.runs.clear();
         self.total_chars = 0;
         self.caret_from_end = 0;
@@ -235,6 +241,7 @@ impl InputJournal {
         if text.is_empty() {
             return;
         }
+        self.input_started = true;
 
         if let Some(last) = self.runs.back_mut()
             && last.layout == layout
@@ -541,6 +548,7 @@ impl InputJournal {
 
             self.clear();
             self.capture_unavailable = unknown_window_input;
+            self.input_started = false;
             self.last_fg_hwnd = raw;
             self.last_focus_key = key;
         });
@@ -782,6 +790,7 @@ impl InputJournal {
     fn restore_suffix(&mut self, suffix_runs: &mut Vec<InputRun>) {
         // `suffix_runs` is expected to be in reverse order (from repeated `pop_back`).
         while let Some(run) = suffix_runs.pop() {
+            self.input_started |= !run.text.is_empty();
             self.total_chars += run.text.chars().count();
             self.runs.push_back(run);
         }
@@ -1512,6 +1521,7 @@ fn clear_secure_journal(journal: &mut InputJournal, reason: ResetReason) {
     layout_decode::reset();
     journal.clear();
     journal.capture_unavailable = matches!(reason, ResetReason::CaptureRejected);
+    journal.input_started = false;
     #[cfg(windows)]
     {
         journal.last_fg_hwnd = 0;
@@ -1586,7 +1596,13 @@ pub fn capture_generation_for_key(
     pending_capture: impl FnOnce(u64) -> bool,
 ) -> Option<u64> {
     with_journal_mut(|journal| {
+        if !validate_secure_input_generation(observed_generation) {
+            return None;
+        }
         if !key.is_current() {
+            // The editor still receives this physical event. Losing its native
+            // target before admission must not leave an apparently fresh prefix.
+            clear_secure_journal(journal, ResetReason::CaptureRejected);
             return None;
         }
         let pending_capture = pending_capture(observed_generation);
@@ -1620,6 +1636,7 @@ fn capture_generation_for_focus(
         now_ms,
         pending_capture,
     );
+    journal.input_started = true;
     Some(secure_input_generation())
 }
 
@@ -1753,6 +1770,83 @@ pub fn reject_secure_capture_for_focus(generation: u64, foreground: usize, focus
     });
 }
 
+/// A failed metadata observation need not lose a key when the segment has never
+/// admitted input. The caller holds capture dispatch through this decision and
+/// queries pending leases under the journal lock. Actual capture denials always
+/// use the stricter rejection above.
+#[cfg(windows)]
+pub fn reject_secure_observation_for_focus(
+    generation: u64,
+    foreground: usize,
+    focus: usize,
+    pending_capture: impl FnOnce(u64) -> bool,
+) {
+    with_journal_mut(|journal| {
+        if !validate_secure_input_generation(generation) {
+            return;
+        }
+        let current = current_focus_cache_key(unsafe { GetForegroundWindow() });
+        let target_current = current.is_some_and(|current| {
+            current.foreground_hwnd as usize == foreground && current.focus_hwnd as usize == focus
+        });
+        let Some(mut pristine) =
+            reject_observation_in_journal(journal, generation, pending_capture, target_current)
+        else {
+            return;
+        };
+        // Retain a freshly verified native identity, as capture rejection does.
+        // Unknown origin must never become a complete prefix in another target.
+        if let Some(current) = current_focus_cache_key(unsafe { GetForegroundWindow() })
+            && current.foreground_hwnd as usize == foreground
+            && current.focus_hwnd as usize == focus
+        {
+            journal.last_fg_hwnd = current.foreground_hwnd;
+            journal.last_focus_key = Some(current);
+        } else if pristine {
+            clear_secure_journal(journal, ResetReason::CaptureRejected);
+            pristine = false;
+        }
+        tracing::debug!(
+            pristine,
+            "secure input: failed focus observation purged history"
+        );
+    });
+}
+
+#[cfg(any(test, windows))]
+fn reject_observation_in_journal(
+    journal: &mut InputJournal,
+    generation: u64,
+    pending_capture: impl FnOnce(u64) -> bool,
+    target_current: bool,
+) -> Option<bool> {
+    if !validate_secure_input_generation(generation) {
+        return None;
+    }
+    let pending_capture = pending_capture(generation);
+    let pristine = target_current
+        && !pending_capture
+        && !journal.input_started
+        && journal.total_chars == 0
+        && journal.runs.is_empty()
+        && !journal.pending_dead_key
+        && !journal.prefix_truncated
+        && !journal.capture_unavailable;
+    if pristine {
+        // Preserve raw G: a hook losing dispatch can still reject that same G.
+        // Advancing it here would make that missing-key rejection stale.
+        SECURE_CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        #[cfg(windows)]
+        layout_decode::reset();
+        journal.clear();
+        #[cfg(windows)]
+        with_journal_cache_mut(HashMap::clear);
+    } else {
+        clear_secure_journal(journal, ResetReason::CaptureRejected);
+    }
+    Some(pristine)
+}
+
 #[cfg(windows)]
 fn reject_secure_capture_with_current_focus(
     generation: u64,
@@ -1828,6 +1922,289 @@ mod property_tests;
 mod secure_clear_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
+
+    fn reject_test_observation(pending: bool, target_current: bool) -> Option<bool> {
+        with_journal_mut(|journal| {
+            reject_observation_in_journal(
+                journal,
+                secure_input_generation(),
+                |_| pending,
+                target_current,
+            )
+        })
+    }
+
+    #[test]
+    fn unused_observation_failure_keeps_raw_epoch_for_a_fresh_first_key() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let raw = secure_input_generation();
+        let context = secure_context_generation();
+        assert_eq!(reject_test_observation(false, true), Some(true));
+        assert!(validate_secure_input_generation(raw));
+        assert!(!validate_secure_context_generation(context));
+        with_journal(|journal| {
+            assert!(!journal.input_started);
+            assert!(!journal.capture_unavailable);
+        });
+
+        // A later explicit non-password identity observation may start capture;
+        // the failed observation alone never manufactures any input.
+        discard_changed_capture_context(raw);
+        push_text("fresh-first-key");
+        let (sequence, suffix) =
+            take_last_sequence_with_suffix().expect("fresh capture must remain usable");
+        assert!(suffix.is_empty());
+        assert_eq!(
+            sequence
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "fresh-first-key"
+        );
+        clear_secure_input_data();
+    }
+
+    #[test]
+    fn clean_observation_purge_cannot_make_a_racing_missing_key_stale() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let raw = secure_input_generation();
+        assert_eq!(reject_test_observation(false, true), Some(true));
+        // A hook that lost dispatch still rejects the epoch it sampled before
+        // the metadata-only purge. No clean G-to-G+1 transition can swallow it.
+        reject_secure_capture(raw);
+        assert!(!validate_secure_input_generation(raw));
+        push_text("incomplete-suffix");
+        assert!(runs_snapshot().is_empty());
+        assert!(with_journal(|journal| journal.capture_unavailable));
+        clear_secure_input_data();
+    }
+
+    #[test]
+    fn observation_failure_does_not_reopen_used_or_ambiguous_empty_segments() {
+        let _guard = test_guard();
+        for scenario in 0..8 {
+            clear_secure_input_data();
+            with_journal_mut(|journal| match scenario {
+                0 => journal.push_text_internal("prefix", LayoutTag::En, RunOrigin::Physical),
+                1 => {
+                    journal.push_text_internal(
+                        "removed-prefix",
+                        LayoutTag::En,
+                        RunOrigin::Physical,
+                    );
+                    journal.clear();
+                }
+                2 => journal.input_started = true, // Admitted raw event with no decoded text.
+                3 => journal.pending_dead_key = true,
+                4 => journal.prefix_truncated = true,
+                5 => journal.capture_unavailable = true,
+                _ => {}
+            });
+            let raw = secure_input_generation();
+            assert_eq!(
+                reject_test_observation(scenario == 6, scenario != 7),
+                Some(false),
+                "scenario {scenario}"
+            );
+            assert!(
+                !validate_secure_input_generation(raw),
+                "scenario {scenario}"
+            );
+            push_text("incomplete-suffix");
+            assert!(runs_snapshot().is_empty(), "scenario {scenario}");
+            assert!(
+                with_journal(|journal| journal.capture_unavailable),
+                "scenario {scenario}"
+            );
+        }
+        clear_secure_input_data();
+    }
+
+    #[test]
+    fn restored_and_extracted_history_is_not_a_pristine_observation_segment() {
+        let _guard = test_guard();
+        for restore_saved_journal in [false, true] {
+            clear_secure_input_data();
+            push_text("document-prefix");
+            if restore_saved_journal {
+                let saved = with_journal(Clone::clone);
+                clear_secure_input_data();
+                // Native cache restoration performs this same journal move.
+                // No new raw capture was admitted in the current epoch.
+                with_journal_mut(|journal| *journal = saved);
+            }
+            let raw = secure_input_generation();
+            let context = secure_context_generation();
+            let (sequence, suffix) = take_last_sequence_with_suffix_if_generation(context)
+                .expect("the complete prefix must be extractable");
+            assert!(runs_snapshot().is_empty());
+            assert!(with_journal(|journal| journal.input_started));
+            assert_eq!(reject_test_observation(false, true), Some(false));
+            assert!(!validate_secure_input_generation(raw));
+            assert!(!push_runs_if_generation(
+                context,
+                sequence.into_iter().chain(suffix)
+            ));
+            push_text("late-suffix");
+            assert!(runs_snapshot().is_empty());
+        }
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_cached_history_remains_used_after_return_and_full_extraction() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let switch = |foreground, time| {
+            with_journal_mut(|journal| {
+                apply_secure_focus_transition(
+                    journal,
+                    foreground,
+                    focus_key_for_test(foreground, 0),
+                    time,
+                    false,
+                );
+            });
+        };
+        switch(101, 1_000);
+        push_text("cached-prefix");
+        let original_raw = secure_input_generation();
+        switch(202, 1_100);
+        push_text("other-editor");
+        switch(101, 1_200);
+        let raw = secure_input_generation();
+        let context = secure_context_generation();
+        assert_ne!(raw, original_raw);
+        let (sequence, suffix) = with_journal_mut(|journal| {
+            assert!(journal.input_started);
+            // Extract directly so the fake native fixture HWND is not queried.
+            let payload = journal.take_last_sequence_with_suffix().unwrap();
+            assert!(journal.runs.is_empty());
+            assert_eq!(
+                reject_observation_in_journal(journal, raw, |_| false, true),
+                Some(false)
+            );
+            assert!(journal.capture_unavailable);
+            payload
+        });
+        assert_eq!(
+            sequence
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "cached-prefix"
+        );
+        assert!(!push_runs_if_generation(
+            context,
+            sequence.into_iter().chain(suffix)
+        ));
+        push_text("late-suffix");
+        assert!(runs_snapshot().is_empty());
+        clear_secure_input_data();
+    }
+
+    #[test]
+    fn stale_observation_failure_cannot_change_a_new_segment() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let stale = secure_input_generation();
+        clear_secure_input_data();
+        push_text("new-segment");
+        let before = runs_snapshot();
+        let raw = secure_input_generation();
+        let context = secure_context_generation();
+        assert_eq!(
+            with_journal_mut(|journal| {
+                reject_observation_in_journal(
+                    journal,
+                    stale,
+                    |_| panic!("stale pending query"),
+                    true,
+                )
+            }),
+            None
+        );
+        assert!(validate_secure_input_generation(raw));
+        assert!(validate_secure_context_generation(context));
+        assert_eq!(runs_snapshot(), before);
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_target_loss_before_admission_rejects_only_the_current_epoch() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let key = CapturedKey {
+            vk: VIRTUAL_KEY(0x41),
+            scan_code: 0,
+            keyboard_state: [0; 256],
+            layout: 0,
+            focus: focus_key_for_test(isize::MAX, 0).unwrap(),
+            ctrl_or_alt_held: false,
+            altgr_held: false,
+            shift_held: false,
+        };
+        let raw = secure_input_generation();
+        assert_eq!(capture_generation_for_key(&key, raw, |_| false), None);
+        assert!(!validate_secure_input_generation(raw));
+        assert!(with_journal(|journal| journal.capture_unavailable));
+        push_text("incomplete-suffix");
+        assert!(runs_snapshot().is_empty());
+
+        clear_secure_input_data();
+        push_text("new-context");
+        let before = runs_snapshot();
+        assert_eq!(capture_generation_for_key(&key, raw, |_| false), None);
+        assert_eq!(runs_snapshot(), before);
+        assert!(!with_journal(|journal| journal.capture_unavailable));
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_admission_is_sticky_before_its_pending_lease_is_registered() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let observed = secure_input_generation();
+        let focus = focus_key_for_test(101, 0).unwrap();
+        let raw = with_journal_mut(|journal| {
+            capture_generation_for_focus(journal, focus, observed, false, 1_000).unwrap()
+        });
+        assert!(validate_secure_input_generation(raw));
+        assert!(runs_snapshot().is_empty());
+        assert!(with_journal(|journal| journal.input_started));
+        assert_eq!(reject_test_observation(false, true), Some(false));
+        assert!(with_journal(|journal| journal.capture_unavailable));
+        clear_secure_input_data();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_observation_purges_other_caches_without_losing_current_native_identity() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        test_switch_foreground(101, 1_000);
+        push_text("other-editor");
+        test_switch_foreground(202, 1_100);
+        let (foreground, focus) = with_journal(|journal| {
+            assert!(!journal.input_started);
+            (journal.last_fg_hwnd, journal.last_focus_key)
+        });
+        assert!(!with_journal_cache_mut(|cache| cache.is_empty()));
+        let raw = secure_input_generation();
+        assert_eq!(reject_test_observation(false, true), Some(true));
+        assert!(validate_secure_input_generation(raw));
+        assert!(with_journal_cache_mut(|cache| cache.is_empty()));
+        with_journal(|journal| {
+            assert_eq!(journal.last_fg_hwnd, foreground);
+            assert_eq!(journal.last_focus_key, focus);
+        });
+        clear_secure_input_data();
+    }
 
     #[cfg(all(windows, debug_assertions))]
     #[test]

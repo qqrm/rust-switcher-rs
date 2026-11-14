@@ -34,6 +34,14 @@ An observation that retains the raw-input epoch also retains its incomplete
 marker, even when the UIA descendant changes. Only a new input boundary can
 start a complete segment after capture has lost a key.
 
+A metadata failure before any input or history in a new segment can purge
+retained data without declaring a missing prefix. This observation-only cleanup
+keeps the raw generation so a simultaneous rejected hook event still marks that
+same segment incomplete. Later input still requires a fresh, explicit
+non-password verdict. A sticky history marker survives cache restoration,
+conversion extraction, deletion, and trimming, so an empty buffer is not
+mistaken for a segment that has never received input.
+
 ### Immediate focus changes
 
 For pointer-driven focus changes, the UIA worker resolves the release position
@@ -41,7 +49,11 @@ once and freezes the nearest explicitly keyboard-focusable control as its
 anchor. It accepts metadata only after that exact element becomes focused,
 within the existing provider deadline. A different focused field or ancestor
 cannot replace the anchor. Capture still rejects a changed element or unknown
-password metadata. Hit testing is asynchronous; it does not establish the
+password metadata. Confirming an anchor cannot authorize raw snapshots already
+waiting for that confirmation: completion is serialized with snapshot admission,
+and pending input is rejected while its incomplete marker is retained. Native
+Edit/RichEdit style checks do not use this UIA waiting path.
+Hit testing is asynchronous; it does not establish the
 identity of an element replaced before the worker resolves that position.
 
 A click can move between browser fields before their asynchronous accessibility

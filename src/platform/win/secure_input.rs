@@ -195,19 +195,26 @@ enum Command {
     /// FIFO barrier: all earlier captures finish or are invalidated first.
     Protect(Probe),
     Refresh(Probe),
-    PointerRefresh { probe: Probe, point: POINT },
+    PointerRefresh {
+        probe: Probe,
+        point: POINT,
+    },
 }
 
 #[derive(Clone, Copy)]
 struct Verdict {
     status: Status,
     element_changed: bool,
+    // A pointer provider may have waited while raw keys entered the FIFO. Those
+    // snapshots must not inherit an identity established only after their input.
+    pointer_anchor: bool,
 }
 
 impl Verdict {
     const UNKNOWN: Self = Self {
         status: Status::Unknown,
         element_changed: false,
+        pointer_anchor: false,
     };
 }
 
@@ -307,10 +314,13 @@ impl Provider {
         let Some(element) = element else {
             return Verdict::UNKNOWN;
         };
-        let element_changed = self.elements.get(&request.probe.target).is_none_or(|previous| {
-            !unsafe { automation.CompareElements(previous, &element) }
-                .is_ok_and(|same| same.as_bool())
-        });
+        let element_changed = self
+            .elements
+            .get(&request.probe.target)
+            .is_none_or(|previous| {
+                !unsafe { automation.CompareElements(previous, &element) }
+                    .is_ok_and(|same| same.as_bool())
+            });
         let status = element_status(&element);
         // A property lookup can itself race a same-HWND DOM focus change.
         let stable = unsafe { automation.GetFocusedElement() }
@@ -327,6 +337,7 @@ impl Provider {
         Verdict {
             status,
             element_changed,
+            pointer_anchor: matches!(request.source, ProbeSource::Pointer(_)),
         }
     }
 }
@@ -339,11 +350,17 @@ fn pointer_element(
     point: POINT,
 ) -> Option<IUIAutomationElement> {
     let Ok(hit) = (unsafe { automation.ElementFromPoint(point) }) else {
-        tracing::debug!(reason = "hit_test_unavailable", "secure input: pointer anchor rejected");
+        tracing::debug!(
+            reason = "hit_test_unavailable",
+            "secure input: pointer anchor rejected"
+        );
         return None;
     };
     let Ok(walker) = (unsafe { automation.ControlViewWalker() }) else {
-        tracing::debug!(reason = "tree_unavailable", "secure input: pointer anchor rejected");
+        tracing::debug!(
+            reason = "tree_unavailable",
+            "secure input: pointer anchor rejected"
+        );
         return None;
     };
     let Some(anchor) = focusable_pointer_anchor(
@@ -361,7 +378,10 @@ fn pointer_element(
             unsafe { walker.GetParentElement(element) }.ok()
         },
     ) else {
-        tracing::debug!(reason = "focusable_anchor_unavailable", "secure input: pointer anchor rejected");
+        tracing::debug!(
+            reason = "focusable_anchor_unavailable",
+            "secure input: pointer anchor rejected"
+        );
         return None;
     };
     let focused = wait_for_pointer_focus(
@@ -382,13 +402,17 @@ fn pointer_element(
             // Only the provider worker waits for this observable condition.
             // One deadline includes hit testing, traversal and focus delivery.
             std::thread::sleep(
-                POINTER_FOCUS_INTERVAL.min(request.deadline.saturating_duration_since(Instant::now())),
+                POINTER_FOCUS_INTERVAL
+                    .min(request.deadline.saturating_duration_since(Instant::now())),
             );
             request.is_current()
         },
     );
     if focused.is_none() {
-        tracing::debug!(reason = "anchored_focus_unavailable", "secure input: pointer anchor rejected");
+        tracing::debug!(
+            reason = "anchored_focus_unavailable",
+            "secure input: pointer anchor rejected"
+        );
     }
     focused
 }
@@ -449,8 +473,7 @@ fn element_boolean_property(
     element: &IUIAutomationElement,
     property: UIA_PROPERTY_ID,
 ) -> Option<bool> {
-    let Ok(mut value) = (unsafe { element.GetCurrentPropertyValueEx(property, true) })
-    else {
+    let Ok(mut value) = (unsafe { element.GetCurrentPropertyValueEx(property, true) }) else {
         return None;
     };
     let result = variant_boolean(&value);
@@ -594,7 +617,10 @@ pub(crate) fn refresh_pointer_context(point: POINT) {
     let generation = capture_generation();
     let queued = if let (Some(Some(worker)), Some(target)) = (WORKER.get(), Target::capture()) {
         worker.submit(
-            Command::PointerRefresh { probe: Probe { target, generation }, point },
+            Command::PointerRefresh {
+                probe: Probe { target, generation },
+                point,
+            },
             CAPTURE_LIFETIME,
         )
     } else {
@@ -700,6 +726,7 @@ fn verdict(
         return Verdict {
             status,
             element_changed: false,
+            pointer_anchor: false,
         };
     }
     if FOCUS_HOOKS_READY.get() != Some(&true) {
@@ -799,18 +826,49 @@ fn refresh_context(
     source: ProbeSource,
 ) -> Status {
     let result = verdict(provider, request, source);
-    if !validate_capture_generation(request.generation) || !request.target.is_current() {
+    complete_refresh(request, result, || request.target.is_current())
+}
+
+fn complete_refresh(
+    request: Probe,
+    result: Verdict,
+    target_is_current: impl FnOnce() -> bool,
+) -> Status {
+    // Provider work has finished before this barrier. A hook snapshot already
+    // in progress must finish registering its pending lease and submitting it
+    // before we inspect the FIFO's ownership. New hooks still use try_lock and
+    // reject their prefix instead of waiting for this coordinator.
+    let _dispatch = (result.pointer_anchor || !result.status.is_allowed()).then(|| {
+        CAPTURE_DISPATCH
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    });
+    if !validate_capture_generation(request.generation) || !target_is_current() {
+        return Status::Unknown;
+    }
+    if result.pointer_anchor && pending_capture_for_generation(request.generation) {
+        tracing::debug!(
+            reason = "input_during_pointer_probe",
+            "secure input: pointer anchor rejected"
+        );
+        reject_probe(request);
         return Status::Unknown;
     }
     if !result.status.is_allowed() {
         tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
-        reject_probe(request);
+        ring_buffer::reject_secure_observation_for_focus(
+            request.generation,
+            request.target.foreground,
+            request.target.focus,
+            pending_capture_for_generation,
+        );
     } else if result.element_changed {
         tracing::debug!("secure input: focused UIA element changed");
         ring_buffer::discard_changed_capture_context(request.generation);
     }
     result.status
 }
+
 fn capture_is_current(capture: &Capture) -> bool {
     if !validate_capture_generation(capture.generation) {
         tracing::debug!(reason = "stale_epoch", "secure input: capture rejected");
@@ -873,6 +931,7 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         return;
     };
     if !target.is_current() {
+        reject_capture(observed);
         return;
     }
     let Some(expected) =
@@ -1139,14 +1198,8 @@ mod tests {
             variant_boolean(&boolean_variant(false, VT_BOOL)),
             Some(false)
         );
-        assert_eq!(
-            variant_boolean(&boolean_variant(true, VT_BOOL)),
-            Some(true)
-        );
-        assert_eq!(
-            variant_boolean(&boolean_variant(false, VT_EMPTY)),
-            None
-        );
+        assert_eq!(variant_boolean(&boolean_variant(true, VT_BOOL)), Some(true));
+        assert_eq!(variant_boolean(&boolean_variant(false, VT_EMPTY)), None);
         assert!(!Status::Unknown.is_allowed());
         assert!(!Status::Secure.is_allowed());
     }
@@ -1166,7 +1219,10 @@ mod tests {
         assert_eq!(anchor, Some(1));
         assert_eq!(inspected, [0, 1]);
         // Unknown is not a false property that permits climbing to the root.
-        assert_eq!(focusable_pointer_anchor(0, |_| None, |_| panic!("unknown anchor")), None);
+        assert_eq!(
+            focusable_pointer_anchor(0, |_| None, |_| panic!("unknown anchor")),
+            None
+        );
     }
 
     #[test]
@@ -1192,7 +1248,10 @@ mod tests {
             wait_for_pointer_focus(
                 1,
                 |anchor| focus.next().map(|focused| *anchor == focused),
-                || { waits += 1; true },
+                || {
+                    waits += 1;
+                    true
+                },
             ),
             Some(1)
         );
@@ -1227,7 +1286,10 @@ mod tests {
         assert_eq!(
             wait_for_pointer_focus(
                 1,
-                |_| { observations += 1; Some(false) },
+                |_| {
+                    observations += 1;
+                    Some(false)
+                },
                 || false,
             ),
             None
@@ -1237,12 +1299,266 @@ mod tests {
         assert_eq!(
             wait_for_pointer_focus(
                 1,
-                |_| { observations += 1; Some(false) },
+                |_| {
+                    observations += 1;
+                    Some(false)
+                },
                 || true,
             ),
             None
         );
         assert_eq!(observations, POINTER_FOCUS_ATTEMPTS);
+    }
+
+    fn pointer_test_probe(generation: u64) -> Probe {
+        Probe {
+            // The completion seam supplies native-target validity explicitly;
+            // these tests do not require an interactive foreground window.
+            target: Target {
+                foreground: 1,
+                focus: 1,
+                thread: 1,
+                process: 1,
+            },
+            generation,
+        }
+    }
+
+    fn pointer_test_verdict(pointer_anchor: bool) -> Verdict {
+        Verdict {
+            status: Status::NotSecure,
+            element_changed: true,
+            pointer_anchor,
+        }
+    }
+
+    fn run_pointer_fifo_case(pointer_anchor: bool, key_during_wait: bool) -> (Status, usize, bool) {
+        use std::sync::mpsc;
+
+        enum Action {
+            Pointer,
+            Capture {
+                generation: u64,
+                pending: PendingCapture,
+            },
+        }
+
+        ring_buffer::clear_secure_input_data();
+        let generation = capture_generation();
+        let request = pointer_test_probe(generation);
+        let focused = Arc::new(AtomicUsize::new(0)); // Password A still owns input.
+        let worker_focus = Arc::clone(&focused);
+        let appended = Arc::new(AtomicUsize::new(0));
+        let worker_appended = Arc::clone(&appended);
+        let (waiting, observed_wait) = mpsc::channel();
+        let (focus_changed, resume_probe) = mpsc::channel();
+        let (completed, results) = mpsc::channel();
+        let worker = BoundedWorker::start("pointer-admission-test", move || {
+            move |action| {
+                let result = match action {
+                    Action::Pointer => {
+                        // The real anchor-wait helper confirms ordinary B only
+                        // after the test has queued A's input when requested.
+                        assert_eq!(
+                            wait_for_pointer_focus(
+                                1,
+                                |anchor| Some(*anchor == worker_focus.load(Ordering::Acquire)),
+                                || {
+                                    waiting.send(()).unwrap();
+                                    resume_probe.recv_timeout(Duration::from_secs(2)).unwrap();
+                                    true
+                                },
+                            ),
+                            Some(1)
+                        );
+                        complete_refresh(request, pointer_test_verdict(pointer_anchor), || true)
+                    }
+                    Action::Capture {
+                        generation,
+                        pending,
+                    } => {
+                        // Synthetic decoding isolates admission from Windows
+                        // focus/keyboard setup. The real epoch and journal are
+                        // used, and the negative control must actually append.
+                        let result = if validate_capture_generation(generation) {
+                            ring_buffer::push_text("x");
+                            if !ring_buffer::runs_snapshot().is_empty() {
+                                worker_appended.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Status::NotSecure
+                        } else {
+                            Status::Unknown
+                        };
+                        drop(pending);
+                        result
+                    }
+                };
+                completed.send(result).unwrap();
+                result
+            }
+        })
+        .unwrap();
+        assert!(worker.submit(Action::Pointer, Duration::from_secs(2)));
+        observed_wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        let enqueue_capture = || {
+            let _dispatch = begin_capture_dispatch(generation).unwrap();
+            assert!(worker.submit(
+                Action::Capture {
+                    generation,
+                    pending: PendingCapture::new(generation),
+                },
+                Duration::from_secs(2)
+            ));
+        };
+        if key_during_wait {
+            enqueue_capture();
+        }
+        focused.store(1, Ordering::Release);
+        focus_changed.send(()).unwrap();
+        let pointer_result = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        if !key_during_wait {
+            enqueue_capture();
+        }
+        let _ = results.recv_timeout(Duration::from_secs(2)).unwrap();
+        let appended = appended.load(Ordering::Relaxed);
+        let current = validate_capture_generation(generation);
+        if appended == 0 {
+            ring_buffer::push_text("late-suffix");
+            assert!(ring_buffer::runs_snapshot().is_empty());
+        }
+        ring_buffer::clear_secure_input_data();
+        (pointer_result, appended, current)
+    }
+
+    #[test]
+    fn pointer_completion_rejects_input_queued_before_its_anchor_was_confirmed() {
+        let _guard = ring_buffer::test_guard();
+        // Removing the pointer barrier reproduces the incorrect A-key append.
+        // This control makes refusal non-vacuous despite synthetic decoding.
+        assert_eq!(
+            run_pointer_fifo_case(false, true),
+            (Status::NotSecure, 1, true)
+        );
+        assert_eq!(
+            run_pointer_fifo_case(true, true),
+            (Status::Unknown, 0, false)
+        );
+        // A confirmed anchor with no older pending input still captures normally.
+        assert_eq!(
+            run_pointer_fifo_case(true, false),
+            (Status::NotSecure, 1, true)
+        );
+    }
+
+    #[test]
+    fn native_pointer_fast_path_does_not_reject_its_known_pending_input() {
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        let generation = capture_generation();
+        let pending = PendingCapture::new(generation);
+        let result = complete_refresh(
+            pointer_test_probe(generation),
+            Verdict {
+                status: Status::NotSecure,
+                element_changed: false,
+                pointer_anchor: false,
+            },
+            || true,
+        );
+        assert_eq!(result, Status::NotSecure);
+        assert!(validate_capture_generation(generation));
+        ring_buffer::push_text("known-native-input");
+        assert!(!ring_buffer::runs_snapshot().is_empty());
+        drop(pending);
+        ring_buffer::clear_secure_input_data();
+    }
+
+    fn assert_refresh_waits_for_started_snapshot(verdict: Verdict) {
+        use std::{sync::mpsc, thread};
+
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        let generation = capture_generation();
+        let (snapshot_started, snapshot_observed) = mpsc::channel();
+        let (finish_snapshot, resume_snapshot) = mpsc::channel();
+        let (registered, lease) = mpsc::channel();
+        let snapshot = thread::spawn(move || {
+            let _dispatch = begin_capture_dispatch(generation).unwrap();
+            snapshot_started.send(()).unwrap();
+            resume_snapshot
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            registered.send(PendingCapture::new(generation)).unwrap();
+        });
+        snapshot_observed
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(!pending_capture_for_generation(generation));
+        let (completion_started, completion_observed) = mpsc::channel();
+        let (checked, check_observed) = mpsc::channel();
+        let completion = thread::spawn(move || {
+            completion_started.send(()).unwrap();
+            complete_refresh(pointer_test_probe(generation), verdict, || {
+                checked.send(()).unwrap();
+                true
+            })
+        });
+        completion_observed
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            check_observed
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        finish_snapshot.send(()).unwrap();
+        let pending = lease.recv_timeout(Duration::from_secs(2)).unwrap();
+        snapshot.join().unwrap();
+        assert_eq!(completion.join().unwrap(), Status::Unknown);
+        assert!(!validate_capture_generation(generation));
+        ring_buffer::push_text("late-suffix");
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        drop(pending);
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn refresh_completion_waits_for_started_snapshot_to_register_its_lease() {
+        for verdict in [pointer_test_verdict(true), Verdict::UNKNOWN] {
+            assert_refresh_waits_for_started_snapshot(verdict);
+        }
+    }
+
+    fn assert_contended_key_stays_rejected(verdict: Verdict) {
+        use std::{sync::mpsc, thread};
+
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        let generation = capture_generation();
+        let (locked, lock_observed) = mpsc::channel();
+        let (finish_check, resume_check) = mpsc::channel();
+        let completion = thread::spawn(move || {
+            complete_refresh(pointer_test_probe(generation), verdict, || {
+                locked.send(()).unwrap();
+                resume_check.recv_timeout(Duration::from_secs(2)).unwrap();
+                true
+            })
+        });
+        lock_observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(begin_capture_dispatch(generation).is_none());
+        assert!(!validate_capture_generation(generation));
+        finish_check.send(()).unwrap();
+        let _ = completion.join().unwrap();
+        ring_buffer::push_text("late-suffix");
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn contended_key_cannot_be_reopened_by_pointer_or_failed_observation() {
+        for verdict in [pointer_test_verdict(true), Verdict::UNKNOWN] {
+            assert_contended_key_stays_rejected(verdict);
+        }
     }
 
     #[test]
