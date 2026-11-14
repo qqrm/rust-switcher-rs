@@ -22,6 +22,15 @@ fn text_of(runs: impl IntoIterator<Item = InputRun>) -> String {
     runs.into_iter().map(|run| run.text).collect()
 }
 
+fn observe_unavailable_for_generation(
+    generation: u64,
+    pending_capture: impl FnOnce(u64) -> bool,
+) -> Option<bool> {
+    with_journal_mut(|journal| {
+        reject_observation_in_journal(journal, generation, pending_capture, true)
+    })
+}
+
 #[derive(Clone, Debug)]
 enum Event {
     Type(char),
@@ -281,6 +290,125 @@ proptest! {
         prop_assert_eq!(text_of(sequence.into_iter().chain(trailing)), expected);
         clear_secure_input_data();
     }
+
+    #[test]
+    fn empty_observations_preserve_future_input_but_never_a_missing_prefix(
+        text in prop::collection::vec(glyph(), 1..17),
+        observations in 1_usize..9,
+        queued_key in any::<bool>(),
+        lost_key in any::<bool>(),
+    ) {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let text: String = text.into_iter().collect();
+        let initial = token(0);
+
+        // Inserting unavailable observations before any physical input must
+        // preserve the first subsequent key, even after empty conversion probes.
+        for _ in 0..observations {
+            let context = secure_context_generation();
+            prop_assert!(take_last_sequence_with_suffix_if_generation(context).is_none());
+            prop_assert!(take_last_layout_run_with_suffix_if_generation(context).is_none());
+            prop_assert_eq!(observe_unavailable_for_generation(initial.raw, |_| false), Some(true));
+            prop_assert!(validate_secure_input_generation(initial.raw));
+            prop_assert!(!validate_secure_context_generation(context));
+        }
+
+        // The editor can have received a prefix which is still queued, or a
+        // key lost before queue admission. Neither permits suffix conversion.
+        let pending_epoch = secure_input_generation();
+        if lost_key {
+            reject_secure_capture(pending_epoch);
+        }
+        let before = token(1);
+        let cleared = observe_unavailable_for_generation(before.raw, |epoch| {
+            queued_key && epoch == pending_epoch
+        });
+        let complete = !queued_key && !lost_key;
+        prop_assert_eq!(cleared, Some(complete));
+        prop_assert_eq!(validate_secure_input_generation(before.raw), complete);
+        prop_assert!(!validate_secure_context_generation(before.context));
+        if !complete {
+            for _ in 0..observations {
+                let current = secure_input_generation();
+                prop_assert_eq!(observe_unavailable_for_generation(current, |_| false), Some(false));
+                prop_assert!(!validate_secure_input_generation(current));
+                discard_changed_capture_context(secure_input_generation());
+            }
+        }
+        append_physical(&text);
+        let extracted = take_last_sequence_with_suffix_if_generation(secure_context_generation());
+        if complete {
+            let (sequence, trailing) = extracted.expect("the entire fresh input must remain convertible");
+            prop_assert_eq!(text_of(sequence.into_iter().chain(trailing)), text.as_str());
+        } else {
+            prop_assert!(extracted.is_none());
+            prop_assert!(runs_snapshot().is_empty());
+        }
+
+        let previous = secure_input_generation();
+        invalidate_capture_context();
+        let fresh = token(2);
+        prop_assert_eq!(observe_unavailable_for_generation(previous, |_| true), None);
+        prop_assert!(validate_secure_input_generation(fresh.raw));
+        prop_assert!(validate_secure_context_generation(fresh.context));
+        prop_assert_eq!(observe_unavailable_for_generation(fresh.raw, |_| false), Some(true));
+        append_physical(&text);
+        let (sequence, trailing) = take_last_sequence_with_suffix_if_generation(secure_context_generation())
+            .expect("fresh navigation must recover after either history");
+        prop_assert_eq!(text_of(sequence.into_iter().chain(trailing)), text);
+        clear_secure_input_data();
+    }
+
+    #[test]
+    fn extracted_history_is_activity_without_a_new_raw_capture(
+        prefix in prop::collection::vec(glyph(), 1..17),
+        suffix in prop::collection::vec(glyph(), 1..17),
+        sequence in any::<bool>(),
+        observations in 1_usize..9,
+        programmatic in any::<bool>(),
+    ) {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let prefix: String = prefix.into_iter().collect();
+        let suffix: String = suffix.into_iter().collect();
+        let original = token(0);
+        // A converted or restored native history can predate every raw key in
+        // this epoch. Do not fake an admission to make the activity check pass.
+        let restored = InputRun {
+            text: prefix.clone(),
+            layout: LayoutTag::En,
+            origin: if programmatic { RunOrigin::Programmatic } else { RunOrigin::Physical },
+            kind: RunKind::Text,
+        };
+        prop_assert!(push_runs_if_generation(original.context, [restored]));
+        let extracted: Vec<_> = if sequence {
+            let (runs, trailing) = take_last_sequence_with_suffix_if_generation(original.context)
+                .expect("the complete history must be extractable");
+            runs.into_iter().chain(trailing).collect()
+        } else {
+            let (run, trailing) = take_last_layout_run_with_suffix_if_generation(original.context)
+                .expect("the complete history must be extractable");
+            std::iter::once(run).chain(trailing).collect()
+        };
+        prop_assert_eq!(text_of(extracted.clone()), prefix);
+        prop_assert!(runs_snapshot().is_empty());
+
+        // The editor still contains the extracted prefix. An empty journal
+        // cannot authorize forgetting it merely because its provider is unsure.
+        for _ in 0..observations {
+            let current = token(1);
+            prop_assert_eq!(observe_unavailable_for_generation(current.raw, |_| false), Some(false));
+            prop_assert!(!validate_secure_input_generation(current.raw));
+            prop_assert!(!validate_secure_context_generation(current.context));
+            discard_changed_capture_context(secure_input_generation());
+        }
+        prop_assert!(!push_runs_if_generation(original.context, extracted));
+        append_physical(&suffix);
+        prop_assert!(runs_snapshot().is_empty());
+        prop_assert!(take_last_sequence_with_suffix_if_generation(secure_context_generation()).is_none());
+        clear_secure_input_data();
+    }
 }
 
 #[cfg(windows)]
@@ -288,6 +416,46 @@ mod native {
     use std::collections::VecDeque;
 
     use super::*;
+
+    #[test]
+    fn empty_observation_keeps_native_owner_but_not_caches_or_admitted_input() {
+        let _guard = test_guard();
+        clear_secure_input_data();
+        let a = focus_key_for_test(101, 0).unwrap();
+        let b = focus_key_for_test(202, 0).unwrap();
+        with_journal_mut(|journal| {
+            apply_secure_focus_transition(journal, 101, Some(a), 1_000, false);
+            journal.push_text_internal("cached", LayoutTag::En, RunOrigin::Physical);
+            apply_secure_focus_transition(journal, 202, Some(b), 1_010, false);
+        });
+        assert!(with_journal_cache_mut(|cache| cache.contains_key(&a)));
+        let fresh = token(0);
+        assert_eq!(
+            observe_unavailable_for_generation(fresh.raw, |_| false),
+            Some(true)
+        );
+        assert!(validate_secure_input_generation(fresh.raw));
+        assert!(!validate_secure_context_generation(fresh.context));
+        assert!(with_journal_cache_mut(|cache| cache.is_empty()));
+        with_journal_mut(|journal| {
+            assert_eq!(journal.last_fg_hwnd, 202);
+            assert_eq!(journal.last_focus_key, Some(b));
+            assert_eq!(
+                capture_generation_for_focus(journal, b, fresh.raw, false, 1_020),
+                Some(fresh.raw)
+            );
+        });
+        // A completed no-text key leaves neither runs nor queued work, but its
+        // admitted epoch must remain distinguishable from a pristine one.
+        let admitted = token(1);
+        assert_eq!(
+            observe_unavailable_for_generation(admitted.raw, |_| false),
+            Some(false)
+        );
+        assert!(!validate_secure_input_generation(admitted.raw));
+        assert!(!validate_secure_context_generation(admitted.context));
+        clear_secure_input_data();
+    }
 
     #[derive(Clone, Debug)]
     enum NativeEvent {

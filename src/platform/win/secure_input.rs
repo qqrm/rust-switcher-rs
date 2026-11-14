@@ -854,17 +854,37 @@ fn complete_refresh(
         reject_probe(request);
         return Status::Unknown;
     }
-    if !result.status.is_allowed() {
-        tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
+    apply_refresh_metadata(request, result, |request| {
         ring_buffer::reject_secure_observation_for_focus(
             request.generation,
             request.target.foreground,
             request.target.focus,
             pending_capture_for_generation,
         );
-    } else if result.element_changed {
-        tracing::debug!("secure input: focused UIA element changed");
-        ring_buffer::discard_changed_capture_context(request.generation);
+    })
+}
+
+fn apply_refresh_metadata(
+    request: Probe,
+    result: Verdict,
+    reject_observation: impl FnOnce(Probe),
+) -> Status {
+    match result.status {
+        Status::Secure => {
+            // A confirmed password context remains unavailable even if the
+            // same element reports ordinary text before a queued key is checked.
+            tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
+            reject_probe(request);
+        }
+        Status::Unknown => {
+            tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
+            reject_observation(request);
+        }
+        Status::NotSecure if result.element_changed => {
+            tracing::debug!("secure input: focused UIA element changed");
+            ring_buffer::discard_changed_capture_context(request.generation);
+        }
+        Status::NotSecure => {}
     }
     result.status
 }
@@ -1330,6 +1350,67 @@ mod tests {
             element_changed: true,
             pointer_anchor,
         }
+    }
+
+    #[test]
+    fn confirmed_password_observation_cannot_use_pristine_recovery() {
+        use std::cell::Cell;
+
+        let _guard = ring_buffer::test_guard();
+        for status in [Status::Secure, Status::Unknown] {
+            ring_buffer::clear_secure_input_data();
+            let raw = capture_generation();
+            let context = generation();
+            let recovered_observation = Cell::new(false);
+            assert_eq!(
+                apply_refresh_metadata(
+                    pointer_test_probe(raw),
+                    Verdict {
+                        status,
+                        element_changed: false,
+                        pointer_anchor: false,
+                    },
+                    |request| {
+                        // Isolate the shared status policy from live native
+                        // focus. Model the successful pristine-observation path:
+                        // raw input survives, but old conversion guards expire.
+                        recovered_observation.set(true);
+                        ring_buffer::discard_changed_capture_context(request.generation);
+                    },
+                ),
+                status
+            );
+            assert!(!validate_generation(context));
+            assert_eq!(recovered_observation.get(), status == Status::Unknown);
+            assert_eq!(validate_capture_generation(raw), status == Status::Unknown);
+
+            // The key entered the confirmed password field. Its queued query
+            // now sees the same element after it was changed to ordinary text.
+            let captured = capture_generation();
+            let pending = {
+                let _dispatch = begin_capture_dispatch(captured).unwrap();
+                PendingCapture::new(captured)
+            };
+            assert_eq!(
+                complete_refresh(
+                    pointer_test_probe(captured),
+                    Verdict {
+                        status: Status::NotSecure,
+                        element_changed: false,
+                        pointer_anchor: false,
+                    },
+                    || true,
+                ),
+                Status::NotSecure
+            );
+            assert!(validate_capture_generation(captured));
+            ring_buffer::push_text("queued-key");
+            drop(pending);
+            // Unknown is a positive control: synthetic decoding must really
+            // append, so the Secure rejection cannot pass through a fake HWND.
+            assert_eq!(ring_buffer::runs_snapshot().is_empty(), status == Status::Secure);
+        }
+        ring_buffer::clear_secure_input_data();
     }
 
     fn run_pointer_fifo_case(pointer_anchor: bool, key_during_wait: bool) -> (Status, usize, bool) {

@@ -34,13 +34,15 @@ An observation that retains the raw-input epoch also retains its incomplete
 marker, even when the UIA descendant changes. Only a new input boundary can
 start a complete segment after capture has lost a key.
 
-A metadata failure before any input or history in a new segment can purge
+Unavailable metadata before any input or history in a new segment can purge
 retained data without declaring a missing prefix. This observation-only cleanup
 keeps the raw generation so a simultaneous rejected hook event still marks that
 same segment incomplete. Later input still requires a fresh, explicit
 non-password verdict. A sticky history marker survives cache restoration,
 conversion extraction, deletion, and trimming, so an empty buffer is not
 mistaken for a segment that has never received input.
+Confirmed password metadata always takes the strict rejection path, including
+an untouched segment; later ordinary metadata cannot authorize password-era keys.
 
 ### Immediate focus changes
 
@@ -106,10 +108,12 @@ character appended since the pointer-down boundary. A refusal must then recover
 through selection conversion and a fresh input segment in the same control.
 These cases do not insert a readiness wait before the tested first key.
 
-`proptest` generates event histories and shrinks failing traces. Three portable
+`proptest` generates event histories and shrinks failing traces. Five portable
 properties compare real journal operations with an independent physical-input
 model, insert stale conversion callbacks into a newer context, and ensure
-metadata observations cannot reopen an incomplete raw generation. Windows
+metadata observations cannot reopen an incomplete raw generation. They also
+check recovery before any input and reject the extracted-history exception for
+both physical and programmatic histories, even without a new raw capture. Windows
 properties cover queued keys across three native owners and require arbitrary
 pointer releases/moves to preserve every retained prefix and guard. The models
 include input delivered to an editor but lost by capture; a captured suffix is
