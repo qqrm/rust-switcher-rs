@@ -1,4 +1,7 @@
-param([Parameter(Mandatory = $true)][string]$DebugExe)
+param(
+    [Parameter(Mandatory = $true)][string]$DebugExe,
+    [switch]$SecurityOnly
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -17,11 +20,13 @@ $results = [System.Collections.Generic.List[object]]::new()
 $failures = [System.Collections.Generic.List[string]]::new()
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $connections = [System.Collections.Generic.List[System.IDisposable]]::new()
+$ordinaryOutcomes = [ordered]@{converted = 0; safe_focus_refusal = 0}
 $switcherOutput = $null
 $switcherErrors = $null
 $failure = $null
-$script:requestId = 0
 
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -32,10 +37,12 @@ using System.Text;
 using System.Threading;
 public sealed class BrowserSocket : IDisposable {
     private readonly ClientWebSocket socket = new ClientWebSocket();
+    private int requestId;
     public BrowserSocket(string address) {
         using (var timeout = new CancellationTokenSource(5000))
             socket.ConnectAsync(new Uri(address), timeout.Token).GetAwaiter().GetResult();
     }
+    public int NextRequestId() { return Interlocked.Increment(ref requestId); }
     public void Send(string message) {
         using (var timeout = new CancellationTokenSource(5000)) {
             var bytes = Encoding.UTF8.GetBytes(message);
@@ -96,6 +103,10 @@ public static class BrowserInput {
     [DllImport("user32.dll", SetLastError=true)] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out RECT rect);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr w, IntPtr l,
+        uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr window, uint message, UIntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr LoadKeyboardLayout(string layout, uint flags);
     private static INPUT Event(ushort key, bool up) {
@@ -117,6 +128,19 @@ public static class BrowserInput {
         var title = new StringBuilder(512);
         GetWindowText(window, title, title.Capacity);
         return title.ToString();
+    }
+    public static string ClassOf(IntPtr window) {
+        var name = new StringBuilder(256);
+        if (window == IntPtr.Zero || GetClassName(window, name, name.Capacity) == 0)
+            throw new InvalidOperationException("Focused native window has no class name");
+        return name.ToString();
+    }
+    public static long SecurityMetadata(IntPtr window, uint selector) {
+        UIntPtr result;
+        if (window == IntPtr.Zero || SendMessageTimeout(window, 0x83F0, new UIntPtr(selector),
+            IntPtr.Zero, 2, 200, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Debug security metadata did not respond");
+        return checked((long)result.ToUInt64());
     }
     public static IntPtr LayoutOf(IntPtr window) {
         uint process;
@@ -177,6 +201,21 @@ public static class BrowserInput {
         var up = down; up.data.mouse.flags = 4;
         Send(new[] {down, up});
     }
+    public static InputTrace ClickThenTypeKey(IntPtr window, int x, int y, ushort key) {
+        RECT bounds;
+        if (GetForegroundWindow() != window || !GetWindowRect(window, out bounds) ||
+            x <= bounds.left || x >= bounds.right || y <= bounds.top || y >= bounds.bottom)
+            throw new InvalidOperationException("Click is outside the owned browser window");
+        if (!SetCursorPos(x, y)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not position fixture pointer");
+        var result = new InputTrace {before = Snapshot(window)};
+        var down = new INPUT(); down.type = 0; down.data.mouse.flags = 2;
+        var up = down; up.data.mouse.flags = 4;
+        // One ordered native batch: no CDP or guard observation between pointer and key.
+        Send(new[] {down, up, Event(key, false), Event(key, true)});
+        result.afterFirst = Snapshot(window);
+        result.afterRest = result.afterFirst;
+        return result;
+    }
 }
 '@
 if ([BrowserInput]::InputSize() -ne $(if ([IntPtr]::Size -eq 8) {40} else {28})) {
@@ -192,8 +231,9 @@ function Wait-Browser([scriptblock]$Condition, [string]$Description, [int]$Milli
     throw "Timed out: $Description"
 }
 function Invoke-Cdp($Connection, [string]$Method, [hashtable]$Arguments = @{}) {
-    $script:requestId++
-    $id = $script:requestId
+    # The security cases run in a child script scope. CDP state belongs to the
+    # connection, so invoking this helper from another script cannot reset it.
+    $id = $Connection.NextRequestId()
     $Connection.Send((@{id = $id; method = $Method; params = $Arguments} | ConvertTo-Json -Depth 8 -Compress))
     do {
         $reply = $Connection.Receive() | ConvertFrom-Json
@@ -233,6 +273,117 @@ function Focus-BrowserEditor($Session, [string]$Id) {
     Read-Browser $Session "fixture.focus('$Id')" | Out-Null
     Wait-Browser { Read-Browser $Session "fixture.focused('$Id')" } "browser field $Id focus"
 }
+function Test-BrowserValueWithin($Session, [string]$Field, [string]$Expected, [int]$Milliseconds = 4000) {
+    # Only an exhausted value wait returns false. Transport, provider, and
+    # process errors propagate and cannot become accepted conservative refusal.
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($Milliseconds)
+    do {
+        if ((Read-Browser $Session 'fixture.values()').$Field -ceq $Expected) { return $true }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+function Read-BrowserJournalState([IntPtr]$Window) {
+    if ([BrowserInput]::SecurityMetadata($Window, 0) -ne 0x52535031) {
+        throw 'The debug executable has no hosted journal inspection API'
+    }
+    return [pscustomobject]@{
+        activeChars = [BrowserInput]::SecurityMetadata($Window, 1)
+        cachedChars = [BrowserInput]::SecurityMetadata($Window, 2)
+        capturedChars = [BrowserInput]::SecurityMetadata($Window, 3)
+        pointerBaseline = [BrowserInput]::SecurityMetadata($Window, 5)
+        captureUnavailable = [BrowserInput]::SecurityMetadata($Window, 6)
+    }
+}
+function Get-BrowserFocusSnapshot($Session) {
+    return @{native = [BrowserInput]::Snapshot($Session.Handle);
+        dom = Read-Browser $Session 'fixture.diagnostics()'}
+}
+function Assert-BrowserTargetFocus($NativeBefore, $Observed, [string]$Field, [long]$Window) {
+    if ($null -eq $NativeBefore -or $null -eq $Observed -or
+        $null -eq $Observed.native -or $null -eq $Observed.dom) {
+        throw 'Browser target focus proof is missing'
+    }
+    if ($Window -eq 0 -or $NativeBefore.error -ne 0 -or $NativeBefore.focus -eq 0 -or
+        $NativeBefore.foreground -ne $Window -or $Observed.native.error -ne 0 -or
+        $Observed.native.foreground -ne $Window -or $Observed.native.focus -ne $NativeBefore.focus -or
+        $Observed.dom.documentFocused -isnot [bool] -or -not $Observed.dom.documentFocused -or
+        $Observed.dom.field -cne $Field -or $Observed.dom.activeId -cne $Field) {
+        throw 'Browser native or DOM focus moved from the original target'
+    }
+}
+function Assert-BrowserOtherFields($Sessions, [hashtable]$ExpectedOther) {
+    foreach ($sessionId in @('a', 'b')) {
+        $values = Read-Browser $Sessions[$sessionId] 'fixture.values()'
+        foreach ($field in @('a', 'b', 'guard')) {
+            $key = "$sessionId/$field"
+            if ($ExpectedOther.ContainsKey($key) -and $values.$field -cne $ExpectedOther[$key]) {
+                throw "Input changed another field ${key}: '$($values.$field)'"
+            }
+        }
+    }
+}
+function Assert-BrowserSafeFocusRefusal([hashtable]$Case, [System.Collections.IDictionary]$Record,
+    $Journal, [string]$Field, [long]$Window) {
+    if ($Case.Mode -cne 'click' -or $Case.Kind -cnotin @('textarea', 'editable')) {
+        throw 'Conservative refusal is restricted to the two immediate-click cases'
+    }
+    if ($Record.actualBefore -cne $Case.Text -or $Record.actualAfter -cne $Case.Text -or
+        $Record.otherFieldsUnchanged -isnot [bool] -or -not $Record.otherFieldsUnchanged) {
+        throw 'Conservative refusal requires the complete original text and unchanged other fields'
+    }
+    foreach ($focus in @($Record.firstAltFocus, $Record.secondAltFocus, $Record.finalFocus)) {
+        Assert-BrowserTargetFocus $Record.focusAfterInput $focus $Field $Window
+    }
+    if ($null -eq $Journal) { throw 'Conservative refusal journal metadata is missing' }
+    foreach ($name in @('activeChars', 'cachedChars', 'capturedChars', 'pointerBaseline', 'captureUnavailable')) {
+        $property = $Journal.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value -or
+            ($property.Value -isnot [long] -and $property.Value -isnot [int] -and
+             $property.Value -isnot [uint] -and $property.Value -isnot [ulong]) -or $property.Value -lt 0) {
+            throw "Conservative refusal has invalid journal metadata: $name"
+        }
+    }
+    if ($Journal.captureUnavailable -ne 1 -or $Journal.activeChars -ne 0 -or $Journal.cachedChars -ne 0 -or
+        $Journal.capturedChars -ne $Journal.pointerBaseline) {
+        throw 'Conservative refusal requires unavailable capture, empty journals, and no append since pointer-down'
+    }
+}
+function Invoke-BrowserClickRecovery($Session, [string]$Field, [hashtable]$Case, $NativeBefore,
+    $Sessions, [hashtable]$ExpectedOther, [System.Collections.IDictionary]$Recovery) {
+    # Preserve the existing text and focus. Selecting it exercises the normal
+    # selection command rather than retrying the refused journal conversion.
+    if (-not (Read-Browser $Session "fixture.select('$Field', true)")) {
+        throw 'Refused click target lost focus before selection recovery'
+    }
+    Tap-BrowserKey 0xA0
+    Start-Sleep -Milliseconds 100
+    Tap-BrowserKey 0xA0
+    Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $Case.Expected } 'same-control selection recovery'
+    $Recovery.selectionResult = (Read-Browser $Session 'fixture.values()').$Field
+    if ($Recovery.selectionResult -cne $Case.Expected) { throw 'Selection recovery did not preserve the exact converted text' }
+    Assert-BrowserTargetFocus $NativeBefore (Get-BrowserFocusSnapshot $Session) $Field ($Session.Handle.ToInt64())
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    if (-not (Read-Browser $Session "fixture.collapseEnd('$Field')")) { throw 'Same-control caret collapse failed' }
+    Tap-BrowserKey 0x1B
+    Set-BrowserEnglish $Session
+    # No readiness polling or guard query between the boundary and fresh keys.
+    $Recovery.inputTrace = [BrowserInput]::Type($Session.Handle, 'ghbdtn', 0, 0)
+    $typed = $Case.Expected + 'ghbdtn'
+    Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $typed } 'exact same-control fresh input' 2500
+    Tap-BrowserKey 0xA4
+    Start-Sleep -Milliseconds 100
+    Tap-BrowserKey 0xA4
+    $expected = $Case.Expected + 'привет'
+    Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $expected } 'same-control fresh journal recovery' 4000
+    Start-Sleep -Milliseconds 75
+    $Recovery.actual = (Read-Browser $Session 'fixture.values()').$Field
+    if ($Recovery.actual -cne $expected) { throw 'Fresh journal recovery did not remain exact and stable' }
+    $Recovery.finalFocus = Get-BrowserFocusSnapshot $Session
+    Assert-BrowserTargetFocus $NativeBefore $Recovery.finalFocus $Field ($Session.Handle.ToInt64())
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    $Recovery.otherFieldsUnchanged = $true
+}
 
 try {
     $browserExe = @(
@@ -249,6 +400,7 @@ try {
     $info.UseShellExecute = $false
     foreach ($argument in @('--no-first-run', '--no-default-browser-check', '--disable-background-networking',
         '--disable-component-update', '--disable-sync', '--disable-extensions', '--force-device-scale-factor=1',
+        '--force-renderer-accessibility',
         '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--window-size=1000,800',
         "--user-data-dir=$browserProfile", $fixtureUrl)) { $info.ArgumentList.Add($argument) }
     $browser = [System.Diagnostics.Process]::Start($info)
@@ -313,10 +465,8 @@ try {
     $switcherProfile = Join-Path $runRoot 'switcher-profile'
     $configDirectory = Join-Path $switcherProfile 'RustSwitcherDebug'
     New-Item -ItemType Directory -Path $configDirectory | Out-Null
-    @'
-delay_ms = 100
-smarter_hotkeys_enabled = true
-'@ | Set-Content -LiteralPath (Join-Path $configDirectory 'config.json') -Encoding utf8NoBOM
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'browser-config.toml') `
+        -Destination (Join-Path $configDirectory 'config.json')
     $switcherInfo = [System.Diagnostics.ProcessStartInfo]::new($DebugExe)
     $switcherInfo.UseShellExecute = $false
     $switcherInfo.CreateNoWindow = $true
@@ -341,33 +491,37 @@ smarter_hotkeys_enabled = true
         commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID} | ConvertTo-Json -Compress | Write-Output
 
     $cases = [System.Collections.Generic.List[object]]::new()
-    foreach ($kind in @('input', 'textarea', 'editable', 'shadow', 'iframe')) {
-        foreach ($sample in @(@{Text = 'ghbdtn'; Expected = 'привет'}, @{Text = '.ghbdtn'; Expected = 'юпривет'})) {
-            foreach ($gap in @(0, 30)) {
-                $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = $sample.Text; Expected = $sample.Expected; Gap = $gap; Repeat = 1})
+    if (-not $SecurityOnly) {
+        foreach ($kind in @('input', 'textarea', 'editable', 'shadow', 'iframe')) {
+            foreach ($sample in @(@{Text = 'ghbdtn'; Expected = 'привет'}, @{Text = '.ghbdtn'; Expected = 'юпривет'})) {
+                foreach ($gap in @(0, 30)) {
+                    $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = $sample.Text; Expected = $sample.Expected; Gap = $gap; Repeat = 1})
+                }
+            }
+            $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.'; Expected = 'ю'; Gap = 0; Repeat = 1})
+        }
+        foreach ($mode in @('tab', 'click', 'click-layout', 'window', 'ctrl-release', 'alt-release')) {
+            foreach ($kind in @('textarea', 'editable')) {
+                $cases.Add(@{Kind = $kind; Mode = $mode; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 0; Repeat = 1})
             }
         }
-        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.'; Expected = 'ю'; Gap = 0; Repeat = 1})
-    }
-    foreach ($mode in @('tab', 'click', 'window', 'ctrl-release', 'alt-release')) {
         foreach ($kind in @('textarea', 'editable')) {
-            $cases.Add(@{Kind = $kind; Mode = $mode; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 0; Repeat = 1})
+            $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = 'a' * 101; Expected = 'ф' * 101; Gap = 0; Repeat = 1})
+            $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.' + ('a' * 100); Expected = 'ю' + ('ф' * 100); Gap = 0; Repeat = 1})
         }
-    }
-    foreach ($kind in @('textarea', 'editable')) {
-        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = 'a' * 101; Expected = 'ф' * 101; Gap = 0; Repeat = 1})
-        $cases.Add(@{Kind = $kind; Mode = 'fresh'; Text = '.' + ('a' * 100); Expected = 'ю' + ('ф' * 100); Gap = 0; Repeat = 1})
-    }
-    foreach ($repeat in 1..6) {
-        $cases.Add(@{Kind = 'editable'; Mode = 'fresh'; Text = 'ghbdtn'; Expected = 'привет'; Gap = 1; Repeat = $repeat})
-        $cases.Add(@{Kind = 'textarea'; Mode = 'fresh'; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 1; Repeat = $repeat})
+        foreach ($repeat in 1..6) {
+            $cases.Add(@{Kind = 'editable'; Mode = 'fresh'; Text = 'ghbdtn'; Expected = 'привет'; Gap = 1; Repeat = $repeat})
+            $cases.Add(@{Kind = 'textarea'; Mode = 'fresh'; Text = '.ghbdtn'; Expected = 'юпривет'; Gap = 1; Repeat = $repeat})
+        }
+        if ($cases.Count -ne 53) { throw "Expected 53 ordinary browser cases, found $($cases.Count)" }
     }
 
     foreach ($case in $cases) {
         $name = "browser $($case.Kind) $($case.Mode) '$($case.Text)' firstGap=$($case.Gap) repeat=$($case.Repeat)"
         $record = [ordered]@{name = $name; input = $case.Text; expected = $case.Expected; actualBefore = $null;
             actualAfter = $null; inputTrace = $null; focusAfterInput = $null; firstAltFocus = $null;
-            secondAltFocus = $null; finalFocus = $null; otherFieldsUnchanged = $null; error = $null}
+            secondAltFocus = $null; finalFocus = $null; otherFieldsUnchanged = $null;
+            outcome = $null; refusal = $null; recovery = $null; error = $null}
         $heldModifier = [ushort]0
         $destination = $sessions.a
         $targetField = 'a'
@@ -386,7 +540,7 @@ smarter_hotkeys_enabled = true
             $expectedOther = @{'a/a' = ''; 'a/b' = 'b-sentinel'; 'a/guard' = 'guard-sentinel';
                 'b/a' = ''; 'b/b' = 'b-sentinel'; 'b/guard' = 'guard-sentinel'}
             $destinationId = 'a'
-            if ($case.Mode -in @('tab', 'click', 'window')) {
+            if ($case.Mode -in @('tab', 'click', 'click-layout', 'window')) {
                 [BrowserInput]::Type($sessions.a.Handle, 'keep', 0, 0) | Out-Null
                 Wait-Browser { (Read-Browser $sessions.a 'fixture.values()').a -eq 'keep' } 'source field text'
                 $expectedOther['a/a'] = 'keep'
@@ -403,6 +557,14 @@ smarter_hotkeys_enabled = true
                         [BrowserInput]::Click($destination.Handle, $point.x, $point.y)
                     }
                     Wait-Browser { Read-Browser $destination "fixture.focused('b')" } 'second DOM field focus'
+                    if ($case.Mode -eq 'click-layout') {
+                        # A protected layout command can be the first action
+                        # after a click. It must not poison the next text key.
+                        Tap-BrowserKey 0x14
+                        Wait-Browser { [BrowserInput]::LayoutOf($destination.Handle) -ne $english } 'CapsLock after click'
+                        Tap-BrowserKey 0x14
+                        Wait-Browser { [BrowserInput]::LayoutOf($destination.Handle) -eq $english } 'CapsLock restores English before typing'
+                    }
                 }
             } elseif ($case.Mode -in @('ctrl-release', 'alt-release')) {
                 # The shortcut is consumed by the source field; no text is altered.
@@ -430,12 +592,36 @@ smarter_hotkeys_enabled = true
             Tap-BrowserKey 0xA4
             $record.secondAltFocus = @{native = [BrowserInput]::Snapshot($destination.Handle);
                 dom = Read-Browser $destination 'fixture.diagnostics()'}
-            Wait-Browser { (Read-Browser $destination 'fixture.values()').$targetField -eq $case.Expected } 'exact Double Alt browser result' 4000
-            Start-Sleep -Milliseconds 75
-            $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField
-            if ($record.actualAfter -ne $case.Expected) { throw 'Browser conversion did not remain stable' }
-            if (-not (Read-Browser $destination "fixture.focused('$targetField')")) {
-                throw 'Double Alt moved focus away from the target editor'
+            $refused = $false
+            if ($case.Mode -eq 'click') {
+                if (-not (Test-BrowserValueWithin $destination $targetField $case.Expected 4000)) {
+                    $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField
+                    $record.finalFocus = Get-BrowserFocusSnapshot $destination
+                    $record.otherFieldsUnchanged = $false
+                    Assert-BrowserOtherFields $sessions $expectedOther
+                    $record.otherFieldsUnchanged = $true
+                    $journal = Read-BrowserJournalState $switcher.MainWindowHandle
+                    Assert-BrowserSafeFocusRefusal $case $record $journal $targetField ($destination.Handle.ToInt64())
+                    $record.refusal = @{actualBefore = $record.actualBefore; actualAfter = $record.actualAfter;
+                        journal = $journal; focus = $record.finalFocus; otherFieldsUnchanged = $true}
+                    $record.outcome = 'safe_focus_refusal'
+                    $record.recovery = [ordered]@{}
+                    Invoke-BrowserClickRecovery $destination $targetField $case $record.focusAfterInput `
+                        $sessions $expectedOther $record.recovery
+                    $record.recovery.journalAfter = Read-BrowserJournalState $switcher.MainWindowHandle
+                    $refused = $true
+                }
+            } else {
+                Wait-Browser { (Read-Browser $destination 'fixture.values()').$targetField -eq $case.Expected } 'exact Double Alt browser result' 4000
+            }
+            if (-not $refused) {
+                Start-Sleep -Milliseconds 75
+                $record.actualAfter = (Read-Browser $destination 'fixture.values()').$targetField
+                if ($record.actualAfter -ne $case.Expected) { throw 'Browser conversion did not remain stable' }
+                if (-not (Read-Browser $destination "fixture.focused('$targetField')")) {
+                    throw 'Double Alt moved focus away from the target editor'
+                }
+                $record.outcome = 'converted'
             }
         } catch {
             $record.error = $_.Exception.Message
@@ -448,26 +634,25 @@ smarter_hotkeys_enabled = true
             } catch { }
             if ($null -ne $expectedOther) {
                 try {
+                    $record.otherFieldsUnchanged = $false
+                    Assert-BrowserOtherFields $sessions $expectedOther
                     $record.otherFieldsUnchanged = $true
-                    foreach ($sessionId in @('a', 'b')) {
-                        $values = Read-Browser $sessions[$sessionId] 'fixture.values()'
-                        foreach ($field in @('a', 'b', 'guard')) {
-                            $key = "$sessionId/$field"
-                            if ($expectedOther.ContainsKey($key) -and $values.$field -ne $expectedOther[$key]) {
-                                $record.otherFieldsUnchanged = $false
-                                throw "Input changed another field ${key}: '$($values.$field)'"
-                            }
-                        }
-                    }
                 } catch {
                     $record.error = "$($record.error) $($_.Exception.Message)".Trim()
                 }
             }
         }
         if ($null -ne $record.error) { $failures.Add("${name}: $($record.error)") }
+        else { $ordinaryOutcomes[$record.outcome]++ }
         $results.Add([pscustomobject]$record)
         $record | ConvertTo-Json -Depth 6 -Compress | Write-Output
         if ($null -eq $record.error) { Write-Output "PASS: $name" } else { Write-Output "FAIL: $name" }
+    }
+    $securityStart = $results.Count
+    & (Join-Path $PSScriptRoot 'browser-security-cases.ps1') -Sessions $sessions `
+        -SwitcherProcess $switcher -Results $results -Failures $failures
+    if ($results.Count - $securityStart -ne 7) {
+        throw "Expected 7 browser password cases, found $($results.Count - $securityStart)"
     }
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
 } catch {
@@ -494,7 +679,7 @@ smarter_hotkeys_enabled = true
         }
     }
     $report = [ordered]@{passed = @($results | Where-Object { $null -eq $_.error }).Count;
-        total = $results.Count; cases = $results.ToArray(); failures = $failures.ToArray(); failure = $failure;
+        total = $results.Count; ordinaryOutcomes = $ordinaryOutcomes; cases = $results.ToArray(); failures = $failures.ToArray(); failure = $failure;
         cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID}
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')
     $report | ConvertTo-Json -Depth 8 | Write-Output

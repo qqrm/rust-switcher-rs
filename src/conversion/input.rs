@@ -90,7 +90,7 @@ fn send_key(vk: VIRTUAL_KEY, key_up: bool) -> bool {
 
 /// Submit replacement as a single ordered input batch after a final target check.
 /// Windows does not interleave other keyboard/mouse input with this batch.
-pub fn replace_selection_unicode(text: &str, target_is_current: impl FnOnce() -> bool) -> bool {
+pub fn replace_selection_unicode(text: &str, target_is_current: impl Fn() -> bool) -> bool {
     let units = text.encode_utf16().count();
     if units == 0 || units > 4096 {
         return false;
@@ -113,7 +113,11 @@ pub fn replace_selection_unicode(text: &str, target_is_current: impl FnOnce() ->
     let Some(size) = input_struct_size_i32() else {
         return false;
     };
-    if !target_is_current() {
+    // The provider check can outlive a focus change; validate the target after it.
+    if !target_is_current()
+        || !crate::platform::win::secure_input::protect_current_context().is_allowed()
+        || !target_is_current()
+    {
         return false;
     }
     let sent = unsafe { SendInput(&inputs, size) } as usize;
@@ -131,7 +135,7 @@ pub fn replace_before_caret(
     suffix_spaces_only: bool,
     suffix_text: &str,
     converted: &str,
-    target_is_current: impl FnOnce() -> bool,
+    target_is_current: impl Fn() -> bool,
 ) -> bool {
     const MAX_CHARS: usize = 4096;
     if core_len == 0
@@ -163,7 +167,10 @@ pub fn replace_before_caret(
     let Some(size) = input_struct_size_i32() else {
         return false;
     };
-    if !target_is_current() {
+    if !target_is_current()
+        || !crate::platform::win::secure_input::protect_current_context().is_allowed()
+        || !target_is_current()
+    {
         return false;
     }
     let sent = unsafe { SendInput(&inputs, size) } as usize;

@@ -28,6 +28,8 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Last typed sequence | Debug double Alt converts two words and short leading-dot inputs in external native Edit controls | Physical typing in release requires a separate VM with keyboard access |
 | First character after focus/modifiers | Debug journal matrix switches between two unowned external windows and two controls, releases Ctrl/Alt in the destination, and asserts exact before/after strings | Synthetic input and native Edit controls do not reproduce every Telegram/Qt or physical-keyboard interaction |
 | Browser fields and first-character timing | Debug Double Alt in a real Chrome/Edge process, two windows, input/textarea/contenteditable/shadow DOM/iframe fields, first-key timing and Tab/click navigation | Synthetic input and a local fixture do not prove behavior in the user's exact browser, extensions or web application |
+| Browser password fields | Seven debug cases require a real UIA `IsPassword` signal without an Edit/RichEdit HWND, zero captured password characters, empty active/cache journals, blocked text hotkeys, same-HWND transitions, and ordinary-field recovery | Local synthetic passwords and the installed Chrome/Edge version; unknown custom controls and OS races are not universal guarantees |
+| Password test sensitivity | A temporary source mutation makes UIA report ordinary input; the real browser suite must detect journal capture | This mutation targets the UIA password signal; native password styles and other guard layers have separate tests |
 | Journal capacity | Native Edit checks 99/100/101 characters; browser checks 101 with a letter and a leading dot; journal unit tests cover 4096 and overflow | Overflow refuses any conversion that reaches the discarded prefix; a complete last word after a retained boundary can still convert |
 | Automatic last-word conversion | Debug runtime toggle followed by a word and space | Other delimiters are not exercised by this GUI scenario |
 | Selected text | Release double Shift in a separate native Edit, both directions, restored selection | Other applications, rich editors and elevated targets are not exercised |
@@ -37,7 +39,7 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
 | Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
 | Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |
-| Tray actions, pause and CapsLock layout switching | No hosted GUI assertion yet | Requires additional scenarios; source/unit checks are not runtime proof |
+| Pause and CapsLock layout switching | Browser password cases verify runtime pause state changes and two layout switches while text conversion remains blocked | Tray menu actions are not exercised |
 | Focus and selection changes | Release conversion cancels after the external fixture changes focus or selection, then recovers | Does not make programmatic OS focus changes atomic with input delivery |
 | Unresponsive editors | External Edit blocks for three seconds; release UI stays responsive, does not type later and recovers | A permanently hung UIA provider consumes the one bounded probe worker until restart |
 | Interrupted config writes | Windows unit tests inject partial writes and denied replacement; prior bytes and cleanup are checked | Sudden power loss and non-local filesystems are not simulated |
@@ -117,22 +119,151 @@ or contact a text service. The debug PID allowlist admits only this browser
 process. CDP prepares and reads the fixture; all tested text, modifier events,
 Tab navigation, physical mouse clicks and Double Alt use native input delivery.
 
-The 51 cases cover five editor types, a single period, words with a leading
+The 53 cases cover five editor types, a single period, words with a leading
 period, 0/1/30 ms first-key gaps, repeated fast typing, and transitions between
-fields/windows while Ctrl or Alt is released. Textarea and contenteditable cases
-also require complete conversion of 101 characters, both with a leading letter
-and a leading period. Every case checks exact input
-before conversion, exact output afterward, and unchanged neighboring/source
-fields in both windows. Input and conversion are never retried. Native focus,
+fields/windows while Ctrl or Alt is released. Two click cases switch the layout
+with CapsLock and restore English before typing and Double Alt. Textarea and
+contenteditable cases also require complete conversion of 101 characters, both with a leading letter
+and a leading period. All cases check exact input and unchanged neighboring/source
+fields in both windows. The 51 cases outside immediate-click transitions require
+the exact converted output. The two click cases allow the verified conservative
+refusal described below as well as exact conversion. Their original input timing
+and first-key gaps are unchanged. Original input and Double Alt are never retried. Native focus,
 caret-owner HWND, caret rectangle and keyboard-layout snapshots are included in
 the JSON results so a journal failure can be distinguished from incorrect input
 or browser focus setup. A failure stays red while the remaining cases collect
 evidence. Missing browsers or desktop capabilities also fail instead of skipping.
 
+`test-browser-cdp.ps1` checks the production CDP helpers without a browser or
+Windows input. It invokes them through a child script under StrictMode, verifies
+connection-owned request IDs, and checks event filtering and error propagation.
+This runs in the PowerShell CI gate before the interactive scenarios.
+
+#### Conservative refusal after an immediate click
+
+A new focused UIA element can be observed after a raw key snapshot was taken.
+The protection contract rejects a snapshot whose element identity changed. Only
+the two original textarea/contenteditable `click` cases may accept that refusal,
+and only after the original four-second conversion wait has expired normally.
+Browser, input, provider, or metadata exceptions remain failures. No additional
+readiness wait or guard polling occurs before the first tested key.
+
+Before any recovery action, the original text must remain exactly intact, native
+foreground/focus and DOM focus must still identify the original target, and every
+other field in both windows must remain unchanged. Read-only debug metadata must
+show capture unavailable, zero active/cache characters, and a cumulative physical
+append count equal to the count sampled atomically at the last pointer-down
+boundary. Selectors `5` (that baseline) and `6` (unavailable as `0`/`1`) supplement
+the existing inspection channel. These checks reject partial conversion and
+capture followed by clearing. They prove conservative refusal; they do not claim
+to establish the precise timing cause of the refusal.
+
+Acceptance also requires two recoveries on the same control. First, select the
+existing text and use the normal selection shortcut to produce the exact
+original expected conversion. Then collapse the caret at the end of that same
+field, send Escape, select the English layout, and immediately type physical
+`ghbdtn`. Double Alt must produce the original converted text followed by
+`привет`. CDP does not replace text during either recovery. Focus and every other
+field are checked before recovery, after selection conversion, and after fresh
+journal conversion. Each ordinary result records `converted` or
+`safe_focus_refusal`, with the latter including counter evidence and recovery
+results; the summary counts both outcomes separately. Password assertions and
+the mutation gate do not accept conservative refusal in place of their checks.
+
+`test-browser-outcomes.ps1` exercises the production refusal predicate and value
+wait without Windows input. It rejects partial text, capture deltas, retained
+history, focus changes, false unavailable state, and missing/null metadata. It
+also proves that non-click cases cannot use this outcome and that transport or
+timeout exceptions cannot be mistaken for a normal exhausted value wait.
+
 The separate focus unit regressions reproduce a caret-owner change under
 unchanged keyboard focus after the first glyph, and assert that changing the
 focused control still starts a separate journal. This tests the state transition
 directly; browser results establish which transitions occurred on that runner.
+
+### Password input acceptance
+
+`browser-security-cases.ps1` adds exactly seven cases to the browser suite. The
+browser starts with `--force-renderer-accessibility` so the runner exercises its
+real Windows UI Automation provider. Each protected fixture is an HTML password
+input: the harness verifies the focused element's `IsPassword` property and that
+the focused native HWND is not Edit/RichEdit. This prevents a native-style-only
+implementation from accidentally satisfying the browser test.
+
+`browser-config.toml` explicitly enables all eight tested shortcut sequences,
+smart conversion, and the AutoConvert feature. Omitted optional bindings in a
+partial config deserialize as disabled; they do not inherit `Config::default()`.
+A Windows regression loads this exact fixture through the production config
+loader and verifies every active runtime binding. Before password hotkey checks,
+all six text commands must convert ordinary input with the same native key
+sequences. Selection controls contain two words so converting only the last word
+cannot pass. An absent binding cannot satisfy password immutability by doing
+nothing.
+
+All tested input and hotkeys use `SendInput`. CDP changes only the owned fixture's
+setup and reads its synthetic values. Tests cover normal-to-password clicks,
+Shift+Tab under the same native HWND, and changing the currently focused input
+from `text` to `password` without changing focus. No wait for the application's
+guard is inserted between the tested transition and the first password character. Last word, last sequence,
+selected text, their smart variants, and AutoConvert must preserve the complete
+password. Pause and CapsLock layout switching must remain functional. An explicit
+new segment in ordinary contenteditable must journal and convert all fresh
+`ghbdtn` to `привет`.
+
+Two ordinary-input prerequisites have an explicit first-burst outcome: the
+`keep` prefix before the focused input changes type, and `ghbdtn` on returning
+from a password to contenteditable. Their original immediate bursts are retained
+and recorded before recovery. They must either be completely captured or have
+an exact zero-capture refusal: full original text, unchanged native/DOM focus
+and other fields, empty active/cache journals, unavailable capture, and equality
+with both the pre-burst counter and the pointer-down baseline. Partial or
+transient capture fails. After ordinary UIA metadata is verified, Escape starts
+a new segment in the same field and fresh physical input is appended. The type
+change test requires `keepkeep` with exactly four fresh captured characters,
+then performs its existing value reset/type change immediately followed by the
+password key. The recovery test requires `ghbdtnпривет`, preserving the first
+burst and the neighboring password while converting exactly six fresh captured
+characters. These two paths have dedicated outcome checks. The six text-command
+positive controls, cache-seeding controls, and the 53-case ordinary matrix retain
+their existing strict assertions.
+
+The delayed-focus case starts with verified password field A focused. Ordinary
+field B cancels the click's default focus change and schedules its own focus
+after 45 ms. A single native input batch sends the click and physical `g` key;
+there is no CDP call or protection probe between them. Trusted DOM key/input
+events must show that A received `g` before B gained focus, with B still empty
+and the same native HWND. The observed delay must be at least 25 ms and less
+than 75 ms; a missed timing window or wrong input owner fails the stimulus.
+After the transition, the physical capture counter must remain unchanged and
+all retained text must be empty, including after Double Alt and 2.25 seconds of
+observation. Escape starts a new segment in already-focused B, where fresh
+`ghbdtn` must become `привет` while A remains unchanged. This proves the observed
+password-to-ordinary transition; a deterministic unit test separately forces
+the internal pointer-wait branch. `test-browser-outcomes.ps1` also rejects
+untrusted/missing input events, wrong owners, invalid ordering, and out-of-range
+timestamps so an invalid stimulus cannot masquerade as a security finding.
+
+A debug-only, explicitly hosted inspection message (`0x83F0`) returns a version
+marker, active/cache character counts, a monotonic count of physical characters
+appended to the journal, and the runtime AutoConvert state. It exposes no text
+and does not invoke detection or clear state. Comparing the monotonic counter
+before and after password entry detects transient recording even if a later
+guard clears the buffer. Normal-input controls prove the counter is live. Empty
+buffers or an absence of plaintext logs alone are not accepted as proof. The
+cache-clearing case first requires nonempty active and cached journals in two
+ordinary browser windows, then requires both counts to become zero. Old ordinary
+history may take up to one second to clear while the asynchronous verdict arrives;
+the capture counter must remain unchanged from the first check after input and
+on every delivery/cleanup poll. Transition cases then observe for 2.25 seconds,
+longer than the two-second deferred-input lifetime, to detect delayed capture.
+
+The mandatory `run-security-mutation.ps1` gate temporarily makes the production
+UIA property helper report `NotSecure`, compiles a separate test executable, and
+restores both source bytes and the protected executable before continuing. It
+runs the same seven browser cases with `-SecurityOnly`. The gate accepts only a
+nonzero exit containing the specific journal-capture assertion; build failures,
+missing inspection support, provider setup errors and timeouts do not count.
+No setting or feature to disable protection is added to release builds.
 
 ### Installed layouts and language models
 

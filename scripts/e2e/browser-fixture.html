@@ -16,6 +16,8 @@
   document.title += location.hash === '#second' ? ' B' : ' A';
   let fields = {};
   const events = [];
+  let delayedFocus = null;
+  let stopDelayedFocus = null;
 
   function observe(doc) {
     for (const type of ['keydown', 'keyup', 'focusin', 'focusout']) {
@@ -43,9 +45,9 @@
     return element;
   }
   function editor(doc, kind, id) {
-    const element = doc.createElement(kind === 'editable' ? 'div' : kind);
+    const element = doc.createElement(kind === 'editable' ? 'div' : kind === 'password' ? 'input' : kind);
     if (kind === 'editable') element.contentEditable = 'true';
-    if (kind === 'input') element.type = 'text';
+    if (kind === 'input' || kind === 'password') element.type = kind === 'password' ? 'password' : 'text';
     element.id = id;
     element.spellcheck = false;
     element.setAttribute('autocapitalize', 'off');
@@ -56,6 +58,9 @@
 
   window.fixture = {
     async reset(kind) {
+      if (stopDelayedFocus) stopDelayedFocus();
+      stopDelayedFocus = null;
+      delayedFocus = null;
       const root = document.getElementById('editors');
       root.replaceChildren();
       fields = {};
@@ -64,7 +69,9 @@
         let host = root;
         let doc = document;
         let editorKind = kind;
-        if (kind === 'shadow') {
+        if (kind === 'secure') {
+          editorKind = id === 'a' ? 'password' : id === 'b' ? 'input' : 'editable';
+        } else if (kind === 'shadow') {
           const shell = document.createElement('div');
           shell.id = 'shadow-host';
           root.append(shell);
@@ -92,6 +99,38 @@
       return true;
     },
     set(id, value) { write(fields[id], value); return true; },
+    setType(id, type) {
+      if (fields[id].tagName !== 'INPUT' || !['text', 'password'].includes(type)) {
+        throw new Error('Only an owned input may change password type');
+      }
+      fields[id].type = type;
+      return true;
+    },
+    select(id, requireFocus = false) {
+      const element = fields[id];
+      if (requireFocus && (deepActive() !== element || !document.hasFocus())) return false;
+      if (element.isContentEditable) {
+        const range = element.ownerDocument.createRange();
+        range.selectNodeContents(element);
+        const selection = element.ownerDocument.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } else element.setSelectionRange(0, element.value.length);
+      return deepActive() === element && document.hasFocus();
+    },
+    collapseEnd(id) {
+      const element = fields[id];
+      if (deepActive() !== element || !document.hasFocus()) return false;
+      if (element.isContentEditable) {
+        const range = element.ownerDocument.createRange();
+        range.selectNodeContents(element);
+        range.collapse(false);
+        const selection = element.ownerDocument.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } else element.setSelectionRange(element.value.length, element.value.length);
+      return deepActive() === element && document.hasFocus();
+    },
     focus(id) {
       const element = fields[id];
       element.focus();
@@ -106,6 +145,44 @@
       return deepActive() === element && document.hasFocus();
     },
     focused(id) { return deepActive() === fields[id] && document.hasFocus(); },
+    armDelayedFocus(delayMs) {
+      if (fields.a.type !== 'password' || fields.b.type !== 'text' ||
+          deepActive() !== fields.a || !document.hasFocus() ||
+          !Number.isInteger(delayMs) || delayMs < 25 || delayMs >= 75) {
+        throw new Error('Delayed focus requires the owned password field and a bounded delay');
+      }
+      if (stopDelayedFocus) stopDelayedFocus();
+      const state = {delayMs, downAt: null, focusRequestedAt: null, focusAt: null, complete: false,
+        prevented: false, downOwner: null, finalOwner: null, events: []};
+      delayedFocus = state;
+      const controller = new AbortController();
+      let timer = null;
+      stopDelayedFocus = () => { controller.abort(); clearTimeout(timer); };
+      for (const type of ['mouseup', 'keydown', 'input', 'keyup', 'focusin']) {
+        document.addEventListener(type, event => {
+          const at = performance.now();
+          state.events.push({type, target: event.target.id ?? '', key: event.key ?? '',
+            data: event.data ?? '', trusted: event.isTrusted, at});
+          if (type === 'focusin' && event.target === fields.b) state.focusAt = at;
+          if (state.events.length > 16) state.events.shift();
+        }, {capture: true, passive: true, signal: controller.signal});
+      }
+      fields.b.addEventListener('mousedown', event => {
+        event.preventDefault();
+        state.downAt = performance.now();
+        state.prevented = event.defaultPrevented && event.isTrusted && event.button === 0;
+        state.downOwner = deepActive()?.id ?? '';
+        timer = setTimeout(() => {
+          state.focusRequestedAt = performance.now();
+          fields.b.focus();
+          state.finalOwner = deepActive()?.id ?? '';
+          state.complete = true;
+          controller.abort();
+        }, delayMs);
+      }, {once: true, signal: controller.signal});
+      return true;
+    },
+    delayedFocusState() { return delayedFocus; },
     diagnostics() {
       const active = deepActive();
       return {documentFocused: document.hasFocus(), activeId: active?.id ?? '',

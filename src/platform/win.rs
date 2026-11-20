@@ -12,6 +12,9 @@ pub(crate) mod keyboard;
 pub(crate) mod layouts;
 pub(crate) mod menu_theme;
 pub(crate) mod mouse;
+pub(crate) mod secure_input;
+#[cfg(debug_assertions)]
+mod secure_input_probe;
 pub mod state;
 pub(crate) mod tray;
 mod tray_dispatch;
@@ -684,6 +687,11 @@ pub fn run(start_hidden: bool) -> Result<()> {
 pub extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     const WM_NCDESTROY: u32 = 0x0082;
 
+    #[cfg(debug_assertions)]
+    if msg == secure_input_probe::MESSAGE {
+        return secure_input_probe::read(hwnd, wparam.0);
+    }
+
     if msg == show_window_message_id() {
         show_main_window(hwnd);
         return LRESULT(0);
@@ -1055,6 +1063,19 @@ fn execute_runtime_command(hwnd: HWND, state: &mut AppState, command: RuntimeCom
     if let RuntimeCommand::Hotkey(action) = command
         && !hotkey_action_enabled(state, action)
     {
+        return;
+    }
+
+    // Pausing never needs a provider. Layout switching remains usable even when
+    // text processing is blocked, including shortcuts shared with conversion.
+    if !matches!(command, RuntimeCommand::Hotkey(HotkeyAction::PauseToggle))
+        && !secure_input::protect_current_context().is_allowed()
+    {
+        if matches!(command, RuntimeCommand::Hotkey(HotkeyAction::SwitchLayout)) {
+            let _ = switch_keyboard_layout();
+        } else {
+            tracing::trace!("text conversion blocked by secure input policy");
+        }
         return;
     }
 

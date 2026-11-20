@@ -1,0 +1,492 @@
+param(
+    [Parameter(Mandatory = $true)][hashtable]$Sessions,
+    [Parameter(Mandatory = $true)][System.Diagnostics.Process]$SwitcherProcess,
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Results,
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Failures
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
+    $env:RUNNER_OS -ne 'Windows' -or $env:RUST_SWITCHER_HOSTED_E2E -ne '1') {
+    throw 'Password checks require the dedicated GitHub-hosted Windows job.'
+}
+
+# The parent owns every process, browser connection, and temporary profile.
+# Only the synthetic local fixture's DOM is inspected. No password is obtained
+# through UIA, and the application's inspection channel returns counts only.
+$switcherHandle = $SwitcherProcess.MainWindowHandle
+$session = $Sessions.a
+
+function Read-SecurityState {
+    if ($SwitcherProcess.HasExited) { throw 'Switcher exited during password checks' }
+    return [pscustomobject]@{
+        activeChars = [BrowserInput]::SecurityMetadata($switcherHandle, 1)
+        cachedChars = [BrowserInput]::SecurityMetadata($switcherHandle, 2)
+        capturedChars = [BrowserInput]::SecurityMetadata($switcherHandle, 3)
+        autoConvert = [BrowserInput]::SecurityMetadata($switcherHandle, 4)
+    }
+}
+
+function Read-PasswordCaptureState($Before) {
+    $after = Read-SecurityState
+    if ($after.capturedChars -ne $Before.capturedChars) {
+        # The mutation gate requires this specific failure. A broken browser,
+        # absent inspection API, or unrelated timeout is not a detected mutant.
+        throw "SECURITY_CAPTURE_VIOLATION: password input entered the journal (capture delta=$($after.capturedChars - $Before.capturedChars))"
+    }
+    return $after
+}
+
+function Assert-NoPasswordCapture($Before, [int]$CleanupMilliseconds = 0) {
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        # Capture is forbidden immediately, including while a background UIA
+        # verdict is still clearing ordinary history from the previous field.
+        $after = Read-PasswordCaptureState $Before
+        if ($after.activeChars -eq 0 -and $after.cachedChars -eq 0) { return $after }
+        if ($clock.ElapsedMilliseconds -ge $CleanupMilliseconds) {
+            throw "Password context retained journal data: active=$($after.activeChars), cached=$($after.cachedChars)"
+        }
+        Start-Sleep -Milliseconds 10
+    } while ($true)
+}
+
+function Assert-BrowserPassword([bool]$Expected, [string]$Id = 'a') {
+    Wait-Browser {
+        try {
+            $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+            $null -ne $focused -and $focused.Current.HasKeyboardFocus -and
+                $focused.Current.Name -eq $Id -and $focused.Current.IsPassword -eq $Expected
+        } catch { $false }
+    } "real focused browser UIA IsPassword=$Expected ($Id)"
+    $native = [BrowserInput]::Snapshot($session.Handle)
+    $class = [BrowserInput]::ClassOf([IntPtr]$native.focus)
+    if ($class -match '^(Edit|RichEdit.*|RICHEDIT.*)$') {
+        throw "Browser password fixture unexpectedly uses native password-style detection: $class"
+    }
+    return @{focus = $native.focus; nativeClass = $class; isPassword = $Expected}
+}
+
+function Reset-PasswordFixture([string]$Kind = 'secure') {
+    foreach ($target in @($Sessions.a, $Sessions.b)) {
+        Read-Browser $target "fixture.reset('$Kind')" | Out-Null
+        Set-BrowserEnglish $target
+        Read-Browser $target "fixture.set('b', '')" | Out-Null
+        Read-Browser $target "fixture.set('guard', '')" | Out-Null
+        Focus-BrowserEditor $target 'b'
+        Tap-BrowserKey 0x1B
+    }
+    Focus-BrowserEditor $session 'b'
+}
+
+function Type-NormalFixture($Target, [string]$Id, [string]$Text) {
+    $before = Read-SecurityState
+    [BrowserInput]::Type($Target.Handle, $Text, 0, 0) | Out-Null
+    Wait-Browser { (Read-Browser $Target 'fixture.values()').$Id -eq $Text } 'exact ordinary input before password check'
+    Wait-Browser { (Read-SecurityState).capturedChars -ge $before.capturedChars + $Text.Length } 'every ordinary character actually journaled'
+}
+
+function Assert-CompleteOrdinarySegment($Before, $After, [int]$Length) {
+    if ($Length -le 0 -or $After.capturedChars - $Before.capturedChars -ne $Length -or
+        $After.activeChars -ne $Length -or $After.cachedChars -ne 0 -or $After.captureUnavailable -ne 0) {
+        throw 'The new ordinary segment did not capture exactly its complete physical input'
+    }
+}
+
+function Get-OrdinaryTransitionOutcome([string]$Purpose, $Record, $Journal, [long]$Window) {
+    $expected = switch ($Purpose) {
+        'type-change-prefix' { @{field = 'a'; text = 'keep'} }
+        'password-recovery' { @{field = 'guard'; text = 'ghbdtn'} }
+        default { throw 'Ordinary transition refusal is limited to two password-test prerequisites' }
+    }
+    if ($Record.field -cne $expected.field -or $Record.text -cne $expected.text -or
+        $Record.actual -cne $expected.text -or $Record.otherFieldsUnchanged -isnot [bool] -or
+        -not $Record.otherFieldsUnchanged) {
+        throw 'Ordinary transition requires complete original input and unchanged other fields'
+    }
+    foreach ($native in @($Record.inputTrace.before, $Record.inputTrace.afterFirst, $Record.inputTrace.afterRest)) {
+        Assert-BrowserTargetFocus $native $Record.focusAfter $expected.field $Window
+    }
+    foreach ($object in @($Record.before, $Journal)) {
+        if ($null -eq $object) { throw 'Ordinary transition metadata is missing' }
+        foreach ($name in @('capturedChars')) {
+            $property = $object.PSObject.Properties[$name]
+            if ($null -eq $property -or $null -eq $property.Value -or
+                ($property.Value -isnot [long] -and $property.Value -isnot [int]) -or $property.Value -lt 0) {
+                throw 'Ordinary transition has an invalid physical capture counter'
+            }
+        }
+    }
+    foreach ($name in @('activeChars', 'cachedChars', 'pointerBaseline', 'captureUnavailable')) {
+        $property = $Journal.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value -or
+            ($property.Value -isnot [long] -and $property.Value -isnot [int]) -or $property.Value -lt 0) {
+            throw "Ordinary transition metadata is invalid: $name"
+        }
+    }
+    if ($Journal.pointerBaseline -ne $Record.before.capturedChars) {
+        throw 'Ordinary transition lost its pointer-down physical capture baseline'
+    }
+    if ($Journal.capturedChars -eq $Record.before.capturedChars -and $Journal.activeChars -eq 0 -and
+        $Journal.cachedChars -eq 0 -and $Journal.captureUnavailable -eq 1) {
+        return 'safe_focus_refusal'
+    }
+    Assert-CompleteOrdinarySegment $Record.before $Journal $expected.text.Length
+    return 'captured'
+}
+
+function Observe-OrdinaryTransition([string]$Purpose, [string]$Id, [string]$Text,
+    [hashtable]$ExpectedOther, [hashtable]$Record) {
+    # Preserve the original first burst: this is the same counter read and
+    # immediate physical input as Type-NormalFixture, with no readiness poll.
+    $Record.before = Read-SecurityState
+    $Record.field = $Id
+    $Record.text = $Text
+    $Record.inputTrace = [BrowserInput]::Type($session.Handle, $Text, 0, 0)
+    Wait-Browser { (Read-Browser $session 'fixture.values()').$Id -ceq $Text } 'complete initial ordinary transition input'
+    Wait-Browser {
+        $state = Read-BrowserJournalState $switcherHandle
+        $state.captureUnavailable -eq 1 -or $state.capturedChars -ge $Record.before.capturedChars + $Text.Length
+    } 'complete capture or explicit ordinary transition refusal'
+    $Record.actual = (Read-Browser $session 'fixture.values()').$Id
+    $Record.focusAfter = Get-BrowserFocusSnapshot $session
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    $Record.otherFieldsUnchanged = $true
+    $Record.journal = Read-BrowserJournalState $switcherHandle
+    $Record.outcome = Get-OrdinaryTransitionOutcome $Purpose $Record $Record.journal ($session.Handle.ToInt64())
+}
+
+function Start-FreshOrdinarySegment([string]$Id, [string]$Text, [hashtable]$Initial,
+    [hashtable]$ExpectedOther, [hashtable]$Recovery) {
+    $Recovery.provider = Assert-BrowserPassword $false $Id
+    Assert-BrowserTargetFocus $Initial.inputTrace.before (Get-BrowserFocusSnapshot $session) $Id ($session.Handle.ToInt64())
+    $Recovery.before = Read-BrowserJournalState $switcherHandle
+    if ($Recovery.before.capturedChars -ne $Initial.journal.capturedChars) {
+        throw 'Initial ordinary transition captured input after its recorded outcome'
+    }
+    # Keep the initial text. Escape explicitly starts a new segment in the
+    # same control; neither CDP replacement nor refocusing retries the burst.
+    Tap-BrowserKey 0x1B
+    Set-BrowserEnglish $session
+    $Recovery.inputTrace = [BrowserInput]::Type($session.Handle, $Text, 0, 0)
+    $Recovery.expected = $Initial.text + $Text
+    Wait-Browser { (Read-Browser $session 'fixture.values()').$Id -ceq $Recovery.expected } 'fresh ordinary input appended to the preserved first burst'
+    Wait-Browser {
+        $state = Read-BrowserJournalState $switcherHandle
+        $state.captureUnavailable -eq 1 -or $state.capturedChars -ge $Recovery.before.capturedChars + $Text.Length
+    } 'every fresh ordinary character captured in the new segment'
+    $Recovery.after = Read-BrowserJournalState $switcherHandle
+    Assert-CompleteOrdinarySegment $Recovery.before $Recovery.after $Text.Length
+    $Recovery.actual = (Read-Browser $session 'fixture.values()').$Id
+    Assert-BrowserOtherFields $Sessions $ExpectedOther
+    $Recovery.otherFieldsUnchanged = $true
+    $Recovery.focusAfter = Get-BrowserFocusSnapshot $session
+    Assert-BrowserTargetFocus $Initial.inputTrace.before $Recovery.focusAfter $Id ($session.Handle.ToInt64())
+    foreach ($native in @($Recovery.inputTrace.before, $Recovery.inputTrace.afterFirst, $Recovery.inputTrace.afterRest)) {
+        Assert-BrowserTargetFocus $native $Recovery.focusAfter $Id ($session.Handle.ToInt64())
+    }
+}
+
+function Type-PasswordFixture([string]$Text, $Before) {
+    # No polling of the application's guard precedes the first tested key.
+    [BrowserInput]::Type($session.Handle, $Text, 0, 0) | Out-Null
+    Read-PasswordCaptureState $Before | Out-Null
+    Wait-Browser {
+        Read-PasswordCaptureState $Before | Out-Null
+        (Read-Browser $session 'fixture.values()').a -eq $Text
+    } 'exact synthetic password input'
+    return Assert-NoPasswordCapture $Before 1000
+}
+
+function Assert-PasswordStable([string]$Text, $Before, [int]$Milliseconds = 1250) {
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ((Read-Browser $session 'fixture.values()').a -ne $Text) {
+            throw 'A text conversion modified the synthetic password'
+        }
+        Assert-NoPasswordCapture $Before | Out-Null
+        Start-Sleep -Milliseconds 25
+    } while ($clock.ElapsedMilliseconds -lt $Milliseconds)
+}
+
+function Tap-PasswordChord([ushort]$Key, [int]$Count) {
+    for ($i = 0; $i -lt $Count; $i++) {
+        if ($i -gt 0) { Start-Sleep -Milliseconds 100 }
+        Tap-BrowserKey $Key
+    }
+}
+
+function Assert-DelayedPasswordStimulus($Proof, $Values) {
+    # Invalid timing or input ownership is a failed stimulus, never proof that
+    # password capture was blocked. Check this before any security sentinel.
+    if ($null -eq $Proof -or $null -eq $Values -or
+        $Proof.complete -isnot [bool] -or -not $Proof.complete -or
+        $Proof.prevented -isnot [bool] -or -not $Proof.prevented -or
+        $Proof.delayMs -ne 45 -or $Proof.downOwner -cne 'a' -or $Proof.finalOwner -cne 'b' -or
+        $Values.a -cne 'g' -or $Values.b -cne '') {
+        throw 'Delayed password stimulus did not preserve the real input owner'
+    }
+    foreach ($value in @($Proof.downAt, $Proof.focusAt)) {
+        if ($null -eq $value -or $value -is [string] -or
+            -not [double]::IsFinite([double]$value) -or $value -lt 0) {
+            throw 'Delayed password stimulus has invalid timestamps'
+        }
+    }
+    $delay = $Proof.focusAt - $Proof.downAt
+    if ($delay -lt 25 -or $delay -ge 75) {
+        throw "Delayed password focus was outside the 25..75 ms stimulus interval: $delay ms"
+    }
+    $previous = $Proof.downAt
+    foreach ($expected in @(
+        @{type = 'mouseup'; target = 'b'; key = ''; data = ''},
+        @{type = 'keydown'; target = 'a'; key = 'g'; data = ''},
+        @{type = 'input'; target = 'a'; key = ''; data = 'g'},
+        @{type = 'keyup'; target = 'a'; key = 'g'; data = ''},
+        @{type = 'focusin'; target = 'b'; key = ''; data = ''}
+    )) {
+        $events = @($Proof.events | Where-Object { $_.type -ceq $expected.type })
+        if ($events.Count -ne 1) { throw "Delayed password stimulus requires one $($expected.type) event" }
+        $event = $events[0]
+        if ($event.target -cne $expected.target -or $event.key -cne $expected.key -or
+            $event.data -cne $expected.data -or $event.trusted -isnot [bool] -or -not $event.trusted -or
+            $null -eq $event.at -or $event.at -is [string] -or -not [double]::IsFinite([double]$event.at) -or
+            $event.at -lt $previous -or
+            ($expected.type -ne 'focusin' -and $event.at -ge $Proof.focusAt) -or
+            ($expected.type -eq 'focusin' -and $event.at -ne $Proof.focusAt)) {
+            throw "Delayed password stimulus has invalid $($expected.type) ownership or ordering"
+        }
+        $previous = $event.at
+    }
+    return $delay
+}
+
+function Invoke-PasswordCase([string]$Name, [scriptblock]$Action) {
+    $record = [ordered]@{name = "browser password $Name"; error = $null; details = @{}}
+    try { & $Action $record.details } catch { $record.error = $_.Exception.Message }
+    if ($null -ne $record.error) { $Failures.Add("$($record.name): $($record.error)") }
+    $Results.Add([pscustomobject]$record)
+    $record | ConvertTo-Json -Depth 6 -Compress | Write-Output
+    if ($null -eq $record.error) { Write-Output "PASS: $($record.name)" }
+    else { Write-Output "FAIL: $($record.name)" }
+}
+
+Read-Browser $session "fixture.reset('secure')" | Out-Null
+Focus-BrowserEditor $session 'b'
+if ([BrowserInput]::SecurityMetadata($switcherHandle, 0) -ne 0x52535031) {
+    throw 'The debug executable has no hosted password inspection API'
+}
+
+Invoke-PasswordCase 'UIA protection and all text hotkeys' {
+    param($details)
+    $commands = @(
+        @{name = 'last-word'; key = 0xA0; count = 2; selection = $false},
+        @{name = 'smart-last-word'; key = 0xA0; count = 3; selection = $false},
+        @{name = 'last-sequence'; key = 0xA4; count = 2; selection = $false},
+        @{name = 'smart-last-sequence'; key = 0xA4; count = 3; selection = $false},
+        @{name = 'selection'; key = 0xA0; count = 2; selection = $true},
+        @{name = 'smart-selection'; key = 0xA0; count = 3; selection = $true}
+    )
+    $details.ordinaryCommands = @()
+    foreach ($command in $commands) {
+        # A missing binding must fail before password immutability can pass.
+        # Exercise the same native keys in an ordinary field first.
+        Reset-PasswordFixture
+        $plainText = if ($command.selection) { 'ghbdtn ghbdtn' } else { 'ghbdtn' }
+        $converted = if ($command.selection) { 'привет привет' } else { 'привет' }
+        Type-NormalFixture $session 'b' $plainText
+        if ($command.selection) { Read-Browser $session "fixture.select('b')" | Out-Null }
+        Tap-PasswordChord $command.key $command.count
+        Wait-Browser { (Read-Browser $session 'fixture.values()').b -eq $converted } `
+            "ordinary $($command.name) positive control"
+        $details.ordinaryCommands += $command.name
+    }
+    Reset-PasswordFixture
+    Type-NormalFixture $session 'b' 'ghbdtn'
+    # No click between windows: preserve the normal journal as a cached context.
+    Focus-Browser $Sessions.b
+    Read-Browser $Sessions.b "fixture.focus('b')" | Out-Null
+    Type-NormalFixture $Sessions.b 'b' 'rfrltkf'
+    $details.before = Read-SecurityState
+    if ($details.before.activeChars -lt 7 -or $details.before.cachedChars -lt 6) {
+        throw 'Password cache-clearing test requires populated active and cached ordinary contexts'
+    }
+    Focus-Browser $session
+    Read-Browser $session "fixture.focus('a')" | Out-Null
+    $before = $details.before
+    Type-PasswordFixture 'ghbdtn' $before | Out-Null
+    $details.provider = Assert-BrowserPassword $true
+    $details.commands = @()
+    foreach ($command in $commands) {
+        Read-Browser $session "fixture.focus('a')" | Out-Null
+        if ($command.selection) { Read-Browser $session "fixture.select('a')" | Out-Null }
+        Tap-PasswordChord $command.key $command.count
+        Assert-PasswordStable 'ghbdtn' $before
+        $details.commands += $command.name
+    }
+    $details.after = Assert-NoPasswordCapture $before
+}
+
+Invoke-PasswordCase 'same native HWND click transition' {
+    param($details)
+    Reset-PasswordFixture
+    Type-NormalFixture $session 'b' 'keep'
+    $nativeBefore = [BrowserInput]::Snapshot($session.Handle).focus
+    $before = Read-SecurityState
+    Focus-BrowserEditor $session 'a'
+    Type-PasswordFixture '.ghbdtn' $before | Out-Null
+    $details.provider = Assert-BrowserPassword $true
+    if ($details.provider.focus -ne $nativeBefore) { throw 'Click fixture did not preserve its native focus HWND' }
+    Assert-PasswordStable '.ghbdtn' $before 2250
+    $details.before = $before
+    $details.after = Assert-NoPasswordCapture $before
+}
+
+Invoke-PasswordCase 'same native HWND keyboard transition' {
+    param($details)
+    Reset-PasswordFixture
+    Type-NormalFixture $session 'b' 'keep'
+    $nativeBefore = [BrowserInput]::Snapshot($session.Handle).focus
+    $before = Read-SecurityState
+    # Shift+Tab enters the preceding password field. The first glyph follows
+    # immediately; neither a guard wait nor CDP focus restoration is allowed.
+    [BrowserInput]::Key(0xA0, $false)
+    try { Tap-BrowserKey 0x09 } finally { [BrowserInput]::Key(0xA0, $true) }
+    Type-PasswordFixture 'ghbdtn' $before | Out-Null
+    if (-not (Read-Browser $session "fixture.focused('a')")) { throw 'Shift+Tab did not focus the password field' }
+    $details.provider = Assert-BrowserPassword $true
+    if ($details.provider.focus -ne $nativeBefore) { throw 'Tab fixture did not preserve its native focus HWND' }
+    Assert-PasswordStable 'ghbdtn' $before 2250
+    $details.after = Assert-NoPasswordCapture $before
+}
+
+Invoke-PasswordCase 'delayed ordinary focus never captures the preceding password key' {
+    param($details)
+    Reset-PasswordFixture
+    Focus-BrowserEditor $session 'a'
+    $details.passwordProvider = Assert-BrowserPassword $true
+    Tap-BrowserKey 0x1B
+    $before = Read-SecurityState
+    Assert-NoPasswordCapture $before 1000 | Out-Null
+    $nativeBefore = [BrowserInput]::Snapshot($session.Handle)
+    Assert-BrowserTargetFocus $nativeBefore (Get-BrowserFocusSnapshot $session) 'a' ($session.Handle.ToInt64())
+    $expectedValues = @{}
+    foreach ($sessionId in @('a', 'b')) {
+        $values = Read-Browser $Sessions[$sessionId] 'fixture.values()'
+        foreach ($field in @('a', 'b', 'guard')) { $expectedValues["$sessionId/$field"] = $values.$field }
+    }
+    $point = Read-Browser $session "fixture.point('b')"
+    Read-Browser $session 'fixture.armDelayedFocus(45)' | Out-Null
+    $details.before = $before
+    $details.inputTrace = [BrowserInput]::ClickThenTypeKey($session.Handle, $point.x, $point.y, 0x47)
+    # Everything above prepares the stimulus. This first observation follows
+    # the entire native click/key batch and cannot make its input owner ready.
+    $details.immediateState = Read-SecurityState
+    Wait-Browser { (Read-Browser $session 'fixture.delayedFocusState()').complete } 'delayed ordinary browser focus'
+    $details.stimulus = Read-Browser $session 'fixture.delayedFocusState()'
+    $details.focusDelayMs = Assert-DelayedPasswordStimulus $details.stimulus (Read-Browser $session 'fixture.values()')
+    $details.focusAfter = Get-BrowserFocusSnapshot $session
+    foreach ($native in @($details.inputTrace.before, $details.inputTrace.afterFirst)) {
+        Assert-BrowserTargetFocus $native $details.focusAfter 'b' ($session.Handle.ToInt64())
+    }
+    Assert-BrowserTargetFocus $nativeBefore $details.focusAfter 'b' ($session.Handle.ToInt64())
+    $expectedValues['a/a'] = 'g'
+    Assert-BrowserOtherFields $Sessions $expectedValues
+    $details.ordinaryProvider = Assert-BrowserPassword $false 'b'
+    Assert-NoPasswordCapture $before 1000 | Out-Null
+    Tap-PasswordChord 0xA4 2
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-NoPasswordCapture $before | Out-Null
+        Assert-BrowserOtherFields $Sessions $expectedValues
+        Start-Sleep -Milliseconds 25
+    } while ($clock.ElapsedMilliseconds -lt 2250)
+    $details.after = Assert-NoPasswordCapture $before
+    $details.fieldsUnchanged = $true
+
+    # Recovery stays in the already focused ordinary field. Its explicit new
+    # segment must capture every fresh character without reading the password.
+    Assert-BrowserTargetFocus $nativeBefore (Get-BrowserFocusSnapshot $session) 'b' ($session.Handle.ToInt64())
+    Tap-BrowserKey 0x1B
+    Set-BrowserEnglish $session
+    Type-NormalFixture $session 'b' 'ghbdtn'
+    Tap-PasswordChord 0xA4 2
+    Wait-Browser { (Read-Browser $session 'fixture.values()').b -ceq 'привет' } 'ordinary recovery after delayed password focus'
+    $expectedValues['a/b'] = 'привет'
+    Assert-BrowserOtherFields $Sessions $expectedValues
+    Assert-BrowserTargetFocus $nativeBefore (Get-BrowserFocusSnapshot $session) 'b' ($session.Handle.ToInt64())
+    $details.recovery = @{password = 'g'; ordinary = 'привет'; after = Read-SecurityState}
+}
+
+Invoke-PasswordCase 'focused input changes from text to password' {
+    param($details)
+    Reset-PasswordFixture 'input'
+    $expectedOther = @{'a/b' = ''; 'a/guard' = ''; 'b/a' = ''; 'b/b' = ''; 'b/guard' = ''}
+    $details.initialOrdinary = @{}
+    $details.freshOrdinary = @{}
+    Focus-BrowserEditor $session 'a'
+    Observe-OrdinaryTransition 'type-change-prefix' 'a' 'keep' $expectedOther $details.initialOrdinary
+    # Establish the ordinary-field prerequisite before exercising the type
+    # change. No observation is inserted between that change and password input.
+    Start-FreshOrdinarySegment 'a' 'keep' $details.initialOrdinary $expectedOther $details.freshOrdinary
+    $details.normalProvider = $details.freshOrdinary.provider
+    $before = Read-SecurityState
+    Read-Browser $session "fixture.set('a', ''); fixture.setType('a', 'password')" | Out-Null
+    Type-PasswordFixture 'ghbdtn' $before | Out-Null
+    $details.passwordProvider = Assert-BrowserPassword $true
+    if ($details.normalProvider.focus -ne $details.passwordProvider.focus) {
+        throw 'Changing the HTML input type unexpectedly changed native focus'
+    }
+    Assert-PasswordStable 'ghbdtn' $before 2250
+    $details.after = Assert-NoPasswordCapture $before
+}
+
+Invoke-PasswordCase 'layout switching pause and automatic conversion' {
+    param($details)
+    Reset-PasswordFixture
+    $before = Read-SecurityState
+    Focus-BrowserEditor $session 'a'
+    $details.provider = Assert-BrowserPassword $true
+    $layout = [BrowserInput]::LayoutOf($session.Handle)
+    Tap-BrowserKey 0x14
+    Wait-Browser { [BrowserInput]::LayoutOf($session.Handle) -ne $layout } 'CapsLock still switches layout in password field'
+    Tap-BrowserKey 0x14
+    Wait-Browser { [BrowserInput]::LayoutOf($session.Handle) -eq $layout } 'CapsLock restores layout in password field'
+    $initialAuto = (Read-SecurityState).autoConvert
+    Tap-PasswordChord 0xA3 2
+    Wait-Browser { (Read-SecurityState).autoConvert -ne $initialAuto } 'Right Ctrl pause toggle in password field'
+    if ((Read-SecurityState).autoConvert -ne 1) {
+        Tap-PasswordChord 0xA3 2
+        Wait-Browser { (Read-SecurityState).autoConvert -eq 1 } 'AutoConvert enabled for protected-input test'
+    }
+    Type-PasswordFixture 'ghbdtn ' $before | Out-Null
+    Assert-PasswordStable 'ghbdtn ' $before
+    if ((Read-SecurityState).autoConvert -ne $initialAuto) {
+        Tap-PasswordChord 0xA3 2
+        Wait-Browser { (Read-SecurityState).autoConvert -eq $initialAuto } 'restore runtime pause state'
+    }
+    $details.after = Assert-NoPasswordCapture $before
+}
+
+Invoke-PasswordCase 'ordinary custom field recovers with every character' {
+    param($details)
+    Reset-PasswordFixture
+    $before = Read-SecurityState
+    Focus-BrowserEditor $session 'a'
+    Type-PasswordFixture 'secretfixture' $before | Out-Null
+    $details.passwordProvider = Assert-BrowserPassword $true
+    Assert-PasswordStable 'secretfixture' $before 2250
+    $expectedOther = @{'a/a' = 'secretfixture'; 'a/b' = ''; 'b/a' = ''; 'b/b' = ''; 'b/guard' = ''}
+    $details.initialOrdinary = @{}
+    $details.freshOrdinary = @{}
+    Focus-BrowserEditor $session 'guard'
+    Observe-OrdinaryTransition 'password-recovery' 'guard' 'ghbdtn' $expectedOther $details.initialOrdinary
+    Start-FreshOrdinarySegment 'guard' 'ghbdtn' $details.initialOrdinary $expectedOther $details.freshOrdinary
+    $details.normalProvider = $details.freshOrdinary.provider
+    Tap-PasswordChord 0xA4 2
+    Wait-Browser { (Read-Browser $session 'fixture.values()').guard -ceq 'ghbdtnпривет' } 'only the six fresh ordinary characters convert after password focus'
+    Assert-BrowserOtherFields $Sessions $expectedOther
+    Assert-BrowserTargetFocus $details.initialOrdinary.inputTrace.before (Get-BrowserFocusSnapshot $session) 'guard' ($session.Handle.ToInt64())
+    $details.result = 'preserved ghbdtn + fresh ghbdtn -> ghbdtnпривет'
+    $details.after = Read-SecurityState
+}

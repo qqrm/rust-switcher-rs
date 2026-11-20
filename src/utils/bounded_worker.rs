@@ -11,8 +11,9 @@ struct Request<T, R> {
     reply: SyncSender<R>,
 }
 
-/// One worker and one queued request, even when a foreign provider never returns.
-/// The worker only reads data: expired requests cannot perform delayed input.
+/// A fixed worker and a bounded queue, even when a foreign provider never returns.
+/// Expired requests never reach the processor. An optional expiration callback
+/// lets an ordered capture consumer invalidate a prefix after losing an event.
 pub(crate) struct BoundedWorker<T, R> {
     sender: SyncSender<Request<T, R>>,
 }
@@ -23,20 +24,49 @@ impl<T: Send + 'static, R: Send + 'static> BoundedWorker<T, R> {
         I: FnOnce() -> F + Send + 'static,
         F: FnMut(T) -> R + 'static,
     {
-        let (sender, receiver) = mpsc::sync_channel::<Request<T, R>>(1);
-        thread::Builder::new().name(name.to_owned()).spawn(move || {
-            let mut process = initialize();
-            while let Ok(request) = receiver.recv() {
-                if Instant::now() >= request.deadline {
-                    continue;
+        Self::start_with_expiration(name, 1, initialize, |_| {})
+    }
+
+    pub(crate) fn start_with_expiration<F, I, E>(
+        name: &str,
+        capacity: usize,
+        initialize: I,
+        mut expired: E,
+    ) -> io::Result<Self>
+    where
+        I: FnOnce() -> F + Send + 'static,
+        F: FnMut(T) -> R + 'static,
+        E: FnMut(T) + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel::<Request<T, R>>(capacity);
+        thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let mut process = initialize();
+                while let Ok(request) = receiver.recv() {
+                    if Instant::now() >= request.deadline {
+                        expired(request.value);
+                        continue;
+                    }
+                    let result = process(request.value);
+                    if Instant::now() < request.deadline {
+                        let _ = request.reply.send(result);
+                    }
                 }
-                let result = process(request.value);
-                if Instant::now() < request.deadline {
-                    let _ = request.reply.send(result);
-                }
-            }
-        })?;
+            })?;
         Ok(Self { sender })
+    }
+
+    /// Enqueue without waiting for a provider or allocating another worker.
+    pub(crate) fn submit(&self, value: T, timeout: Duration) -> bool {
+        let (reply, _receiver) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(Request {
+                value,
+                deadline: Instant::now() + timeout,
+                reply,
+            })
+            .is_ok()
     }
 
     pub(crate) fn request(&self, value: T, timeout: Duration) -> Option<R> {
@@ -73,7 +103,8 @@ mod tests {
                 blocked.recv().unwrap();
                 value
             }
-        }).unwrap();
+        })
+        .unwrap();
         let start = Instant::now();
         assert_eq!(worker.request(1, Duration::from_millis(30)), None);
         assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
@@ -83,5 +114,40 @@ mod tests {
         release.send(()).unwrap();
         // The expired queued request must never reach the provider.
         assert!(observed.recv_timeout(Duration::from_millis(80)).is_err());
+    }
+
+    #[test]
+    fn asynchronous_capture_is_bounded_and_expired_prefix_is_reported() {
+        let (release, blocked) = mpsc::channel();
+        let (started, observed) = mpsc::channel();
+        let (expired, expired_events) = mpsc::channel();
+        let worker = BoundedWorker::start_with_expiration(
+            "capture-test",
+            1,
+            move || {
+                move |value: u32| {
+                    started.send(value).unwrap();
+                    blocked.recv().unwrap();
+                    value
+                }
+            },
+            move |value| {
+                expired.send(value).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(worker.submit(1, Duration::from_secs(1)));
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        let start = Instant::now();
+        assert!(worker.submit(2, Duration::ZERO));
+        assert!(!worker.submit(3, Duration::from_secs(1)));
+        assert!(start.elapsed() < Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert_eq!(
+            expired_events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            2
+        );
+        assert!(observed.try_recv().is_err());
     }
 }

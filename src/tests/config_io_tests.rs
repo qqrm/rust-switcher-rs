@@ -7,8 +7,11 @@ use std::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 
 use super::env_lock::lock_env;
-use crate::config::{
-    self, Config, HotkeyChord, HotkeySequence, MODVK_LALT, MODVK_LSHIFT, MODVK_RCTRL,
+use crate::{
+    app::{HotkeySequenceValues, HotkeySlot},
+    config::{
+        self, Config, HotkeyChord, HotkeySequence, MODVK_LALT, MODVK_LSHIFT, MODVK_RCTRL,
+    },
 };
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -90,6 +93,46 @@ fn config_loads_missing_autoconvert_feature_flag_as_enabled() {
     let loaded = config::load().unwrap();
 
     assert!(loaded.autoconvert_feature_enabled);
+}
+
+#[test]
+fn browser_acceptance_config_enables_every_exercised_runtime_shortcut() {
+    let _env = AppDataOverride::new("browser-acceptance-config");
+    let path = config::config_path().unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, include_str!("../../scripts/e2e/browser-config.toml")).unwrap();
+
+    let loaded = config::load().unwrap();
+    loaded.validate_hotkey_sequences().unwrap();
+    assert!(loaded.smarter_hotkeys_enabled);
+    assert!(loaded.autoconvert_feature_enabled);
+    let runtime = HotkeySequenceValues::from_config(&loaded);
+    let repeated = |mods, mods_vks, count| {
+        let chord = HotkeyChord { mods, mods_vks, vk: None };
+        HotkeySequence {
+            first: chord,
+            second: Some(chord),
+            third: (count == 3).then_some(chord),
+            max_gap_ms: 1000,
+        }
+    };
+    for (slot, sequence) in [
+        (HotkeySlot::LastWord, repeated(MOD_SHIFT.0, MODVK_LSHIFT, 2)),
+        (HotkeySlot::LastSequence, repeated(MOD_ALT.0, MODVK_LALT, 2)),
+        (HotkeySlot::Selection, repeated(MOD_SHIFT.0, MODVK_LSHIFT, 2)),
+        (HotkeySlot::SmartLastWord, repeated(MOD_SHIFT.0, MODVK_LSHIFT, 3)),
+        (HotkeySlot::SmartLastSequence, repeated(MOD_ALT.0, MODVK_LALT, 3)),
+        (HotkeySlot::SmartSelection, repeated(MOD_SHIFT.0, MODVK_LSHIFT, 3)),
+        (HotkeySlot::Pause, repeated(MOD_CONTROL.0, MODVK_RCTRL, 2)),
+        (HotkeySlot::SwitchLayout, HotkeySequence {
+            first: HotkeyChord { mods: 0, mods_vks: 0, vk: Some(20) },
+            second: None,
+            third: None,
+            max_gap_ms: 1000,
+        }),
+    ] {
+        assert_eq!(runtime.get(slot), Some(sequence), "browser binding: {slot:?}");
+    }
 }
 
 #[test]

@@ -41,7 +41,7 @@ fn convert_selection_if_any_impl(state: &mut AppState, mode: SelectionDirectionM
         ConvertOutcome::Noop => false,
         ConvertOutcome::Ok | ConvertOutcome::Cancelled => true,
         ConvertOutcome::Err(e) => {
-            tracing::warn!(user_text = e.user_text(), error = ?e, "selection conversion failed");
+            tracing::warn!(error = ?e, "selection conversion failed");
             true
         }
     }
@@ -72,7 +72,7 @@ fn convert_selection_impl(state: &mut AppState, mode: SelectionDirectionMode) {
         ConvertOutcome::Noop => tracing::trace!("no selection"),
         ConvertOutcome::Ok | ConvertOutcome::Cancelled => {}
         ConvertOutcome::Err(e) => {
-            tracing::warn!(user_text = e.user_text(), error = ?e, "selection conversion failed");
+            tracing::warn!(error = ?e, "selection conversion failed");
         }
     }
 }
@@ -120,15 +120,6 @@ fn convert_selection_outcome(
 enum ConvertSelectionError {
     TargetChanged,
     InputRejected,
-}
-
-impl ConvertSelectionError {
-    fn user_text(&self) -> &'static str {
-        match self {
-            Self::TargetChanged => "Selection changed before conversion",
-            Self::InputRejected => "Selection input was rejected",
-        }
-    }
 }
 
 /// Replaces currently selected text with layout converted text.

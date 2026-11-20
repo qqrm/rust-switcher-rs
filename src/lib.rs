@@ -46,3 +46,9 @@ mod core_tests;
 #[cfg(test)]
 #[path = "domain/text/ranking.rs"]
 mod ranking;
+
+// The asynchronous capture transport is platform-independent; exercise stalled
+// providers and queue expiry in the Linux test jobs too.
+#[cfg(test)]
+#[path = "utils/bounded_worker.rs"]
+mod bounded_worker;
