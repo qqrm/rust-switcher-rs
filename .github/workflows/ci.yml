@@ -74,7 +74,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
         with:
           tool: cargo-nextest
           fallback: none
@@ -120,7 +120,7 @@ jobs:
         id: app_build
         run: cargo +nightly build --features debug-tracing
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
         with:
           tool: cargo-nextest
           fallback: none
@@ -248,7 +248,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install dependency tooling
-        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
         with:
           tool: |
             cargo-audit@0.22.2
