@@ -208,12 +208,10 @@ impl ProbeState {
         }
         let Some(automation) = self.automation.as_ref() else { return Ok(SelectionProbe::Blocked); };
         let element = unsafe { automation.GetFocusedElement() }?;
-        // Check the provider's explicit password property before asking it for text.
-        // A missing property must not become a default FALSE authorization.
-        if !secure_input::element_status(&element).is_allowed() {
-            secure_input::clear_sensitive_context_if_current(target.security_generation);
-            return Ok(SelectionProbe::Blocked);
-        }
+        // Password providers can return masks or refuse text access. Inspect
+        // selection endpoints before deciding whether journal fallback is valid.
+        // Missing password metadata does not prevent reading ordinary selections.
+        let is_password = secure_input::element_password_state(&element) == Some(true);
         let pattern: IUIAutomationTextPattern = match unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) } {
             Ok(pattern) => pattern,
             // Preserve fallback for an explicitly unsupported pattern only.
@@ -225,6 +223,14 @@ impl ProbeState {
         if count == 0 { return Ok(SelectionProbe::Absent); }
         if count != 1 { return Ok(SelectionProbe::Blocked); }
         let range = unsafe { ranges.GetElement(0) }?;
+        if unsafe { range.CompareEndpoints(
+            TextPatternRangeEndpoint_Start, &range, TextPatternRangeEndpoint_End,
+        ) }? == 0 {
+            return Ok(SelectionProbe::Absent);
+        }
+        // A noncollapsed password selection cannot be replaced from a journal
+        // that only describes text before the caret. Never read or convert masks.
+        if is_password { return Ok(SelectionProbe::Blocked); }
         let text = read_automation_text(&range, max_chars)?;
         if text.is_empty() { return Ok(SelectionProbe::Absent); }
         if !super::convert::is_convertible_selection(&text, max_chars) || !target.is_current() {
@@ -254,8 +260,9 @@ impl ProbeState {
         if !unsafe { automation.CompareElements(&snapshot.element, &element) }?.as_bool() {
             return Ok(false);
         }
-        if !secure_input::element_status(&element).is_allowed() {
-            secure_input::clear_sensitive_context_if_current(selection.target.security_generation);
+        // A text-to-password transition invalidates this previously captured
+        // selection. It must not turn a mask into replacement text.
+        if secure_input::element_password_state(&element) == Some(true) {
             return Ok(false);
         }
         let pattern: IUIAutomationTextPattern = unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) }?;
@@ -299,10 +306,6 @@ fn same_native_selection(selection: &CapturedSelection) -> bool {
 fn probe_native(target: FocusTarget, max_chars: usize) -> SelectionProbe {
     if !target.is_current() { return SelectionProbe::Blocked; }
     let hwnd = target.focus_hwnd();
-    if secure_input::win32_password_state(hwnd) != Some(false) {
-        secure_input::clear_sensitive_context_if_current(target.security_generation);
-        return SelectionProbe::Blocked;
-    }
     let mut start = 0u32;
     let mut end = 0u32;
     // System messages below WM_USER marshal these pointers across processes.

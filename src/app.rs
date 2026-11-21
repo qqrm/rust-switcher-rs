@@ -13,12 +13,31 @@ use windows::Win32::{
     UI::WindowsAndMessaging::HMENU,
 };
 
-use crate::{config, input::hotkeys::HotkeyAction};
+use crate::{config, input::hotkeys::HotkeyAction, platform::win::secure_input::CommandContext};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RuntimeCommand {
     Hotkey(HotkeyAction),
     AutoconvertLastWord,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct PendingRuntimeCommand {
+    pub command: RuntimeCommand,
+    pub(crate) context: Option<CommandContext>,
+}
+
+impl PendingRuntimeCommand {
+    pub(crate) fn new(command: RuntimeCommand, context: Option<CommandContext>) -> Self {
+        Self { command, context }
+    }
+
+    pub(crate) fn has_current_context(
+        self,
+        is_current: impl FnOnce(CommandContext) -> bool,
+    ) -> bool {
+        self.context.is_some_and(is_current)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +228,7 @@ pub struct SequenceProgress {
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredSequenceHotkey {
     pub slot: HotkeySlot,
+    pub(crate) context: Option<CommandContext>,
 }
 
 #[derive(Debug, Default)]
@@ -269,7 +289,7 @@ pub struct AppState {
     pub deferred_sequence_hotkey: Option<DeferredSequenceHotkey>,
 
     /// Serialized runtime commands triggered by hotkeys/autoconvert.
-    pub pending_runtime_commands: VecDeque<RuntimeCommand>,
+    pub pending_runtime_commands: VecDeque<PendingRuntimeCommand>,
     pub runtime_command_running: bool,
 
     pub active_switch_layout_sequence: Option<config::HotkeySequence>,
@@ -308,7 +328,7 @@ impl AppState {
 
         self.pending_runtime_commands.retain(|command| {
             !matches!(
-                command,
+                command.command,
                 RuntimeCommand::AutoconvertLastWord
                     | RuntimeCommand::Hotkey(HotkeyAction::PauseToggle)
             )
@@ -335,7 +355,8 @@ impl AppState {
             None
         };
         self.active_hotkey_sequences.smart_last_sequence = if enabled {
-            self.applied_config.smart_hotkey_convert_last_sequence_sequence
+            self.applied_config
+                .smart_hotkey_convert_last_sequence_sequence
         } else {
             None
         };
@@ -353,7 +374,7 @@ impl AppState {
         }
         self.pending_runtime_commands.retain(|command| {
             !matches!(
-                command,
+                command.command,
                 RuntimeCommand::Hotkey(
                     HotkeyAction::SmartConvertLastWord
                         | HotkeyAction::SmartConvertLastSequence
@@ -513,6 +534,7 @@ mod tests {
             active_hotkey_sequences: HotkeySequenceValues::from_config(&cfg),
             deferred_sequence_hotkey: Some(DeferredSequenceHotkey {
                 slot: HotkeySlot::SmartLastSequence,
+                context: None,
             }),
             hotkey_sequence_progress: HotkeySequenceProgress {
                 smart_last_sequence: SequenceProgress {
@@ -529,7 +551,9 @@ mod tests {
                 RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord),
                 RuntimeCommand::AutoconvertLastWord,
             ]
-            .into(),
+            .into_iter()
+            .map(|command| PendingRuntimeCommand::new(command, None))
+            .collect(),
             autoconvert_enabled: true,
             ..Default::default()
         };
@@ -539,12 +563,28 @@ mod tests {
         assert!(state.active_hotkey_sequences.smart_last_sequence.is_none());
         assert!(state.active_hotkey_sequences.smart_selection.is_none());
         assert!(state.deferred_sequence_hotkey.is_none());
-        assert_eq!(state.hotkey_sequence_progress.smart_last_sequence.matched_chords, 0);
-        assert_eq!(state.active_hotkey_sequences.last_word, cfg.hotkey_convert_last_word_sequence);
-        assert_eq!(state.active_hotkey_sequences.pause, cfg.hotkey_pause_sequence);
+        assert_eq!(
+            state
+                .hotkey_sequence_progress
+                .smart_last_sequence
+                .matched_chords,
+            0
+        );
+        assert_eq!(
+            state.active_hotkey_sequences.last_word,
+            cfg.hotkey_convert_last_word_sequence
+        );
+        assert_eq!(
+            state.active_hotkey_sequences.pause,
+            cfg.hotkey_pause_sequence
+        );
         assert!(state.autoconvert_enabled);
         assert_eq!(
-            state.pending_runtime_commands.into_iter().collect::<Vec<_>>(),
+            state
+                .pending_runtime_commands
+                .into_iter()
+                .map(|pending| pending.command)
+                .collect::<Vec<_>>(),
             vec![
                 RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord),
                 RuntimeCommand::AutoconvertLastWord,
@@ -590,13 +630,16 @@ mod tests {
             },
             deferred_sequence_hotkey: Some(DeferredSequenceHotkey {
                 slot: HotkeySlot::Pause,
+                context: None,
             }),
             pending_runtime_commands: [
                 RuntimeCommand::AutoconvertLastWord,
                 RuntimeCommand::Hotkey(HotkeyAction::PauseToggle),
                 RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord),
             ]
-            .into(),
+            .into_iter()
+            .map(|command| PendingRuntimeCommand::new(command, None))
+            .collect(),
             ..Default::default()
         };
 
@@ -615,7 +658,7 @@ mod tests {
             state
                 .pending_runtime_commands
                 .iter()
-                .copied()
+                .map(|pending| pending.command)
                 .collect::<Vec<_>>(),
             vec![RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord)]
         );

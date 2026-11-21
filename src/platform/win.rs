@@ -33,14 +33,14 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::SetFocus,
             WindowsAndMessaging::{
-                DefWindowProcW, DestroyWindow, FindWindowW, GWLP_USERDATA, GetWindowLongPtrW, IsWindow,
-                IsWindowVisible, KillTimer, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
-                SC_CLOSE, SC_MINIMIZE, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL,
-                SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, WM_APP, WM_CLOSE,
-                WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
-                WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_PAINT,
-                WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WS_MAXIMIZEBOX,
-                WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+                DefWindowProcW, DestroyWindow, FindWindowW, GWLP_USERDATA, GetWindowLongPtrW,
+                IsWindow, IsWindowVisible, KillTimer, PostMessageW, PostQuitMessage,
+                RegisterWindowMessageW, SC_CLOSE, SC_MINIMIZE, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE,
+                SW_SHOWNORMAL, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
+                WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORDLG,
+                WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_LBUTTONDOWN,
+                WM_MBUTTONDOWN, WM_PAINT, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SIZE, WM_SYSCOMMAND,
+                WM_TIMER, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
             },
         },
     },
@@ -58,7 +58,7 @@ pub(crate) const AUTOSTART_ARG: &str = "--autostart";
 use windows::Win32::UI::WindowsAndMessaging::{WM_CTLCOLOREDIT, WM_ERASEBKGND};
 
 use crate::{
-    app::{AppState, ControlId, HotkeySlot, RuntimeCommand},
+    app::{AppState, ControlId, HotkeySlot, PendingRuntimeCommand, RuntimeCommand},
     app_identity, config,
     domain::text::{last_word::autoconvert_last_word, switch_keyboard_layout},
     input::hotkeys::{HotkeyAction, action_from_id},
@@ -379,7 +379,6 @@ fn apply_theme(hwnd: HWND, state: &mut AppState, dark: bool) {
             );
         }
     }
-
 }
 
 fn apply_config_runtime(
@@ -785,13 +784,23 @@ pub extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         }
 
         crate::platform::ui::error_notifier::WM_APP_AUTOCONVERT => {
+            let Some(context) = secure_input::take_autoconvert_context(wparam.0) else {
+                return LRESULT(0);
+            };
             if crate::input::ring_buffer::last_token_autoconverted() {
                 return LRESULT(0);
             }
 
             with_state_mut_do(hwnd, |state| {
                 if state.autoconvert_feature_enabled && state.autoconvert_enabled {
-                    enqueue_runtime_command(hwnd, state, RuntimeCommand::AutoconvertLastWord);
+                    enqueue_stamped_runtime_command(
+                        hwnd,
+                        state,
+                        PendingRuntimeCommand::new(
+                            RuntimeCommand::AutoconvertLastWord,
+                            Some(context),
+                        ),
+                    );
                 }
             });
 
@@ -915,8 +924,8 @@ pub fn request_running_instance_exit() -> windows::core::Result<bool> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let hwnd = unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) }
-        .unwrap_or_default();
+    let hwnd =
+        unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) }.unwrap_or_default();
     if hwnd.0.is_null() {
         return Ok(false);
     }
@@ -1059,22 +1068,39 @@ fn hotkey_action_enabled(state: &AppState, action: HotkeyAction) -> bool {
     }
 }
 
-fn execute_runtime_command(hwnd: HWND, state: &mut AppState, command: RuntimeCommand) {
+fn command_context_valid(
+    pending: PendingRuntimeCommand,
+    mut is_current: impl FnMut(secure_input::CommandContext) -> bool,
+    protect: impl FnOnce() -> bool,
+) -> bool {
+    pending.has_current_context(&mut is_current)
+        && protect()
+        && pending.has_current_context(is_current)
+}
+
+fn execute_runtime_command(hwnd: HWND, state: &mut AppState, pending: PendingRuntimeCommand) {
+    let command = pending.command;
     if let RuntimeCommand::Hotkey(action) = command
         && !hotkey_action_enabled(state, action)
     {
         return;
     }
 
+    // Preserve the recognition target through selection reads, journal
+    // extraction and the final input-delivery checks, including nested waits.
+    let _origin_scope = pending.context.map(secure_input::CommandContext::enter);
+
     // Pausing never needs a provider. Layout switching remains usable even when
     // text processing is blocked, including shortcuts shared with conversion.
     if !matches!(command, RuntimeCommand::Hotkey(HotkeyAction::PauseToggle))
-        && !secure_input::protect_current_context().is_allowed()
+        && !command_context_valid(pending, secure_input::CommandContext::is_current, || {
+            secure_input::protect_new_command().is_allowed()
+        })
     {
         if matches!(command, RuntimeCommand::Hotkey(HotkeyAction::SwitchLayout)) {
             let _ = switch_keyboard_layout();
         } else {
-            tracing::trace!("text conversion blocked by secure input policy");
+            tracing::trace!("text conversion cancelled after its editing context changed");
         }
         return;
     }
@@ -1106,7 +1132,25 @@ fn execute_runtime_command(hwnd: HWND, state: &mut AppState, command: RuntimeCom
 }
 
 fn enqueue_runtime_command(hwnd: HWND, state: &mut AppState, command: RuntimeCommand) {
-    state.pending_runtime_commands.push_back(command);
+    enqueue_stamped_runtime_command(
+        hwnd,
+        state,
+        PendingRuntimeCommand::new(command, secure_input::CommandContext::capture()),
+    );
+}
+
+const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
+
+pub(crate) fn enqueue_stamped_runtime_command(
+    hwnd: HWND,
+    state: &mut AppState,
+    pending: PendingRuntimeCommand,
+) {
+    if state.pending_runtime_commands.len() >= MAX_PENDING_RUNTIME_COMMANDS {
+        tracing::trace!("runtime command queue is full");
+        return;
+    }
+    state.pending_runtime_commands.push_back(pending);
 
     if state.runtime_command_running || state.pending_runtime_commands.len() != 1 {
         return;
@@ -1163,6 +1207,8 @@ fn on_hotkey(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         if !hotkey_action_enabled(state, action) {
             return;
         }
+        // RegisterHotKey supplies no original target. Native chord commands can
+        // be bound only at receipt; hook-recognized sequences enqueue earlier.
         enqueue_runtime_command(hwnd, state, RuntimeCommand::Hotkey(action));
     });
 
@@ -1400,7 +1446,7 @@ mod tests {
             state
                 .pending_runtime_commands
                 .iter()
-                .copied()
+                .map(|pending| pending.command)
                 .collect::<Vec<_>>(),
             vec![
                 RuntimeCommand::Hotkey(HotkeyAction::ConvertLastSequence),
@@ -1428,10 +1474,96 @@ mod tests {
             state
                 .pending_runtime_commands
                 .iter()
-                .copied()
+                .map(|pending| pending.command)
                 .collect::<Vec<_>>(),
             vec![RuntimeCommand::Hotkey(HotkeyAction::SwitchLayout)]
         );
         assert!(state.runtime_command_running);
+    }
+
+    #[test]
+    fn queued_command_cannot_authorize_a_new_target_during_provider_wait() {
+        let _guard = crate::input::ring_buffer::test_guard();
+        let origin = secure_input::CommandContext::for_test(
+            crate::input::ring_buffer::secure_input_generation(),
+            101,
+            1_001,
+        );
+        let pending = PendingRuntimeCommand::new(
+            RuntimeCommand::Hotkey(HotkeyAction::ConvertSelection),
+            Some(origin),
+        );
+        assert!(command_context_valid(
+            pending,
+            |context| context.is_current_with(|| true),
+            || true,
+        ));
+        assert!(!command_context_valid(
+            pending,
+            |context| context.is_current_with(|| true),
+            || {
+                // A provider can complete successfully after Tab. Its fresh
+                // result for B must not authorize the earlier command for A.
+                secure_input::invalidate_context();
+                true
+            },
+        ));
+        assert!(!command_context_valid(
+            pending,
+            |context| context.is_current_with(|| true),
+            || panic!("a stale command must not query a new field"),
+        ));
+        let fresh = PendingRuntimeCommand::new(
+            pending.command,
+            Some(secure_input::CommandContext::for_test(
+                crate::input::ring_buffer::secure_input_generation(),
+                202,
+                2_002,
+            )),
+        );
+        assert!(command_context_valid(
+            fresh,
+            |context| context.is_current_with(|| true),
+            || true,
+        ));
+        assert!(!command_context_valid(
+            fresh,
+            |context| context.is_current_with(|| false),
+            || panic!("a different native target cannot authorize the command"),
+        ));
+    }
+
+    #[test]
+    fn missing_command_origin_never_authorizes_text_conversion() {
+        let pending =
+            PendingRuntimeCommand::new(RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord), None);
+        assert!(!command_context_valid(
+            pending,
+            |_| panic!("missing origins must not be replaced with the current field"),
+            || panic!("missing origins must not authorize a provider query"),
+        ));
+    }
+
+    #[test]
+    fn runtime_queue_is_bounded_without_replacing_earlier_commands() {
+        let mut state = AppState {
+            runtime_command_running: true,
+            ..Default::default()
+        };
+        let pending =
+            PendingRuntimeCommand::new(RuntimeCommand::Hotkey(HotkeyAction::ConvertLastWord), None);
+        for _ in 0..MAX_PENDING_RUNTIME_COMMANDS + 1 {
+            enqueue_stamped_runtime_command(HWND::default(), &mut state, pending);
+        }
+        assert_eq!(
+            state.pending_runtime_commands.len(),
+            MAX_PENDING_RUNTIME_COMMANDS
+        );
+        assert!(
+            state
+                .pending_runtime_commands
+                .iter()
+                .all(|entry| *entry == pending)
+        );
     }
 }

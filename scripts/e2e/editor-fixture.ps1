@@ -38,6 +38,19 @@ public sealed class ProbeTrap : NativeWindow {
         };
     }
     protected override void WndProc(ref Message message) {
+        if (message.Msg == 0x87) {
+            base.WndProc(ref message);
+            // Receive an actual Tab key so this native-only fixture implements
+            // the same A-to-B navigation as a normal dialog's tab order.
+            message.Result = new IntPtr(message.Result.ToInt64() | 2);
+            return;
+        }
+        if (message.Msg == 0x100 && message.WParam.ToInt32() == 9) {
+            SetFocus(other);
+            System.IO.File.WriteAllText(signal, "tab");
+            message.Result = IntPtr.Zero;
+            return;
+        }
         if (message.Msg == 0x8011) {
             timer.Stop();
             mode = message.WParam.ToInt32();
