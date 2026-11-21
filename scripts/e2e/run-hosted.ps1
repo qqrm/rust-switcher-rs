@@ -230,6 +230,43 @@ function Focus-App($Window) {
     [HostedInput]::SetForegroundWindow($handle) | Out-Null
     Wait-Condition { [HostedInput]::GetForegroundWindow() -eq $handle } 'owned app foreground'
 }
+function Set-OwnedControlFocus($SourceWindow, $SourceEdit) {
+    $windowHandle = [IntPtr]$SourceWindow.Current.NativeWindowHandle
+    $editHandle = [IntPtr]$SourceEdit.Current.NativeWindowHandle
+    $deadline = [DateTime]::UtcNow.AddSeconds(4)
+    $stableSamples = 0
+    $requests = 0
+    $actualForeground = [IntPtr]::Zero
+    $actualFocus = [IntPtr]::Zero
+    $uiaFocused = $false
+    $lastError = $null
+    [HostedInput]::ShowWindow($windowHandle, 9) | Out-Null
+    do {
+        try {
+            $actualForeground = [HostedInput]::GetForegroundWindow()
+            $actualFocus = [HostedInput]::WindowFocus($windowHandle)
+            $uiaFocused = $SourceEdit.Current.HasKeyboardFocus
+            if ($actualForeground -eq $windowHandle -and $actualFocus -eq $editHandle -and $uiaFocused) {
+                $stableSamples++
+                if ($stableSamples -ge 3) { return $requests }
+            } else {
+                $stableSamples = 0
+                if ($actualForeground -ne $windowHandle) {
+                    [HostedInput]::SetForegroundWindow($windowHandle) | Out-Null
+                }
+                # Activation and UIA focus are asynchronous across processes.
+                # Reissue setup focus only; no tested key has been sent yet.
+                $SourceEdit.SetFocus()
+                $requests++
+            }
+        } catch {
+            $stableSamples = 0
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Modifier source focus setup failed: expectedWindow=$windowHandle expectedEdit=$editHandle actualForeground=$actualForeground actualFocus=$actualFocus uiaFocused=$uiaFocused requests=$requests lastError=$lastError"
+}
 function Find-Control($Window, [string]$Name) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
@@ -605,12 +642,10 @@ try {
 
     # Keep the default double-Shift coverage above, then exercise the user's
     # single-key selection binding through the real settings and restart path.
-    Focus-App $window
     $selectionHotkey = [System.Windows.Automation.AutomationElement]::FromHandle(
         [HostedInput]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 1204))
     $selectionHotkeyValue = Get-Pattern $selectionHotkey ([System.Windows.Automation.ValuePattern]::Pattern)
-    $selectionHotkey.SetFocus()
-    Wait-Condition { $selectionHotkey.Current.HasKeyboardFocus } 'selection hotkey settings focus'
+    Set-OwnedControlFocus $window $selectionHotkey | Out-Null
     Tap-Key 0x75 # F6: exactly one chord, not a modifier sequence.
     Assert-Value $selectionHotkeyValue 'F6' 'release selection hotkey captures one F6'
     Apply-Settings $window
@@ -628,13 +663,8 @@ try {
     $phrase = 'ghbdtn vbh'
     $editValue.SetValue($phrase)
     $otherValue.SetValue('untouched')
-    Focus-App $editorWindow
-    $edit.SetFocus()
     $editorHandle = [IntPtr]$editorWindow.Current.NativeWindowHandle
-    Wait-Condition {
-        $edit.Current.HasKeyboardFocus -and
-        [HostedInput]::WindowFocus($editorHandle) -eq $editHandle
-    } 'prepopulated F6 phrase focus'
+    Set-OwnedControlFocus $editorWindow $edit | Out-Null
     [HostedInput]::SelectFixtureText($editHandle, $phrase.Length)
     $f6Clipboard = [HostedInput]::GetClipboardSequenceNumber()
     if ($f6Clipboard -eq 0) { throw 'Clipboard sequence is unavailable before F6' }
