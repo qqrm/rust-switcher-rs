@@ -259,12 +259,18 @@ impl ProviderRequest {
 enum Command {
     Capture(Box<Capture>),
     /// FIFO barrier: all earlier captures finish or are invalidated first.
-    Protect(Probe),
+    Protect(Probe, ProtectionMode),
     Refresh(Probe),
     PointerRefresh {
         probe: Probe,
         point: POINT,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtectionMode {
+    NewCommand,
+    ExistingContext,
 }
 
 #[derive(Clone, Copy)]
@@ -968,24 +974,39 @@ fn process_command(
             }
             result.status
         }
-        Command::Protect(request) => {
+        Command::Protect(request, mode) => {
             let result = verdict(provider, request, ProbeSource::Focused);
-            if !validate_capture_generation(request.generation) || !request.target.is_current() {
-                return Status::Unknown;
-            }
-            if !result.status.is_allowed() || result.element_changed {
-                tracing::debug!(status = ?result.status, element_changed = result.element_changed,
-                    "secure input: conversion metadata rejected");
-                reject_probe(request);
-                return Status::Unknown;
-            }
-            result.status
+            complete_protection(request, result, mode, || request.target.is_current())
         }
         Command::Refresh(request) => refresh_context(provider, request, ProbeSource::Focused),
         Command::PointerRefresh { probe, point } => {
             refresh_context(provider, probe, ProbeSource::Pointer(point))
         }
     }
+}
+
+fn complete_protection(
+    request: Probe,
+    result: Verdict,
+    mode: ProtectionMode,
+    target_is_current: impl FnOnce() -> bool,
+) -> Status {
+    if !validate_capture_generation(request.generation) || !target_is_current() {
+        return Status::Unknown;
+    }
+    // The provider already discarded the old owner's journal before accepting
+    // this ordinary identity. A new command can now read a fresh selection.
+    // Prepared text must still reject a changed owner: a lagging native focus
+    // notification can leave its context token unchanged during that discard.
+    if !result.status.is_allowed()
+        || (result.element_changed && mode == ProtectionMode::ExistingContext)
+    {
+        tracing::debug!(status = ?result.status, element_changed = result.element_changed, ?mode,
+            "secure input: conversion metadata rejected");
+        reject_probe(request);
+        return Status::Unknown;
+    }
+    result.status
 }
 
 fn refresh_context(
@@ -1161,9 +1182,20 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
     }
 }
 
-/// Called only outside the hook. The FIFO barrier drains prior captures before
-/// a fresh bounded probe authorizes any conversion or journal restoration.
+/// Start a command before reading its selection or extracting journal text.
+/// A freshly confirmed ordinary field can be used after its old history is discarded.
+pub(crate) fn protect_new_command() -> Status {
+    protect_context(ProtectionMode::NewCommand)
+}
+
+/// Revalidate prepared text or journal restoration outside the input hook.
+/// An owner change must cancel the operation even when the new field is ordinary.
 pub(crate) fn protect_current_context() -> Status {
+    protect_context(ProtectionMode::ExistingContext)
+}
+
+/// The FIFO barrier drains earlier captures before a fresh bounded probe.
+fn protect_context(mode: ProtectionMode) -> Status {
     let Some(target) = Target::capture() else {
         reject_capture(capture_generation());
         return Status::Unknown;
@@ -1174,10 +1206,13 @@ pub(crate) fn protect_current_context() -> Status {
         .and_then(Option::as_ref)
         .and_then(|worker| {
             worker.request(
-                Command::Protect(Probe {
-                    target,
-                    generation: expected,
-                }),
+                Command::Protect(
+                    Probe {
+                        target,
+                        generation: expected,
+                    },
+                    mode,
+                ),
                 COMMAND_TIMEOUT,
             )
         })
@@ -1533,6 +1568,143 @@ mod tests {
             element_changed,
             identity: MetadataIdentity::Published(revision),
         }
+    }
+
+    fn observe_new_command_target(journal_lags: bool) -> (Probe, Verdict, u64) {
+        ring_buffer::clear_secure_input_data();
+        ring_buffer::test_switch_foreground(101, 1_000);
+        ring_buffer::push_text("previous-owner");
+        if journal_lags {
+            ring_buffer::test_switch_foreground(202, 1_100);
+            ring_buffer::push_text("other-editor");
+        }
+        let previous_context = generation();
+        let mut request = pointer_test_probe(capture_generation());
+        request.target.foreground = 101;
+        request.target.focus = 10_101;
+        let publications = IdentityPublications::new();
+        let result = probe_observed_identity(
+            true,
+            (|| validate_capture_generation(request.generation), || true),
+            || publications.publish(request.target, true, false),
+            |revision| publications.retire(request.target, revision),
+            || Status::NotSecure,
+            || true,
+            || accept_observed_identity(request, true, || {}),
+        );
+        assert_eq!(result.status, Status::NotSecure);
+        assert!(result.element_changed);
+        (request, result, previous_context)
+    }
+
+    #[test]
+    fn new_command_accepts_first_ordinary_identity_after_discarding_old_text() {
+        let _guard = ring_buffer::test_guard();
+        let (request, result, previous_context) = observe_new_command_target(false);
+        assert!(!validate_generation(previous_context));
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        assert_eq!(
+            complete_protection(request, result, ProtectionMode::NewCommand, || true),
+            Status::NotSecure
+        );
+        assert!(validate_capture_generation(request.generation));
+        // Accepting a new command must not authorize earlier key snapshots.
+        assert!(!capture_metadata_allows(None, result));
+        let MetadataIdentity::Published(revision) = result.identity else {
+            panic!("ordinary UIA identity was not published");
+        };
+        assert!(!capture_metadata_allows(Some(revision), result));
+        assert!(capture_metadata_allows(
+            Some(revision),
+            published_test_verdict(revision, false)
+        ));
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn new_command_evicts_its_old_owner_while_preserving_another_editor() {
+        let _guard = ring_buffer::test_guard();
+        let (request, result, previous_context) = observe_new_command_target(true);
+        let other_runs = ring_buffer::runs_snapshot();
+        assert!(!other_runs.is_empty());
+        assert!(validate_generation(previous_context));
+        assert_eq!(
+            complete_protection(request, result, ProtectionMode::NewCommand, || true),
+            Status::NotSecure
+        );
+        assert!(validate_generation(previous_context));
+        assert_eq!(ring_buffer::runs_snapshot(), other_runs);
+        ring_buffer::test_switch_foreground(101, 1_200);
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        ring_buffer::test_switch_foreground(202, 1_300);
+        assert_eq!(ring_buffer::runs_snapshot(), other_runs);
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn existing_context_rejects_changed_owner_even_when_its_token_survives() {
+        let _guard = ring_buffer::test_guard();
+        let (request, result, previous_context) = observe_new_command_target(true);
+        // A selection need not belong to the journal's current native target.
+        // Its token alone cannot detect this same-HWND UIA owner change.
+        assert!(validate_generation(previous_context));
+        assert_eq!(
+            complete_protection(request, result, ProtectionMode::ExistingContext, || true),
+            Status::Unknown
+        );
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn every_protection_mode_rejects_password_and_unknown_metadata() {
+        let _guard = ring_buffer::test_guard();
+        for mode in [ProtectionMode::NewCommand, ProtectionMode::ExistingContext] {
+            for status in [Status::Secure, Status::Unknown] {
+                ring_buffer::clear_secure_input_data();
+                ring_buffer::push_text("must-be-purged");
+                let request = pointer_test_probe(capture_generation());
+                let result = Verdict {
+                    status,
+                    ..published_test_verdict(1, true)
+                };
+                assert_eq!(
+                    complete_protection(request, result, mode, || true),
+                    Status::Unknown
+                );
+                assert!(!validate_capture_generation(request.generation));
+                assert!(ring_buffer::runs_snapshot().is_empty());
+            }
+        }
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn protection_cancellation_preserves_newer_or_different_targets() {
+        let _guard = ring_buffer::test_guard();
+        for mode in [ProtectionMode::NewCommand, ProtectionMode::ExistingContext] {
+            ring_buffer::clear_secure_input_data();
+            let stale = pointer_test_probe(capture_generation());
+            ring_buffer::clear_secure_input_data();
+            ring_buffer::push_text("newer-editor");
+            let current = pointer_test_probe(capture_generation());
+            let before = ring_buffer::runs_snapshot();
+            assert_eq!(
+                complete_protection(stale, Verdict::UNKNOWN, mode, || true),
+                Status::Unknown
+            );
+            assert_eq!(
+                complete_protection(current, Verdict::UNKNOWN, mode, || false),
+                Status::Unknown
+            );
+            assert!(validate_capture_generation(current.generation));
+            assert_eq!(ring_buffer::runs_snapshot(), before);
+            assert_eq!(
+                complete_protection(current, published_test_verdict(1, false), mode, || true),
+                Status::NotSecure
+            );
+            assert_eq!(ring_buffer::runs_snapshot(), before);
+        }
+        ring_buffer::clear_secure_input_data();
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]

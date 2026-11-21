@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$DebugExe,
+    [string]$ReleaseExe,
     [switch]$SecurityOnly
 )
 
@@ -14,6 +15,7 @@ if (-not [Environment]::UserInteractive -or (Get-Process -Id $PID).SessionId -eq
     throw 'An interactive Windows session is required.'
 }
 $DebugExe = (Resolve-Path -LiteralPath $DebugExe).Path
+if ($ReleaseExe -and -not $SecurityOnly) { $ReleaseExe = (Resolve-Path -LiteralPath $ReleaseExe).Path }
 $runRoot = Join-Path $env:RUNNER_TEMP ('switcher-browser-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 $results = [System.Collections.Generic.List[object]]::new()
@@ -96,6 +98,7 @@ public static class BrowserInput {
     [DllImport("user32.dll", SetLastError=true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint thread);
@@ -653,6 +656,115 @@ try {
         -SwitcherProcess $switcher -Results $results -Failures $failures
     if ($results.Count - $securityStart -ne 7) {
         throw "Expected 7 browser password cases, found $($results.Count - $securityStart)"
+    }
+    if ($ReleaseExe -and -not $SecurityOnly) {
+        # The production executable owns this phase. Stop the debug hook using
+        # the application's Exit command; the mutation-only invocation skips it.
+        if (-not [BrowserInput]::PostMessage($switcher.MainWindowHandle, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
+            -not $switcher.WaitForExit(8000) -or $switcher.ExitCode -ne 0) {
+            throw 'Debug Switcher did not exit before release browser checks'
+        }
+        $releaseProfile = Join-Path $runRoot 'release-f6-profile'
+        $releaseConfigDirectory = Join-Path $releaseProfile 'RustSwitcher'
+        New-Item -ItemType Directory -Path $releaseConfigDirectory | Out-Null
+        # Match a single F6 saved by Settings, including its legacy chord.
+        @'
+delay_ms = 100
+smarter_hotkeys_enabled = false
+autoconvert_feature_enabled = false
+
+[hotkey_convert_selection]
+mods = 0
+vk = 117
+
+[hotkey_convert_selection_sequence]
+first = { mods = 0, mods_vks = 0, vk = 117 }
+max_gap_ms = 1000
+'@ | Set-Content -LiteralPath (Join-Path $releaseConfigDirectory 'config.json') -Encoding utf8NoBOM
+        $releaseInfo = [System.Diagnostics.ProcessStartInfo]::new($ReleaseExe)
+        $releaseInfo.UseShellExecute = $false
+        $releaseInfo.CreateNoWindow = $true
+        $releaseInfo.Environment['APPDATA'] = $releaseProfile
+        foreach ($variable in @('RUST_SWITCHER_E2E_PLAYGROUND', 'RUST_SWITCHER_E2E_ALLOW_INJECTED', 'RUST_SWITCHER_E2E_TARGET_PID')) {
+            $releaseInfo.Environment.Remove($variable) | Out-Null
+        }
+        $release = [System.Diagnostics.Process]::Start($releaseInfo)
+        $ownedProcesses.Add($release)
+        Wait-Browser {
+            if ($release.HasExited) { throw "Release Switcher exited during startup: $($release.ExitCode)" }
+            $release.Refresh()
+            $release.MainWindowHandle -ne [IntPtr]::Zero
+        } 'release Switcher window for F6'
+        # Read only the selected range; never repair it or focus after F6.
+        $selectionProbe = @'
+(() => {
+  const element = document.getElementById('a');
+  if (!element.isContentEditable) return {
+    complete: element.selectionStart === 0 && element.selectionEnd === element.value.length,
+    text: element.value.slice(element.selectionStart, element.selectionEnd)
+  };
+  const selection = document.getSelection();
+  return {
+    complete: selection.rangeCount === 1 && element.contains(selection.anchorNode) &&
+      element.contains(selection.focusNode) && selection.toString() === element.textContent,
+    text: selection.toString()
+  };
+})()
+'@
+        foreach ($kind in @('input', 'editable')) {
+            $record = [ordered]@{name = "release-f6-$kind"; kind = $kind; mode = 'release-f6';
+                conversions = @(); finalFocus = $null; error = $null}
+            try {
+                $expectedOther = @{}
+                foreach ($sessionId in @('a', 'b')) {
+                    Read-Browser $sessions[$sessionId] "fixture.reset('$kind')" | Out-Null
+                    Set-BrowserEnglish $sessions[$sessionId]
+                    $values = Read-Browser $sessions[$sessionId] 'fixture.values()'
+                    foreach ($field in @('a', 'b', 'guard')) {
+                        if ($sessionId -ne 'a' -or $field -ne 'a') { $expectedOther["$sessionId/$field"] = $values.$field }
+                    }
+                }
+                $session = $sessions.a
+                Read-Browser $session "fixture.set('a', 'ghbdtn vbh')" | Out-Null
+                Focus-BrowserEditor $session 'a'
+                if (-not (Read-Browser $session "fixture.select('a', true)")) { throw 'Initial F6 selection lost focus' }
+                $nativeBefore = [BrowserInput]::Snapshot($session.Handle)
+                if ([BrowserInput]::ClassOf([IntPtr]$nativeBefore.focus) -match '^(Edit|RichEdit.*|RICHEDIT.*)$') {
+                    throw 'Release browser F6 must exercise UIA rather than the native Edit fallback'
+                }
+                $clipboardBefore = [BrowserInput]::GetClipboardSequenceNumber()
+                if ($clipboardBefore -eq 0) { throw 'Clipboard sequence is unavailable before browser F6' }
+                foreach ($expected in @('привет мир', 'ghbdtn vbh')) {
+                    Tap-BrowserKey 0x75
+                    Wait-Browser { (Read-Browser $session 'fixture.values()').a -ceq $expected } 'single F6 converts the complete browser phrase'
+                    Wait-Browser {
+                        $selection = Read-Browser $session $selectionProbe
+                        $selection.complete -eq $true -and $selection.text -ceq $expected
+                    } 'release F6 restores the full browser selection'
+                    Start-Sleep -Milliseconds 150
+                    $selection = Read-Browser $session $selectionProbe
+                    if ((Read-Browser $session 'fixture.values()').a -cne $expected -or
+                        $selection.complete -ne $true -or $selection.text -cne $expected) {
+                        throw 'One F6 did not produce one stable browser phrase conversion and reselection'
+                    }
+                    $record.finalFocus = Get-BrowserFocusSnapshot $session
+                    Assert-BrowserTargetFocus $nativeBefore $record.finalFocus 'a' ($session.Handle.ToInt64())
+                    Assert-BrowserOtherFields $sessions $expectedOther
+                    if ([BrowserInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Browser F6 changed the clipboard' }
+                    $record.conversions += $expected
+                }
+            } catch {
+                $record.error = $_.Exception.Message
+                $failures.Add("$($record.name): $($record.error)")
+            }
+            $results.Add([pscustomobject]$record)
+            $record | ConvertTo-Json -Depth 6 -Compress | Write-Output
+            if ($null -eq $record.error) { Write-Output "PASS: $($record.name)" } else { Write-Output "FAIL: $($record.name)" }
+        }
+        if (-not [BrowserInput]::PostMessage($release.MainWindowHandle, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
+            -not $release.WaitForExit(8000) -or $release.ExitCode -ne 0) {
+            throw 'Release Switcher did not exit after browser F6 checks'
+        }
     }
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
 } catch {

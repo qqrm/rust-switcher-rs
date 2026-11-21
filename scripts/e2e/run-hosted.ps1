@@ -602,6 +602,60 @@ try {
         Assert-Value $editValue 'привет' "release conversion recovers after adversarial mode $mode"
         Wait-Condition { [HostedInput]::HasSelection($editHandle, 6) } 'adversarial recovery input completed'
     }
+
+    # Keep the default double-Shift coverage above, then exercise the user's
+    # single-key selection binding through the real settings and restart path.
+    Focus-App $window
+    $selectionHotkey = [System.Windows.Automation.AutomationElement]::FromHandle(
+        [HostedInput]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 1204))
+    $selectionHotkeyValue = Get-Pattern $selectionHotkey ([System.Windows.Automation.ValuePattern]::Pattern)
+    $selectionHotkey.SetFocus()
+    Wait-Condition { $selectionHotkey.Current.HasKeyboardFocus } 'selection hotkey settings focus'
+    Tap-Key 0x75 # F6: exactly one chord, not a modifier sequence.
+    Assert-Value $selectionHotkeyValue 'F6' 'release selection hotkey captures one F6'
+    Apply-Settings $window
+    Quit-Owned $release $window
+    $release = Start-Switcher $ReleaseExe $releaseProfile $false
+    Wait-Condition { $null -ne (Find-AppWindow $release) } 'release F6 settings restart'
+    $window = Find-AppWindow $release
+    $selectionHotkey = [System.Windows.Automation.AutomationElement]::FromHandle(
+        [HostedInput]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 1204))
+    $selectionHotkeyValue = Get-Pattern $selectionHotkey ([System.Windows.Automation.ValuePattern]::Pattern)
+    Assert-Value $selectionHotkeyValue 'F6' 'release selection F6 binding survives restart'
+
+    # Prepopulated two-word text cannot be recovered from the typing journal.
+    # Do not retry the hotkey or restore focus/selection after either press.
+    $phrase = 'ghbdtn vbh'
+    $editValue.SetValue($phrase)
+    $otherValue.SetValue('untouched')
+    Focus-App $editorWindow
+    $edit.SetFocus()
+    $editorHandle = [IntPtr]$editorWindow.Current.NativeWindowHandle
+    Wait-Condition {
+        $edit.Current.HasKeyboardFocus -and
+        [HostedInput]::WindowFocus($editorHandle) -eq $editHandle
+    } 'prepopulated F6 phrase focus'
+    [HostedInput]::SelectFixtureText($editHandle, $phrase.Length)
+    $f6Clipboard = [HostedInput]::GetClipboardSequenceNumber()
+    if ($f6Clipboard -eq 0) { throw 'Clipboard sequence is unavailable before F6' }
+    foreach ($expected in @('привет мир', $phrase)) {
+        Tap-Key 0x75
+        Wait-Condition { $editValue.Current.Value -ceq $expected } 'one F6 converts the complete selected phrase'
+        Wait-Condition { [HostedInput]::HasSelection($editHandle, $expected.Length) } 'F6 restores the complete selection'
+        # Catch a duplicate queued command reversing a briefly correct result.
+        Start-Sleep -Milliseconds 150
+        if ($editValue.Current.Value -cne $expected -or
+            -not [HostedInput]::HasSelection($editHandle, $expected.Length)) {
+            throw 'One F6 did not produce one stable phrase conversion and reselection'
+        }
+        if ([HostedInput]::GetForegroundWindow() -ne $editorHandle -or
+            [HostedInput]::WindowFocus($editorHandle) -ne $editHandle) {
+            throw 'F6 moved focus away from the selected phrase'
+        }
+        if ($otherValue.Current.Value -cne 'untouched') { throw 'F6 changed the other editor field' }
+        if ([HostedInput]::GetClipboardSequenceNumber() -ne $f6Clipboard) { throw 'F6 changed the clipboard' }
+        Record-Pass "release F6 converts exactly once with selection and focus preserved: $expected"
+    }
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     if (-not $editor.WaitForExit(5000)) { throw 'Isolated editor did not close' }
