@@ -178,7 +178,7 @@ jobs:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: ./scripts/e2e/run-hosted.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
 
-      - name: Verify browser Double Alt, password protection and release F6
+      - name: Verify browser Double Alt, password protection and release Double Shift
         if: ${{ !cancelled() && steps.desktop_build.outcome == 'success' }}
         timeout-minutes: 8
         shell: pwsh

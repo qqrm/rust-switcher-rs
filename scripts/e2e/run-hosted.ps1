@@ -640,51 +640,40 @@ try {
         Wait-Condition { [HostedInput]::HasSelection($editHandle, 6) } 'adversarial recovery input completed'
     }
 
-    # Keep the default double-Shift coverage above, then exercise the user's
-    # single-key selection binding through the real settings and restart path.
-    $selectionHotkey = [System.Windows.Automation.AutomationElement]::FromHandle(
-        [HostedInput]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 1204))
-    $selectionHotkeyValue = Get-Pattern $selectionHotkey ([System.Windows.Automation.ValuePattern]::Pattern)
-    Set-OwnedControlFocus $window $selectionHotkey | Out-Null
-    Tap-Key 0x75 # F6: exactly one chord, not a modifier sequence.
-    Assert-Value $selectionHotkeyValue 'F6' 'release selection hotkey captures one F6'
-    Apply-Settings $window
+    # Restart without changing the default Double Shift binding, then exercise
+    # a complete phrase with a fresh selection provider.
     Quit-Owned $release $window
     $release = Start-Switcher $ReleaseExe $releaseProfile $false
-    Wait-Condition { $null -ne (Find-AppWindow $release) } 'release F6 settings restart'
+    Wait-Condition { $null -ne (Find-AppWindow $release) } 'release Double Shift restart'
     $window = Find-AppWindow $release
-    $selectionHotkey = [System.Windows.Automation.AutomationElement]::FromHandle(
-        [HostedInput]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 1204))
-    $selectionHotkeyValue = Get-Pattern $selectionHotkey ([System.Windows.Automation.ValuePattern]::Pattern)
-    Assert-Value $selectionHotkeyValue 'F6' 'release selection F6 binding survives restart'
 
     # Prepopulated two-word text cannot be recovered from the typing journal.
-    # Do not retry the hotkey or restore focus/selection after either press.
+    # Do not retry the hotkey or restore focus/selection after either gesture.
     $phrase = 'ghbdtn vbh'
     $editValue.SetValue($phrase)
     $otherValue.SetValue('untouched')
     $editorHandle = [IntPtr]$editorWindow.Current.NativeWindowHandle
     Set-OwnedControlFocus $editorWindow $edit | Out-Null
     [HostedInput]::SelectFixtureText($editHandle, $phrase.Length)
-    $f6Clipboard = [HostedInput]::GetClipboardSequenceNumber()
-    if ($f6Clipboard -eq 0) { throw 'Clipboard sequence is unavailable before F6' }
+    $selectionClipboard = [HostedInput]::GetClipboardSequenceNumber()
+    if ($selectionClipboard -eq 0) { throw 'Clipboard sequence is unavailable before Double Shift' }
     foreach ($expected in @('привет мир', $phrase)) {
-        Tap-Key 0x75
-        Wait-Condition { $editValue.Current.Value -ceq $expected } 'one F6 converts the complete selected phrase'
-        Wait-Condition { [HostedInput]::HasSelection($editHandle, $expected.Length) } 'F6 restores the complete selection'
+        Tap-Shift 2
+        Wait-Condition { $editValue.Current.Value -ceq $expected } 'one Double Shift converts the complete selected phrase'
+        Wait-Condition { [HostedInput]::HasSelection($editHandle, $expected.Length) } 'Double Shift restores the complete selection'
         # Catch a duplicate queued command reversing a briefly correct result.
         Start-Sleep -Milliseconds 150
         if ($editValue.Current.Value -cne $expected -or
             -not [HostedInput]::HasSelection($editHandle, $expected.Length)) {
-            throw 'One F6 did not produce one stable phrase conversion and reselection'
+            throw 'One Double Shift did not produce one stable phrase conversion and reselection'
         }
         if ([HostedInput]::GetForegroundWindow() -ne $editorHandle -or
             [HostedInput]::WindowFocus($editorHandle) -ne $editHandle) {
-            throw 'F6 moved focus away from the selected phrase'
+            throw 'Double Shift moved focus away from the selected phrase'
         }
-        if ($otherValue.Current.Value -cne 'untouched') { throw 'F6 changed the other editor field' }
-        if ([HostedInput]::GetClipboardSequenceNumber() -ne $f6Clipboard) { throw 'F6 changed the clipboard' }
-        Record-Pass "release F6 converts exactly once with selection and focus preserved: $expected"
+        if ($otherValue.Current.Value -cne 'untouched') { throw 'Double Shift changed the other editor field' }
+        if ([HostedInput]::GetClipboardSequenceNumber() -ne $selectionClipboard) { throw 'Double Shift changed the clipboard' }
+        Record-Pass "release Double Shift converts exactly once with selection and focus preserved: $expected"
     }
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null

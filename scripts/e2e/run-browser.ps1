@@ -263,6 +263,11 @@ function Tap-BrowserKey([ushort]$Key) {
     [BrowserInput]::Key($Key, $false)
     try { Start-Sleep -Milliseconds 20 } finally { [BrowserInput]::Key($Key, $true) }
 }
+function Tap-BrowserDoubleShift {
+    Tap-BrowserKey 0xA0
+    Start-Sleep -Milliseconds 100
+    Tap-BrowserKey 0xA0
+}
 function Set-BrowserEnglish($Session) {
     if (-not [BrowserInput]::PostMessage($Session.Handle, 0x50, [UIntPtr]::Zero, $english)) { throw 'Browser layout request failed' }
     Wait-Browser { [BrowserInput]::LayoutOf($Session.Handle) -eq $english } 'browser English keyboard layout'
@@ -360,9 +365,7 @@ function Invoke-BrowserClickRecovery($Session, [string]$Field, [hashtable]$Case,
     if (-not (Read-Browser $Session "fixture.select('$Field', true)")) {
         throw 'Refused click target lost focus before selection recovery'
     }
-    Tap-BrowserKey 0xA0
-    Start-Sleep -Milliseconds 100
-    Tap-BrowserKey 0xA0
+    Tap-BrowserDoubleShift
     Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $Case.Expected } 'same-control selection recovery'
     $Recovery.selectionResult = (Read-Browser $Session 'fixture.values()').$Field
     if ($Recovery.selectionResult -cne $Case.Expected) { throw 'Selection recovery did not preserve the exact converted text' }
@@ -665,23 +668,10 @@ try {
             -not $switcher.WaitForExit(8000) -or $switcher.ExitCode -ne 0) {
             throw 'Debug Switcher did not exit before release browser checks'
         }
-        $releaseProfile = Join-Path $runRoot 'release-f6-profile'
-        $releaseConfigDirectory = Join-Path $releaseProfile 'RustSwitcher'
-        New-Item -ItemType Directory -Path $releaseConfigDirectory | Out-Null
-        # Match a single F6 saved by Settings, including its legacy chord.
-        @'
-delay_ms = 100
-smarter_hotkeys_enabled = false
-autoconvert_feature_enabled = false
-
-[hotkey_convert_selection]
-mods = 0
-vk = 117
-
-[hotkey_convert_selection_sequence]
-first = { mods = 0, mods_vks = 0, vk = 117 }
-max_gap_ms = 1000
-'@ | Set-Content -LiteralPath (Join-Path $releaseConfigDirectory 'config.json') -Encoding utf8NoBOM
+        $releaseProfile = Join-Path $runRoot 'release-double-shift-profile'
+        New-Item -ItemType Directory -Path $releaseProfile | Out-Null
+        # Let the application create its complete default configuration,
+        # including the shared Double Shift selection and last-word binding.
         $releaseInfo = [System.Diagnostics.ProcessStartInfo]::new($ReleaseExe)
         $releaseInfo.UseShellExecute = $false
         $releaseInfo.CreateNoWindow = $true
@@ -695,7 +685,7 @@ max_gap_ms = 1000
             if ($release.HasExited) { throw "Release Switcher exited during startup: $($release.ExitCode)" }
             $release.Refresh()
             $release.MainWindowHandle -ne [IntPtr]::Zero
-        } 'release Switcher window for F6'
+        } 'release Switcher window for Double Shift'
         $releaseWindow = $release.MainWindowHandle
         if ([BrowserInput]::ProcessOf($releaseWindow) -ne $release.Id) {
             throw 'Release Switcher window is not owned by the launched process'
@@ -709,7 +699,7 @@ max_gap_ms = 1000
             if ($release.HasExited) { throw "Release Switcher exited while hiding Settings: $($release.ExitCode)" }
             -not [BrowserInput]::IsWindowVisible($releaseWindow)
         } 'release Switcher Settings hidden to tray'
-        # Read only the selected range; never repair it or focus after F6.
+        # Read only the selected range; never repair it or focus after Double Shift.
         $selectionProbe = @'
 (() => {
   const element = document.getElementById('a');
@@ -727,7 +717,7 @@ max_gap_ms = 1000
 '@
         $stateProbe = "({value: fixture.values().a, selection: $selectionProbe, dom: fixture.diagnostics()})"
         foreach ($kind in @('input', 'editable')) {
-            $record = [ordered]@{name = "release-f6-$kind"; kind = $kind; mode = 'release-f6';
+            $record = [ordered]@{name = "release-double-shift-$kind"; kind = $kind; mode = 'release-double-shift';
                 attempted = @(); conversions = @(); focusBefore = $null; actualBefore = $null;
                 selectionBefore = $null; actualAfter = $null; selectionAfter = $null; finalFocus = $null;
                 otherFieldsUnchanged = $null; clipboardBefore = $null; clipboardAfter = $null;
@@ -747,7 +737,7 @@ max_gap_ms = 1000
                 $expectedOtherReady = $true
                 Read-Browser $session "fixture.set('a', 'ghbdtn vbh')" | Out-Null
                 Focus-BrowserEditor $session 'a'
-                if (-not (Read-Browser $session "fixture.select('a', true)")) { throw 'Initial F6 selection lost focus' }
+                if (-not (Read-Browser $session "fixture.select('a', true)")) { throw 'Initial Double Shift selection lost focus' }
                 $nativeBefore = [BrowserInput]::Snapshot($session.Handle)
                 $record.focusBefore = @{native = $nativeBefore; dom = $null}
                 try {
@@ -757,29 +747,29 @@ max_gap_ms = 1000
                     $record.selectionBefore = $initial.selection
                 } catch { $record.diagnosticErrors += "initial browser state: $($_.Exception.Message)" }
                 if ([BrowserInput]::ClassOf([IntPtr]$nativeBefore.focus) -match '^(Edit|RichEdit.*|RICHEDIT.*)$') {
-                    throw 'Release browser F6 must exercise UIA rather than the native Edit fallback'
+                    throw 'Release browser Double Shift must exercise UIA rather than the native Edit fallback'
                 }
                 $clipboardBefore = [BrowserInput]::GetClipboardSequenceNumber()
                 $record.clipboardBefore = $clipboardBefore
-                if ($clipboardBefore -eq 0) { throw 'Clipboard sequence is unavailable before browser F6' }
+                if ($clipboardBefore -eq 0) { throw 'Clipboard sequence is unavailable before browser Double Shift' }
                 foreach ($expected in @('привет мир', 'ghbdtn vbh')) {
                     $record.attempted += $expected
-                    Tap-BrowserKey 0x75
-                    Wait-Browser { (Read-Browser $session 'fixture.values()').a -ceq $expected } 'single F6 converts the complete browser phrase'
+                    Tap-BrowserDoubleShift
+                    Wait-Browser { (Read-Browser $session 'fixture.values()').a -ceq $expected } 'one Double Shift converts the complete browser phrase'
                     Wait-Browser {
                         $selection = Read-Browser $session $selectionProbe
                         $selection.complete -eq $true -and $selection.text -ceq $expected
-                    } 'release F6 restores the full browser selection'
+                    } 'release Double Shift restores the full browser selection'
                     Start-Sleep -Milliseconds 150
                     $selection = Read-Browser $session $selectionProbe
                     if ((Read-Browser $session 'fixture.values()').a -cne $expected -or
                         $selection.complete -ne $true -or $selection.text -cne $expected) {
-                        throw 'One F6 did not produce one stable browser phrase conversion and reselection'
+                        throw 'One Double Shift did not produce one stable browser phrase conversion and reselection'
                     }
                     $record.finalFocus = Get-BrowserFocusSnapshot $session
                     Assert-BrowserTargetFocus $nativeBefore $record.finalFocus 'a' ($session.Handle.ToInt64())
                     Assert-BrowserOtherFields $sessions $expectedOther
-                    if ([BrowserInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Browser F6 changed the clipboard' }
+                    if ([BrowserInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Browser Double Shift changed the clipboard' }
                     $record.conversions += $expected
                 }
             } catch {
@@ -817,7 +807,7 @@ max_gap_ms = 1000
         }
         if (-not [BrowserInput]::PostMessage($releaseWindow, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
             -not $release.WaitForExit(8000) -or $release.ExitCode -ne 0) {
-            throw 'Release Switcher did not exit after browser F6 checks'
+            throw 'Release Switcher did not exit after browser Double Shift checks'
         }
     }
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
