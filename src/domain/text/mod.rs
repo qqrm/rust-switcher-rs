@@ -14,3 +14,5 @@ mod smart;
 
 #[cfg(windows)]
 pub use convert::{switch_keyboard_layout, wait_shift_released};
+#[cfg(windows)]
+pub(crate) use selection_probe::warm as warm_selection_probe;

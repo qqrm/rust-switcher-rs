@@ -1,4 +1,4 @@
-use std::{sync::OnceLock, time::Duration};
+use std::{sync::OnceLock, time::{Duration, Instant}};
 
 use windows::{
     Win32::{
@@ -93,7 +93,10 @@ pub(super) struct CapturedSelection {
 impl CapturedSelection {
     /// Validate both target identity and the exact selection after the conversion delay.
     pub(super) fn is_current(&self) -> bool {
-        if !self.target.is_current() { return false; }
+        if !self.target.is_current() {
+            tracing::debug!(operation = "validate", reason = "target_changed", "selection probe cancelled");
+            return false;
+        }
         if self.target.is_own_native_edit() {
             return same_native_selection(self);
         }
@@ -146,6 +149,22 @@ struct ProbeWorker {
 }
 
 impl ProbeWorker {
+    fn new() -> Self {
+        let status = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let apartment = ComGuard(status.is_ok());
+        let mut state = ProbeState::default();
+        if apartment.0 {
+            // Prepare the client only. Startup must never inspect a focused
+            // element, a password property or any selected text.
+            if let Err(error) = state.initialize_automation() {
+                tracing::debug!(hresult = ?error.code(), "selection probe automation initialization failed");
+            }
+        } else {
+            tracing::debug!(hresult = ?status, "selection probe apartment initialization failed");
+        }
+        Self { state, apartment }
+    }
+
     fn process(&mut self, command: Command) -> Response {
         match command {
             Command::Capture(target, max_chars) if self.apartment.0 => {
@@ -160,21 +179,55 @@ impl ProbeWorker {
     }
 }
 
-fn request(command: Command) -> Option<Response> {
+fn worker() -> Option<&'static BoundedWorker<Command, Response>> {
     static WORKER: OnceLock<Option<BoundedWorker<Command, Response>>> = OnceLock::new();
     WORKER.get_or_init(|| {
         BoundedWorker::start("selection-probe", || {
-            let mut worker = ProbeWorker {
-                state: ProbeState::default(),
-                apartment: ComGuard(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok()),
-            };
+            let mut worker = ProbeWorker::new();
             move |command| worker.process(command)
         }).ok()
-    }).as_ref()?.request(command, PROBE_TIMEOUT)
+    }).as_ref()
+}
+
+/// Start the persistent MTA without waiting for COM or accessing a text target.
+/// Requests keep their normal bound if initialization is still busy or hung.
+pub(crate) fn warm() {
+    let _ = worker();
+}
+
+fn request(command: Command) -> Option<Response> {
+    let operation = match &command {
+        Command::Capture(..) => "capture",
+        Command::Validate(..) => "validate",
+    };
+    let Some(worker) = worker() else {
+        tracing::debug!(operation, reason = "worker_unavailable", "selection probe cancelled");
+        return None;
+    };
+    let started = Instant::now();
+    let response = worker.request(command, PROBE_TIMEOUT);
+    if let Some(response) = response.as_ref() {
+        let outcome = match response {
+            Response::Probe(SelectionProbe::Absent) => "absent",
+            Response::Probe(SelectionProbe::Selected(_)) => "selected",
+            Response::Probe(SelectionProbe::Blocked) => "blocked",
+            Response::Valid(true) => "valid",
+            Response::Valid(false) => "invalid",
+        };
+        tracing::debug!(operation, outcome, elapsed_ms = started.elapsed().as_millis(), "selection probe completed");
+    } else {
+        let elapsed = started.elapsed();
+        let reason = if elapsed >= PROBE_TIMEOUT { "request_deadline_elapsed" } else { "request_unavailable" };
+        tracing::debug!(operation, reason, elapsed_ms = elapsed.as_millis(), "selection probe cancelled");
+    }
+    response
 }
 
 pub(super) fn probe_selection(max_chars: usize) -> SelectionProbe {
-    let Some(target) = FocusTarget::capture() else { return SelectionProbe::Blocked; };
+    let Some(target) = FocusTarget::capture() else {
+        tracing::debug!(operation = "capture", reason = "target_unavailable", "selection probe cancelled");
+        return SelectionProbe::Blocked;
+    };
     // Our known standard Edit is on this UI thread. Calling it directly avoids
     // waiting for a worker which would in turn wait for this same message loop.
     if target.process == unsafe { GetCurrentProcessId() } {
@@ -188,29 +241,47 @@ pub(super) fn probe_selection(max_chars: usize) -> SelectionProbe {
     }
     match request(Command::Capture(target, max_chars)) {
         Some(Response::Probe(result)) if target.is_current() => result,
+        Some(Response::Probe(_)) => {
+            tracing::debug!(operation = "capture", reason = "target_changed", "selection probe cancelled");
+            SelectionProbe::Blocked
+        }
         _ => SelectionProbe::Blocked,
     }
 }
 
 impl ProbeState {
-    fn capture(&mut self, target: FocusTarget, max_chars: usize) -> SelectionProbe {
-        self.snapshot = None;
-        if !target.is_current() { return SelectionProbe::Blocked; }
-        if is_native_edit(target.focus_hwnd()) {
-            return probe_native(target, max_chars);
-        }
-        self.capture_automation(target, max_chars).unwrap_or(SelectionProbe::Blocked)
-    }
-
-    fn capture_automation(&mut self, target: FocusTarget, max_chars: usize) -> windows::core::Result<SelectionProbe> {
+    fn initialize_automation(&mut self) -> windows::core::Result<()> {
         if self.automation.is_none() {
             self.automation = Some(unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }?);
         }
+        Ok(())
+    }
+
+    fn capture(&mut self, target: FocusTarget, max_chars: usize) -> SelectionProbe {
+        self.snapshot = None;
+        if !target.is_current() {
+            tracing::debug!(operation = "capture", reason = "target_changed", "selection probe cancelled");
+            return SelectionProbe::Blocked;
+        }
+        if is_native_edit(target.focus_hwnd()) {
+            return probe_native(target, max_chars);
+        }
+        self.capture_automation(target, max_chars).unwrap_or_else(|error| {
+            tracing::debug!(operation = "capture", hresult = ?error.code(), "selection probe UIA call failed");
+            SelectionProbe::Blocked
+        })
+    }
+
+    fn capture_automation(&mut self, target: FocusTarget, max_chars: usize) -> windows::core::Result<SelectionProbe> {
+        // Retain bounded recovery if best-effort startup activation failed.
+        self.initialize_automation()?;
         let Some(automation) = self.automation.as_ref() else { return Ok(SelectionProbe::Blocked); };
         let element = unsafe { automation.GetFocusedElement() }?;
         // Check the provider's explicit password property before asking it for text.
         // A missing property must not become a default FALSE authorization.
-        if !secure_input::element_status(&element).is_allowed() {
+        let status = secure_input::element_status(&element);
+        if !status.is_allowed() {
+            tracing::debug!(operation = "capture", ?status, "selection probe rejected password metadata");
             secure_input::clear_sensitive_context_if_current(target.security_generation);
             return Ok(SelectionProbe::Blocked);
         }
@@ -218,7 +289,10 @@ impl ProbeState {
             Ok(pattern) => pattern,
             // Preserve fallback for an explicitly unsupported pattern only.
             // Provider failures must never authorize last-word deletion.
-            Err(error) => return Ok(pattern_failure(error.code())),
+            Err(error) => {
+                tracing::debug!(operation = "capture", hresult = ?error.code(), "selection probe text pattern unavailable");
+                return Ok(pattern_failure(error.code()));
+            }
         };
         let ranges = unsafe { pattern.GetSelection() }?;
         let count = unsafe { ranges.Length() }?;
@@ -238,11 +312,17 @@ impl ProbeState {
     }
 
     fn validate(&self, selection: &CapturedSelection) -> bool {
-        if !selection.target.is_current() { return false; }
+        if !selection.target.is_current() {
+            tracing::debug!(operation = "validate", reason = "target_changed", "selection probe cancelled");
+            return false;
+        }
         if matches!(selection.identity, SelectionIdentity::Native { .. }) {
             return same_native_selection(selection);
         }
-        self.validate_automation(selection).unwrap_or(false) && selection.target.is_current()
+        self.validate_automation(selection).unwrap_or_else(|error| {
+            tracing::debug!(operation = "validate", hresult = ?error.code(), "selection probe UIA call failed");
+            false
+        }) && selection.target.is_current()
     }
 
     fn validate_automation(&self, selection: &CapturedSelection) -> windows::core::Result<bool> {
@@ -252,9 +332,12 @@ impl ProbeState {
         if selection.identity != SelectionIdentity::Automation(snapshot.generation) { return Ok(false); }
         let element = unsafe { automation.GetFocusedElement() }?;
         if !unsafe { automation.CompareElements(&snapshot.element, &element) }?.as_bool() {
+            tracing::debug!(operation = "validate", reason = "uia_owner_changed", "selection probe cancelled");
             return Ok(false);
         }
-        if !secure_input::element_status(&element).is_allowed() {
+        let status = secure_input::element_status(&element);
+        if !status.is_allowed() {
+            tracing::debug!(operation = "validate", ?status, "selection probe rejected password metadata");
             secure_input::clear_sensitive_context_if_current(selection.target.security_generation);
             return Ok(false);
         }
@@ -356,6 +439,31 @@ unsafe fn bounded_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
 mod tests {
     use super::*;
     use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL};
+
+    #[test]
+    fn worker_initializes_automation_before_any_selection_request() {
+        let (completed, initialized) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let worker = ProbeWorker::new();
+            let state = (
+                worker.apartment.0,
+                worker.state.automation.is_some(),
+                worker.state.snapshot.is_none(),
+                worker.state.generation,
+            );
+            drop(worker);
+            let _ = completed.send(state);
+        });
+        match initialized.recv_timeout(Duration::from_secs(5)) {
+            Ok((apartment, automation, no_snapshot, generation)) => {
+                assert!(apartment);
+                assert!(automation);
+                assert!(no_snapshot);
+                assert_eq!(generation, 0);
+            }
+            Err(error) => panic!("selection worker initialization did not finish: {error}"),
+        }
+    }
 
     #[test]
     fn provider_errors_do_not_authorize_last_word_fallback() {

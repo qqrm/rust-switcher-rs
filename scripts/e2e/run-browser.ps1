@@ -711,9 +711,15 @@ max_gap_ms = 1000
   };
 })()
 '@
+        $stateProbe = "({value: fixture.values().a, selection: $selectionProbe, dom: fixture.diagnostics()})"
         foreach ($kind in @('input', 'editable')) {
             $record = [ordered]@{name = "release-f6-$kind"; kind = $kind; mode = 'release-f6';
-                conversions = @(); finalFocus = $null; error = $null}
+                attempted = @(); conversions = @(); focusBefore = $null; actualBefore = $null;
+                selectionBefore = $null; actualAfter = $null; selectionAfter = $null; finalFocus = $null;
+                otherFieldsUnchanged = $null; clipboardBefore = $null; clipboardAfter = $null;
+                clipboardUnchanged = $null; diagnosticErrors = @(); error = $null}
+            $session = $sessions.a
+            $expectedOtherReady = $false
             try {
                 $expectedOther = @{}
                 foreach ($sessionId in @('a', 'b')) {
@@ -724,17 +730,26 @@ max_gap_ms = 1000
                         if ($sessionId -ne 'a' -or $field -ne 'a') { $expectedOther["$sessionId/$field"] = $values.$field }
                     }
                 }
-                $session = $sessions.a
+                $expectedOtherReady = $true
                 Read-Browser $session "fixture.set('a', 'ghbdtn vbh')" | Out-Null
                 Focus-BrowserEditor $session 'a'
                 if (-not (Read-Browser $session "fixture.select('a', true)")) { throw 'Initial F6 selection lost focus' }
                 $nativeBefore = [BrowserInput]::Snapshot($session.Handle)
+                $record.focusBefore = @{native = $nativeBefore; dom = $null}
+                try {
+                    $initial = Read-Browser $session $stateProbe
+                    $record.focusBefore.dom = $initial.dom
+                    $record.actualBefore = $initial.value
+                    $record.selectionBefore = $initial.selection
+                } catch { $record.diagnosticErrors += "initial browser state: $($_.Exception.Message)" }
                 if ([BrowserInput]::ClassOf([IntPtr]$nativeBefore.focus) -match '^(Edit|RichEdit.*|RICHEDIT.*)$') {
                     throw 'Release browser F6 must exercise UIA rather than the native Edit fallback'
                 }
                 $clipboardBefore = [BrowserInput]::GetClipboardSequenceNumber()
+                $record.clipboardBefore = $clipboardBefore
                 if ($clipboardBefore -eq 0) { throw 'Clipboard sequence is unavailable before browser F6' }
                 foreach ($expected in @('привет мир', 'ghbdtn vbh')) {
+                    $record.attempted += $expected
                     Tap-BrowserKey 0x75
                     Wait-Browser { (Read-Browser $session 'fixture.values()').a -ceq $expected } 'single F6 converts the complete browser phrase'
                     Wait-Browser {
@@ -756,6 +771,31 @@ max_gap_ms = 1000
             } catch {
                 $record.error = $_.Exception.Message
                 $failures.Add("$($record.name): $($record.error)")
+            } finally {
+                # Keep the original failure and observe the unrepaired target,
+                # including a timeout before the first successful conversion.
+                $record.finalFocus = @{native = $null; dom = $null}
+                try { $record.finalFocus.native = [BrowserInput]::Snapshot($session.Handle) }
+                catch { $record.diagnosticErrors += "final native focus: $($_.Exception.Message)" }
+                try {
+                    $final = Read-Browser $session $stateProbe
+                    $record.actualAfter = $final.value
+                    $record.selectionAfter = $final.selection
+                    $record.finalFocus.dom = $final.dom
+                } catch { $record.diagnosticErrors += "final browser state: $($_.Exception.Message)" }
+                if ($expectedOtherReady) {
+                    $record.otherFieldsUnchanged = $false
+                    try {
+                        Assert-BrowserOtherFields $sessions $expectedOther
+                        $record.otherFieldsUnchanged = $true
+                    } catch { $record.diagnosticErrors += "other fields: $($_.Exception.Message)" }
+                }
+                try {
+                    $record.clipboardAfter = [BrowserInput]::GetClipboardSequenceNumber()
+                    if ($null -ne $record.clipboardBefore) {
+                        $record.clipboardUnchanged = $record.clipboardAfter -eq $record.clipboardBefore
+                    }
+                } catch { $record.diagnosticErrors += "final clipboard sequence: $($_.Exception.Message)" }
             }
             $results.Add([pscustomobject]$record)
             $record | ConvertTo-Json -Depth 6 -Compress | Write-Output

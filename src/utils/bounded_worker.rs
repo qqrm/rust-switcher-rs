@@ -94,6 +94,59 @@ mod tests {
     }
 
     #[test]
+    fn initialization_is_nonblocking_and_expired_requests_are_never_replayed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let initializations = Arc::new(AtomicUsize::new(0));
+        let initialized_count = Arc::clone(&initializations);
+        let (entered, initializing) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (ready, initialized) = mpsc::channel();
+        let (processed, observed) = mpsc::channel();
+        let (expired, expiration) = mpsc::channel();
+        let worker = BoundedWorker::start_with_expiration(
+            "initializing-probe-test",
+            1,
+            move || {
+                initialized_count.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                ready.send(()).unwrap();
+                move |value: u32| {
+                    processed.send(value).unwrap();
+                    value + 1
+                }
+            },
+            move |value| expired.send(value).unwrap(),
+        )
+        .unwrap();
+        initializing.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        // Initialization has not completed, but callers keep their own bound.
+        let timeout = Duration::from_millis(200);
+        let start = Instant::now();
+        assert_eq!(worker.request(1, timeout), None);
+        assert_eq!(worker.request(2, timeout), None);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(observed.try_recv().is_err());
+        assert!(initialized.try_recv().is_err());
+        assert_eq!(initializations.load(Ordering::SeqCst), 1);
+
+        release.send(()).unwrap();
+        initialized.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(expiration.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        // The first post-warmup request receives the same budget, with no retry
+        // or replay of either earlier request and no additional worker.
+        assert_eq!(worker.request(3, timeout), Some(4));
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+        assert!(observed.try_recv().is_err());
+        assert_eq!(initializations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn hung_provider_does_not_create_more_workers_or_block_caller() {
         let (release, blocked) = mpsc::channel();
         let (started, observed) = mpsc::channel();
