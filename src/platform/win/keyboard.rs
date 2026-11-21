@@ -209,7 +209,6 @@ pub fn install(hwnd: HWND, state: &mut crate::app::AppState) {
     }
 
     crate::input::ring_buffer::warm_decoder();
-    crate::domain::text::warm_selection_probe();
     super::secure_input::initialize(hwnd);
     crate::domain::text::multilang::warm();
 

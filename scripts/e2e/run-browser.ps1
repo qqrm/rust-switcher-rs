@@ -100,6 +100,7 @@ public static class BrowserInput {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint thread);
     [DllImport("user32.dll", SetLastError=true)] private static extern bool GetGUIThreadInfo(uint thread, ref GUI_THREAD_INFO info);
@@ -695,6 +696,19 @@ max_gap_ms = 1000
             $release.Refresh()
             $release.MainWindowHandle -ne [IntPtr]::Zero
         } 'release Switcher window for F6'
+        $releaseWindow = $release.MainWindowHandle
+        if ([BrowserInput]::ProcessOf($releaseWindow) -ne $release.Id) {
+            throw 'Release Switcher window is not owned by the launched process'
+        }
+        # Queue the normal close-to-tray command after startup shows Settings.
+        # Observe its completion before transferring focus to the browser.
+        if (-not [BrowserInput]::PostMessage($releaseWindow, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero)) {
+            throw 'Release Switcher Settings close-to-tray command failed'
+        }
+        Wait-Browser {
+            if ($release.HasExited) { throw "Release Switcher exited while hiding Settings: $($release.ExitCode)" }
+            -not [BrowserInput]::IsWindowVisible($releaseWindow)
+        } 'release Switcher Settings hidden to tray'
         # Read only the selected range; never repair it or focus after F6.
         $selectionProbe = @'
 (() => {
@@ -801,7 +815,7 @@ max_gap_ms = 1000
             $record | ConvertTo-Json -Depth 6 -Compress | Write-Output
             if ($null -eq $record.error) { Write-Output "PASS: $($record.name)" } else { Write-Output "FAIL: $($record.name)" }
         }
-        if (-not [BrowserInput]::PostMessage($release.MainWindowHandle, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
+        if (-not [BrowserInput]::PostMessage($releaseWindow, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
             -not $release.WaitForExit(8000) -or $release.ExitCode -ne 0) {
             throw 'Release Switcher did not exit after browser F6 checks'
         }
