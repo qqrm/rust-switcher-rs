@@ -178,13 +178,13 @@ jobs:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: ./scripts/e2e/run-hosted.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
 
-      - name: Verify Double Alt in real browser fields
+      - name: Verify browser Double Alt, password protection and release Double Shift
         if: ${{ !cancelled() && steps.desktop_build.outcome == 'success' }}
         timeout-minutes: 8
         shell: pwsh
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
-        run: ./scripts/e2e/run-browser.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe
+        run: ./scripts/e2e/run-browser.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
 
       - name: Reject a build with UIA password protection removed
         if: ${{ !cancelled() && steps.desktop_build.outcome == 'success' }}

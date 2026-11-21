@@ -1069,7 +1069,7 @@ fn execute_runtime_command(hwnd: HWND, state: &mut AppState, command: RuntimeCom
     // Pausing never needs a provider. Layout switching remains usable even when
     // text processing is blocked, including shortcuts shared with conversion.
     if !matches!(command, RuntimeCommand::Hotkey(HotkeyAction::PauseToggle))
-        && !secure_input::protect_current_context().is_allowed()
+        && !secure_input::protect_new_command().is_allowed()
     {
         if matches!(command, RuntimeCommand::Hotkey(HotkeyAction::SwitchLayout)) {
             let _ = switch_keyboard_layout();
