@@ -30,6 +30,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class HostedInput {
     [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public UNION data; }
     [StructLayout(LayoutKind.Explicit)] public struct UNION {
@@ -69,6 +70,16 @@ public static class HostedInput {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "SendInput did not inject one event");
     }
     public static int InputSize() { return Marshal.SizeOf<INPUT>(); }
+    private static INPUT InputKey(ushort key, bool up) {
+        var input = new INPUT(); input.type = 1; input.data.keyboard.key = key;
+        input.data.keyboard.flags = up ? 2u : 0u; return input;
+    }
+    public static void DoubleShiftThenTab() {
+        var input = new[] {InputKey(0xA0, false), InputKey(0xA0, true),
+            InputKey(0xA0, false), InputKey(0xA0, true), InputKey(9, false), InputKey(9, true)};
+        if (SendInput((uint)input.Length, input, Marshal.SizeOf<INPUT>()) != (uint)input.Length)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Shortcut/Tab batch was incomplete");
+    }
     private static void ReleaseAfterIncompleteBatch(ushort modifier, ushort firstKey) {
         try { Key(firstKey, true); } catch { }
         try { Key(modifier, true); } catch { }
@@ -124,6 +135,29 @@ public static class HostedInput {
         IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)] static extern IntPtr ReadSelection(
         IntPtr window, uint message, out uint start, out uint end, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr ReadText(IntPtr window, uint message, UIntPtr capacity, StringBuilder text, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr WriteText(IntPtr window, uint message, UIntPtr w, string text, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW", SetLastError=true)] static extern IntPtr WindowStyle(IntPtr window, int index);
+    public static string FixtureText(IntPtr window) {
+        var text = new StringBuilder(256); UIntPtr result;
+        if (ReadText(window, 0xD, new UIntPtr((uint)text.Capacity), text, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned fixture text read failed");
+        return text.ToString();
+    }
+    public static void SetFixtureText(IntPtr window, string text) {
+        UIntPtr result;
+        if (WriteText(window, 0xC, UIntPtr.Zero, text, 2, 1000, out result) == IntPtr.Zero || result == UIntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned fixture text setup failed");
+    }
+    public static void SetFixturePassword(IntPtr window, bool enabled) {
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0xCC, new UIntPtr(enabled ? 42u : 0u), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned password fixture setup failed");
+        if (((WindowStyle(window, -16).ToInt64() & 0x20) != 0) != enabled)
+            throw new InvalidOperationException("Owned fixture did not change its ES_PASSWORD style");
+    }
     public static void SelectFixtureText(IntPtr window, int length) {
         UIntPtr result;
         if (SendMessageTimeout(window, 0xB1, UIntPtr.Zero, new IntPtr(length), 2, 1000, out result) == IntPtr.Zero)
@@ -675,6 +709,48 @@ try {
         if ([HostedInput]::GetClipboardSequenceNumber() -ne $selectionClipboard) { throw 'Double Shift changed the clipboard' }
         Record-Pass "release Double Shift converts exactly once with selection and focus preserved: $expected"
     }
+    # A real ES_PASSWORD Edit exposes its selected text through the native
+    # message path. No journal/debug injection override is used by this release.
+    [HostedInput]::SetFixturePassword($editHandle, $true)
+    try {
+        [HostedInput]::SetFixtureText($editHandle, 'ghbdtn')
+        [HostedInput]::SetFixtureText($otherHandle, 'untouched')
+        Set-OwnedControlFocus $editorWindow $edit | Out-Null
+        [HostedInput]::SelectFixtureText($editHandle, 6)
+        $passwordClipboard = [HostedInput]::GetClipboardSequenceNumber()
+        if ($passwordClipboard -eq 0) { throw 'Password-test clipboard sequence is unavailable' }
+        foreach ($expected in @('привет', 'ghbdtn')) {
+            Tap-Shift 2
+            Wait-Condition { [HostedInput]::FixtureText($editHandle) -ceq $expected } 'release native selected password converts'
+            Wait-Condition { [HostedInput]::HasSelection($editHandle, 6) } 'release native password reselection'
+            if ([HostedInput]::WindowFocus($editorHandle) -ne $editHandle -or
+                [HostedInput]::FixtureText($otherHandle) -cne 'untouched' -or
+                [HostedInput]::GetClipboardSequenceNumber() -ne $passwordClipboard) {
+                throw 'Release password conversion changed focus, another field or clipboard'
+            }
+            Record-Pass "release selected native password converts with default Double Shift: $expected"
+        }
+        [HostedInput]::SetFixtureText($editHandle, 'ghbdtn ')
+        [HostedInput]::SetFixtureText($otherHandle, 'untouched')
+        Set-OwnedControlFocus $editorWindow $edit | Out-Null
+        [HostedInput]::SelectFixtureText($editHandle, 7)
+        Set-Content -LiteralPath $signalPath -Value 'ready' -NoNewline
+        [HostedInput]::DoubleShiftThenTab()
+        Wait-Condition { (Get-Content -LiteralPath $signalPath -Raw) -ceq 'tab' -and
+            [HostedInput]::WindowFocus($editorHandle) -eq $otherHandle } 'actual native Tab reaches the neighboring editor'
+        Start-Sleep -Milliseconds 1600
+        if ([HostedInput]::FixtureText($otherHandle) -cne 'untouched') {
+            throw 'WRONG_TARGET_WRITE: native password conversion reached the field selected by Tab'
+        }
+        $sourceAfterTab = [HostedInput]::FixtureText($editHandle)
+        if ($sourceAfterTab -cne 'ghbdtn ' -and $sourceAfterTab -cne 'привет ') {
+            throw 'PARTIAL_SOURCE_WRITE: native shortcut/Tab partially changed the password source'
+        }
+        if ([HostedInput]::GetClipboardSequenceNumber() -ne $passwordClipboard) {
+            throw 'Native password shortcut/Tab changed the clipboard'
+        }
+        Record-Pass 'release Double Shift followed immediately by Tab preserves password source ownership'
+    } finally { [HostedInput]::SetFixturePassword($editHandle, $false) }
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     if (-not $editor.WaitForExit(5000)) { throw 'Isolated editor did not close' }

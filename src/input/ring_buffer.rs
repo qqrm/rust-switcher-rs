@@ -1505,7 +1505,8 @@ pub fn validate_secure_context_generation(generation: u64) -> bool {
 enum ResetReason {
     /// Start an empty active segment while retaining other editors' histories.
     Navigation,
-    /// Purge potentially sensitive text from every retained context.
+    /// Reset every retained context for isolated tests.
+    #[cfg(test)]
     SensitiveInput,
     /// A missing or unverified key makes the remaining segment incomplete.
     CaptureRejected,
@@ -1534,7 +1535,7 @@ fn clear_secure_journal(journal: &mut InputJournal, reason: ResetReason) {
 
 /// Discard every retained context and private decoder composition atomically
 /// with the security epoch used by deferred capture and conversion guards.
-#[cfg(any(test, windows))]
+#[cfg(test)]
 pub fn clear_secure_input_data() {
     with_journal_mut(|journal| clear_secure_journal(journal, ResetReason::SensitiveInput));
 }
@@ -1912,8 +1913,8 @@ fn reject_secure_capture_with_current_focus(
     });
 }
 
-/// Reject a delayed selection/property result only for the conversion context
-/// it actually inspected, including a UIA descendant sharing the same HWND.
+/// Reject incomplete input delivery only for the conversion context it actually
+/// modified, including a UIA descendant sharing the same HWND.
 #[cfg(any(test, windows))]
 pub fn reject_secure_context(generation: u64) {
     with_journal_mut(|journal| {

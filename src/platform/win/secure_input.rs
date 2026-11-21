@@ -1,13 +1,17 @@
-//! Password-field capture guard. Foreign UI Automation providers are queried
+//! Input ownership guard. Foreign UI Automation providers are queried
 //! only on a persistent MTA worker, never on either low-level input hook.
 //!
 //! The capture coordinator owns a bounded FIFO of event-time key snapshots.
-//! Only a fresh, explicit non-password result can authorize decoding. A hung
-//! provider receives handles and epochs, not queued key data.
+//! Fresh native/UIA identity binds decoding and conversion to the originating
+//! field, including password fields. A hung provider receives handles and
+//! epochs, not queued key data.
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap},
+    marker::PhantomData,
+    rc::Rc,
     sync::{
         Arc, LazyLock, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
@@ -16,7 +20,7 @@ use std::{
 };
 
 use windows::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, POINT, SetLastError, WIN32_ERROR, WPARAM},
+    Foundation::{HWND, LPARAM, POINT, WPARAM},
     System::{
         Com::{
             CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -33,10 +37,9 @@ use windows::Win32::{
         },
         Input::KeyboardAndMouse::VIRTUAL_KEY,
         WindowsAndMessaging::{
-            ES_PASSWORD, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GUITHREADINFO, GWL_STYLE,
-            GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
-            GetWindowThreadProcessId, IsChild, KBDLLHOOKSTRUCT, PostMessageW,
-            WINEVENT_OUTOFCONTEXT,
+            EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GUITHREADINFO, GetClassNameW,
+            GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, IsChild,
+            KBDLLHOOKSTRUCT, PostMessageW, WINEVENT_OUTOFCONTEXT,
         },
     },
 };
@@ -67,26 +70,153 @@ static FOCUS_HOOKS_READY: OnceLock<bool> = OnceLock::new();
 static CAPTURE_DISPATCH: Mutex<()> = Mutex::new(());
 static PUBLISHED_IDENTITIES: LazyLock<IdentityPublications> =
     LazyLock::new(IdentityPublications::new);
+static AUTOCONVERT_NOTIFICATION: Mutex<AutoconvertNotification> =
+    Mutex::new(AutoconvertNotification {
+        last_ticket: 0,
+        pending: None,
+    });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Status {
-    Secure,
-    NotSecure,
+    Verified,
     Unknown,
 }
 
 impl Status {
     pub(crate) const fn is_allowed(self) -> bool {
-        matches!(self, Self::NotSecure)
+        matches!(self, Self::Verified)
     }
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct Target {
     foreground: usize,
     focus: usize,
     thread: u32,
     process: u32,
+}
+
+/// The target and navigation epoch at recognition, before a command is queued.
+/// UIA ownership acceptance may advance the context epoch without navigation;
+/// keeping the raw epoch lets that first observation discard obsolete history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CommandContext {
+    target: Target,
+    generation: u64,
+}
+
+// Only the current last word can be converted, so a newer word-end event
+// supersedes an undelivered notification. Tickets prevent an older message
+// from consuming that newer event's target; no pointers cross the queue.
+#[derive(Default)]
+struct AutoconvertNotification {
+    last_ticket: usize,
+    pending: Option<(usize, CommandContext)>,
+}
+
+impl AutoconvertNotification {
+    fn publish(&mut self, context: CommandContext) -> Option<usize> {
+        let ticket = self.last_ticket.checked_add(1)?;
+        self.last_ticket = ticket;
+        self.pending = Some((ticket, context));
+        Some(ticket)
+    }
+
+    fn take(&mut self, ticket: usize) -> Option<CommandContext> {
+        if self.pending.is_some_and(|(pending, _)| pending == ticket) {
+            self.pending.take().map(|(_, context)| context)
+        } else {
+            None
+        }
+    }
+}
+
+fn post_autoconvert(hwnd: HWND, context: CommandContext) {
+    let ticket = AUTOCONVERT_NOTIFICATION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .publish(context);
+    let Some(ticket) = ticket else {
+        return;
+    };
+    if unsafe {
+        PostMessageW(
+            Some(hwnd),
+            crate::platform::ui::error_notifier::WM_APP_AUTOCONVERT,
+            WPARAM(ticket),
+            LPARAM(0),
+        )
+    }
+    .is_err()
+    {
+        let _ = take_autoconvert_context(ticket);
+    }
+}
+
+pub(crate) fn take_autoconvert_context(ticket: usize) -> Option<CommandContext> {
+    AUTOCONVERT_NOTIFICATION
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take(ticket)
+}
+
+thread_local! {
+    static ACTIVE_COMMAND: Cell<Option<CommandContext>> = const { Cell::new(None) };
+}
+
+/// Keep the original command bound through nested conversion and output calls.
+/// The guard cannot cross threads because its state belongs to this thread.
+pub(crate) struct CommandScope {
+    previous: Option<CommandContext>,
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl CommandContext {
+    pub(crate) fn capture() -> Option<Self> {
+        let generation = capture_generation();
+        let target = Target::capture()?;
+        validate_capture_generation(generation).then_some(Self { target, generation })
+    }
+
+    pub(crate) fn is_current(self) -> bool {
+        self.is_current_with(|| self.target.is_current())
+    }
+
+    pub(crate) fn is_current_with(self, target_is_current: impl FnOnce() -> bool) -> bool {
+        validate_capture_generation(self.generation)
+            && target_is_current()
+            && validate_capture_generation(self.generation)
+    }
+
+    pub(crate) fn enter(self) -> CommandScope {
+        CommandScope {
+            previous: ACTIVE_COMMAND.replace(Some(self)),
+            _thread: PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(generation: u64, foreground: usize, focus: usize) -> Self {
+        Self {
+            target: Target {
+                foreground,
+                focus,
+                thread: 1,
+                process: 1,
+            },
+            generation,
+        }
+    }
+}
+
+impl Drop for CommandScope {
+    fn drop(&mut self) {
+        ACTIVE_COMMAND.set(self.previous);
+    }
+}
+
+fn active_command_is_current() -> bool {
+    ACTIVE_COMMAND.get().is_none_or(CommandContext::is_current)
 }
 
 /// Only native target metadata and monotonic revisions cross into the hook.
@@ -328,7 +458,7 @@ impl IUIAutomationFocusChangedEventHandler_Impl for FocusChangedHandler_Impl {
 // Release COM interfaces before uninitializing their owning MTA.
 struct Provider {
     automation: Option<IUIAutomation>,
-    // Identity only, never a cached password verdict. Bounded independently of
+    // Identity only, never a cached focus verdict. Bounded independently of
     // the text journal, so returning to a known editor preserves its cache.
     elements: HashMap<Target, IUIAutomationElement>,
     focus_handler: Option<IUIAutomationFocusChangedEventHandler>,
@@ -408,15 +538,20 @@ impl Provider {
             ),
             || PUBLISHED_IDENTITIES.publish(request.probe.target, element_changed, forget),
             |revision| PUBLISHED_IDENTITIES.retire(request.probe.target, revision),
-            || element_status(&element),
             || {
-                // A property lookup can itself race a same-HWND DOM focus change.
-                unsafe { automation.GetFocusedElement() }
+                // Recheck the exact element after publication; password
+                // metadata does not determine whether a field may be used.
+                let focused = unsafe { automation.GetFocusedElement() }
                     .ok()
                     .and_then(|current| {
                         unsafe { automation.CompareElements(&element, &current) }.ok()
                     })
-                    .is_some_and(|same| same.as_bool())
+                    .is_some_and(|same| same.as_bool());
+                if focused {
+                    Status::Verified
+                } else {
+                    Status::Unknown
+                }
             },
             || {
                 accept_observed_identity(request.probe, element_changed, || {
@@ -435,29 +570,28 @@ fn probe_observed_identity(
     (generation_is_current, metadata_is_current): (impl Fn() -> bool, impl Fn() -> bool),
     publish_identity: impl FnOnce() -> u64,
     retire_identity: impl Fn(u64),
-    password_status: impl FnOnce() -> Status,
-    remains_focused: impl FnOnce() -> bool,
+    observe_focus: impl FnOnce() -> Status,
     accept_identity: impl FnOnce() -> bool,
 ) -> Verdict {
     if !generation_is_current() || !metadata_is_current() {
         return Verdict::UNKNOWN;
     }
     // The exact focused element is known now. Publish its identity before
-    // slower metadata queries, so later keys can retain that observation.
+    // the final focus query, so later keys can retain that observation.
     // This is not authorization: the final verdict and every queued Capture
-    // still need fresh ordinary metadata and stable focus. Older snapshots
+    // still need freshly verified identity and stable focus. Older snapshots
     // keep their original revision, and failed probes never roll it back.
     let revision = publish_identity();
-    let status = password_status();
+    let status = observe_focus();
     let denied = !status.is_allowed();
     if denied {
         // A coordinator may already have timed out with no pending input. Its
         // clean observation keeps the raw epoch, so keys arriving afterward
-        // must not inherit this unconfirmed or sensitive publication. Retire
+        // must not inherit this unconfirmed publication. Retire
         // before another provider call can stall or its result can be dropped.
         retire_identity(revision);
     }
-    if !remains_focused() || !metadata_is_current() {
+    if !metadata_is_current() {
         if !denied {
             retire_identity(revision);
         }
@@ -466,13 +600,13 @@ fn probe_observed_identity(
     if !generation_is_current() {
         // An unaccepted owner must not leave a publication that a later return
         // to the accepted owner could reuse as "unchanged". Only an already
-        // accepted ordinary identity can survive this navigation cancellation.
+        // accepted identity can survive this navigation cancellation.
         if !denied && element_changed {
             retire_identity(revision);
         } else if !denied {
             tracing::debug!(
                 revision,
-                "secure input: superseded probe kept valid ordinary identity"
+                "input ownership: superseded probe kept valid identity"
             );
         }
         return Verdict::UNKNOWN;
@@ -514,7 +648,7 @@ fn accept_observed_identity(
 }
 
 /// Freeze the clicked control before observing focus. A different focused
-/// ancestor must never replace a password field's anchor while delivery lags.
+/// ancestor must never replace the clicked field's anchor while delivery lags.
 fn pointer_element(
     automation: &IUIAutomation,
     request: &ProviderRequest,
@@ -629,15 +763,10 @@ impl Drop for Provider {
     }
 }
 
-/// Explicitly request the property's non-default value. Unsupported providers
-/// return a non-BOOL reserved value, not a trustworthy `false`.
-/// Caller must be on a UIA worker, never on an input hook.
-pub(crate) fn element_status(element: &IUIAutomationElement) -> Status {
-    match element_boolean_property(element, UIA_IsPasswordPropertyId) {
-        Some(true) => Status::Secure,
-        Some(false) => Status::NotSecure,
-        None => Status::Unknown,
-    }
+/// Optional selection hint, never a capture/conversion authorization decision.
+/// Unsupported metadata stays unknown. Call only on a UIA worker.
+pub(crate) fn element_password_state(element: &IUIAutomationElement) -> Option<bool> {
+    element_boolean_property(element, UIA_IsPasswordPropertyId)
 }
 
 fn element_boolean_property(
@@ -661,32 +790,18 @@ fn variant_boolean(value: &VARIANT) -> Option<bool> {
 }
 
 /// This fallback applies only to known standard Edit/RichEdit window classes.
-pub(crate) fn win32_password_state(hwnd: HWND) -> Option<bool> {
+fn is_standard_edit(hwnd: HWND) -> bool {
     let mut class_name = [0u16; 128];
     let length = unsafe { GetClassNameW(hwnd, &mut class_name) };
     if length <= 0 {
-        return None;
+        return false;
     }
     let class = String::from_utf16_lossy(&class_name[..length as usize]);
-    if class != "Edit" && !class.starts_with("RichEdit") && !class.starts_with("RICHEDIT") {
-        return None;
-    }
-    unsafe { SetLastError(WIN32_ERROR::default()) };
-    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
-    if style == 0 && unsafe { GetLastError() } != WIN32_ERROR::default() {
-        return None;
-    }
-    Some(style & ES_PASSWORD as isize != 0)
+    class == "Edit" || class.starts_with("RichEdit") || class.starts_with("RICHEDIT")
 }
 
 fn native_status(target: Target) -> Option<Status> {
-    win32_password_state(target.hwnd()).map(|password| {
-        if password {
-            Status::Secure
-        } else {
-            Status::NotSecure
-        }
-    })
+    is_standard_edit(target.hwnd()).then_some(Status::Verified)
 }
 
 fn capture_generation() -> u64 {
@@ -716,12 +831,6 @@ pub(crate) fn generation() -> u64 {
 
 pub(crate) fn validate_generation(expected: u64) -> bool {
     ring_buffer::validate_secure_context_generation(expected)
-}
-
-pub(crate) fn clear_sensitive_context_if_current(expected: u64) {
-    if validate_generation(expected) {
-        ring_buffer::reject_secure_context(expected);
-    }
 }
 
 fn enqueue_refresh() -> bool {
@@ -806,8 +915,8 @@ pub(crate) fn invalidate_context_if_current(expected: u64) {
     }
 }
 
-/// Confirmed sensitive fields and rejected text probes must purge every cache,
-/// unlike ordinary mouse/navigation invalidation.
+/// Discard all retained input after an explicit ownership reset.
+#[cfg(test)]
 pub(crate) fn clear_sensitive_context() {
     ring_buffer::clear_secure_input_data();
 }
@@ -862,13 +971,13 @@ pub(crate) fn initialize(hwnd: HWND) {
         !foreground.0.is_null() && !focus.0.is_null()
     });
     WORKER.get_or_init(|| {
-        let provider = BoundedWorker::start("password-property", || {
+        let provider = BoundedWorker::start("input-identity", || {
             let mut provider = Provider::new();
             move |request| provider.probe(request)
         })
         .ok();
         BoundedWorker::start_with_expiration(
-            "password-capture",
+            "input-capture",
             CAPTURE_QUEUE_CAPACITY,
             move || move |command| process_command(provider.as_ref(), command),
             |command| {
@@ -962,14 +1071,13 @@ fn process_command(
             {
                 let hwnd = MAIN_HWND.load(Ordering::Acquire);
                 if hwnd != 0 {
-                    let _ = unsafe {
-                        PostMessageW(
-                            Some(HWND(hwnd as *mut _)),
-                            crate::platform::ui::error_notifier::WM_APP_AUTOCONVERT,
-                            WPARAM(0),
-                            LPARAM(0),
-                        )
-                    };
+                    post_autoconvert(
+                        HWND(hwnd as *mut _),
+                        CommandContext {
+                            target: capture.target,
+                            generation: capture.generation,
+                        },
+                    );
                 }
             }
             result.status
@@ -995,7 +1103,7 @@ fn complete_protection(
         return Status::Unknown;
     }
     // The provider already discarded the old owner's journal before accepting
-    // this ordinary identity. A new command can now read a fresh selection.
+    // this verified identity. A new command can now read a fresh selection.
     // Prepared text must still reject a changed owner: a lagging native focus
     // notification can leave its context token unchanged during that discard.
     if !result.status.is_allowed()
@@ -1050,17 +1158,11 @@ fn apply_refresh_metadata(
     reject_observation: impl FnOnce(Probe),
 ) -> Status {
     match result.status {
-        Status::Secure => {
-            // A confirmed password context remains unavailable even if the
-            // same element reports ordinary text before a queued key is checked.
-            tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
-            reject_probe(request);
-        }
         Status::Unknown => {
             tracing::debug!(status = ?result.status, "secure input: focus metadata rejected");
             reject_observation(request);
         }
-        Status::NotSecure if result.element_changed => {
+        Status::Verified if result.element_changed => {
             tracing::debug!("secure input: focused UIA element changed");
             let _ = ring_buffer::discard_changed_capture_context_for_focus_if_current(
                 request.generation,
@@ -1068,7 +1170,7 @@ fn apply_refresh_metadata(
                 request.target.focus,
             );
         }
-        Status::NotSecure => {}
+        Status::Verified => {}
     }
     result.status
 }
@@ -1145,10 +1247,6 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         reject_capture(capture_generation());
         return;
     };
-    if native_status(target) == Some(Status::Secure) {
-        clear_sensitive_context();
-        return;
-    }
     let identity_revision = PUBLISHED_IDENTITIES.at_admission(target, identity_frontier);
     let Some(key) = ring_buffer::capture_keydown(kb, vk) else {
         return;
@@ -1183,19 +1281,22 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
 }
 
 /// Start a command before reading its selection or extracting journal text.
-/// A freshly confirmed ordinary field can be used after its old history is discarded.
+/// A freshly confirmed field can be used after its old history is discarded.
 pub(crate) fn protect_new_command() -> Status {
     protect_context(ProtectionMode::NewCommand)
 }
 
 /// Revalidate prepared text or journal restoration outside the input hook.
-/// An owner change must cancel the operation even when the new field is ordinary.
+/// An owner change must cancel the operation even when the new field is verified.
 pub(crate) fn protect_current_context() -> Status {
     protect_context(ProtectionMode::ExistingContext)
 }
 
 /// The FIFO barrier drains earlier captures before a fresh bounded probe.
 fn protect_context(mode: ProtectionMode) -> Status {
+    if !active_command_is_current() {
+        return Status::Unknown;
+    }
     let Some(target) = Target::capture() else {
         reject_capture(capture_generation());
         return Status::Unknown;
@@ -1217,7 +1318,10 @@ fn protect_context(mode: ProtectionMode) -> Status {
             )
         })
         .unwrap_or(Status::Unknown);
-    if !validate_capture_generation(expected) || !target.is_current() {
+    if !active_command_is_current()
+        || !validate_capture_generation(expected)
+        || !target.is_current()
+    {
         return Status::Unknown;
     }
     if !status.is_allowed() {
@@ -1237,7 +1341,7 @@ mod tests {
             Foundation::VARIANT_BOOL,
             System::Variant::{VARENUM, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_EMPTY},
             UI::WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+                CreateWindowExW, DestroyWindow, ES_PASSWORD, WINDOW_EX_STYLE, WINDOW_STYLE,
             },
         },
         core::{PCWSTR, w},
@@ -1431,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_boolean_false_authorizes_custom_input() {
+    fn optional_boolean_hints_preserve_unknown_values() {
         assert_eq!(
             variant_boolean(&boolean_variant(false, VT_BOOL)),
             Some(false)
@@ -1439,7 +1543,7 @@ mod tests {
         assert_eq!(variant_boolean(&boolean_variant(true, VT_BOOL)), Some(true));
         assert_eq!(variant_boolean(&boolean_variant(false, VT_EMPTY)), None);
         assert!(!Status::Unknown.is_allowed());
-        assert!(!Status::Secure.is_allowed());
+        assert!(Status::Verified.is_allowed());
     }
 
     #[test]
@@ -1564,7 +1668,7 @@ mod tests {
 
     fn published_test_verdict(revision: u64, element_changed: bool) -> Verdict {
         Verdict {
-            status: Status::NotSecure,
+            status: Status::Verified,
             element_changed,
             identity: MetadataIdentity::Published(revision),
         }
@@ -1588,11 +1692,10 @@ mod tests {
             (|| validate_capture_generation(request.generation), || true),
             || publications.publish(request.target, true, false),
             |revision| publications.retire(request.target, revision),
-            || Status::NotSecure,
-            || true,
+            || Status::Verified,
             || accept_observed_identity(request, true, || {}),
         );
-        assert_eq!(result.status, Status::NotSecure);
+        assert_eq!(result.status, Status::Verified);
         assert!(result.element_changed);
         (request, result, previous_context)
     }
@@ -1605,7 +1708,7 @@ mod tests {
         assert!(ring_buffer::runs_snapshot().is_empty());
         assert_eq!(
             complete_protection(request, result, ProtectionMode::NewCommand, || true),
-            Status::NotSecure
+            Status::Verified
         );
         assert!(validate_capture_generation(request.generation));
         // Accepting a new command must not authorize earlier key snapshots.
@@ -1630,7 +1733,7 @@ mod tests {
         assert!(validate_generation(previous_context));
         assert_eq!(
             complete_protection(request, result, ProtectionMode::NewCommand, || true),
-            Status::NotSecure
+            Status::Verified
         );
         assert!(validate_generation(previous_context));
         assert_eq!(ring_buffer::runs_snapshot(), other_runs);
@@ -1656,24 +1759,22 @@ mod tests {
     }
 
     #[test]
-    fn every_protection_mode_rejects_password_and_unknown_metadata() {
+    fn every_protection_mode_rejects_unverified_ownership() {
         let _guard = ring_buffer::test_guard();
         for mode in [ProtectionMode::NewCommand, ProtectionMode::ExistingContext] {
-            for status in [Status::Secure, Status::Unknown] {
-                ring_buffer::clear_secure_input_data();
-                ring_buffer::push_text("must-be-purged");
-                let request = pointer_test_probe(capture_generation());
-                let result = Verdict {
-                    status,
-                    ..published_test_verdict(1, true)
-                };
-                assert_eq!(
-                    complete_protection(request, result, mode, || true),
-                    Status::Unknown
-                );
-                assert!(!validate_capture_generation(request.generation));
-                assert!(ring_buffer::runs_snapshot().is_empty());
-            }
+            ring_buffer::clear_secure_input_data();
+            ring_buffer::push_text("must-be-purged");
+            let request = pointer_test_probe(capture_generation());
+            let result = Verdict {
+                status: Status::Unknown,
+                ..published_test_verdict(1, true)
+            };
+            assert_eq!(
+                complete_protection(request, result, mode, || true),
+                Status::Unknown
+            );
+            assert!(!validate_capture_generation(request.generation));
+            assert!(ring_buffer::runs_snapshot().is_empty());
         }
         ring_buffer::clear_secure_input_data();
     }
@@ -1700,24 +1801,16 @@ mod tests {
             assert_eq!(ring_buffer::runs_snapshot(), before);
             assert_eq!(
                 complete_protection(current, published_test_verdict(1, false), mode, || true),
-                Status::NotSecure
+                Status::Verified
             );
             assert_eq!(ring_buffer::runs_snapshot(), before);
         }
         ring_buffer::clear_secure_input_data();
     }
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum ProbePause {
-        Password,
-        Stability,
-    }
-
     fn run_early_publication_case(
-        pause: ProbePause,
         earlier_capture: bool,
         status: Status,
-        stable: bool,
         current: bool,
     ) -> (Status, usize, bool) {
         use std::sync::mpsc;
@@ -1755,7 +1848,7 @@ mod tests {
                             observing.send(()).unwrap();
                             confirmation.recv_timeout(Duration::from_secs(2)).unwrap();
                             // This is the production ordering seam used by
-                            // Provider::probe, with its property/focus query
+                            // Provider::probe, with its focus query
                             // blocked after the exact element was observed.
                             let verdict = probe_observed_identity(
                                 true,
@@ -1766,22 +1859,13 @@ mod tests {
                                 || worker_publications.publish(request.target, true, false),
                                 |revision| worker_publications.retire(request.target, revision),
                                 || {
-                                    if pause == ProbePause::Password {
-                                        querying.send(()).unwrap();
-                                        resume_query.recv_timeout(Duration::from_secs(2)).unwrap();
-                                    }
+                                    querying.send(()).unwrap();
+                                    resume_query.recv_timeout(Duration::from_secs(2)).unwrap();
                                     status
-                                },
-                                || {
-                                    if pause == ProbePause::Stability {
-                                        querying.send(()).unwrap();
-                                        resume_query.recv_timeout(Duration::from_secs(2)).unwrap();
-                                    }
-                                    stable
                                 },
                                 || true,
                             );
-                            if stable && current {
+                            if current {
                                 assert!(verdict.element_changed);
                             }
                             complete_refresh(request, verdict, || true)
@@ -1800,8 +1884,7 @@ mod tests {
                                     (|| validate_capture_generation(generation), || true),
                                     || worker_publications.publish(request.target, false, false),
                                     |revision| worker_publications.retire(request.target, revision),
-                                    || Status::NotSecure,
-                                    || true,
+                                    || Status::Verified,
                                     || true,
                                 );
                                 if capture_metadata_allows(identity_revision, fresh) {
@@ -1809,7 +1892,7 @@ mod tests {
                                     if !ring_buffer::runs_snapshot().is_empty() {
                                         worker_appended.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    Status::NotSecure
+                                    Status::Verified
                                 } else {
                                     reject_probe(request);
                                     Status::Unknown
@@ -1851,13 +1934,8 @@ mod tests {
         // Moving publication after the blocked query fails here: a later
         // snapshot would still carry A, although B's focus was already observed.
         let later_revision = enqueue_capture();
-        if pause == ProbePause::Stability && !status.is_allowed() {
-            // Known denied metadata is retired before stability can stall.
-            assert_eq!(later_revision, None);
-        } else {
-            assert!(later_revision.is_some());
-            assert_ne!(later_revision, Some(old_revision));
-        }
+        assert!(later_revision.is_some());
+        assert_ne!(later_revision, Some(old_revision));
         assert_eq!(enqueue_capture(), later_revision);
         assert!(ring_buffer::runs_snapshot().is_empty());
         request_current.store(current, Ordering::Release);
@@ -1879,35 +1957,26 @@ mod tests {
     #[test]
     fn observed_identity_is_available_while_fresh_metadata_is_pending() {
         let _guard = ring_buffer::test_guard();
-        for pause in [ProbePause::Password, ProbePause::Stability] {
-            assert_eq!(
-                run_early_publication_case(pause, false, Status::NotSecure, true, true),
-                (Status::NotSecure, 2, true),
-            );
-            // An earlier A key poisons the whole prefix, including B keys
-            // admitted after publication while metadata was still pending.
-            assert_eq!(
-                run_early_publication_case(pause, true, Status::NotSecure, true, true),
-                (Status::NotSecure, 0, false),
-            );
-        }
+        assert_eq!(
+            run_early_publication_case(false, Status::Verified, true),
+            (Status::Verified, 2, true),
+        );
+        // An earlier A key poisons the whole prefix, including B keys
+        // admitted after publication while focus validation was still pending.
+        assert_eq!(
+            run_early_publication_case(true, Status::Verified, true),
+            (Status::Verified, 0, false),
+        );
     }
 
     #[test]
-    fn early_identity_does_not_authorize_denied_unstable_or_expired_metadata() {
+    fn early_identity_does_not_authorize_unverified_or_expired_focus() {
         let _guard = ring_buffer::test_guard();
-        for pause in [ProbePause::Password, ProbePause::Stability] {
-            for (status, stable, current, expected) in [
-                (Status::Secure, true, true, Status::Secure),
-                (Status::Unknown, true, true, Status::Unknown),
-                (Status::NotSecure, false, true, Status::Unknown),
-                (Status::NotSecure, true, false, Status::Unknown),
-            ] {
-                assert_eq!(
-                    run_early_publication_case(pause, false, status, stable, current),
-                    (expected, 0, false),
-                );
-            }
+        for (status, current) in [(Status::Unknown, true), (Status::Verified, false)] {
+            assert_eq!(
+                run_early_publication_case(false, status, current),
+                (Status::Unknown, 0, false),
+            );
         }
     }
 
@@ -1921,7 +1990,6 @@ mod tests {
             ),
             || panic!("a stale observation must not publish an identity"),
             |_| panic!("a stale observation must not retire another identity"),
-            || panic!("a stale observation must not query password metadata"),
             || panic!("a stale observation must not query focus"),
             || panic!("a stale observation must not accept an identity"),
         );
@@ -1978,9 +2046,8 @@ mod tests {
                 if interruption == IdentityInterruption::Metadata {
                     switch_away();
                 }
-                Status::NotSecure
+                Status::Verified
             },
-            || true,
             || {
                 if interruption == IdentityInterruption::BeforeAcceptance {
                     switch_away();
@@ -2047,13 +2114,12 @@ mod tests {
             (|| validate_capture_generation(returned.generation), || true),
             || publications.publish(returned.target, changed, false),
             |revision| publications.retire(returned.target, revision),
-            || Status::NotSecure,
-            || true,
+            || Status::Verified,
             || accept_observed_identity(returned, changed, || accepted.set('B')),
         );
         assert_eq!(
             complete_refresh(returned, refreshed, || true),
-            Status::NotSecure
+            Status::Verified
         );
         let (captured, pending) = {
             let frontier = publications.frontier();
@@ -2068,8 +2134,7 @@ mod tests {
             (|| validate_capture_generation(returned.generation), || true),
             || publications.publish(returned.target, false, false),
             |revision| publications.retire(returned.target, revision),
-            || Status::NotSecure,
-            || true,
+            || Status::Verified,
             || accept_observed_identity(returned, false, || accepted.set('B')),
         );
         assert!(capture_metadata_allows(captured, fresh));
@@ -2112,31 +2177,29 @@ mod tests {
     }
 
     #[test]
-    fn denied_or_incomplete_metadata_preserves_the_accepted_identity() {
+    fn unverified_focus_preserves_the_accepted_identity() {
         use std::cell::Cell;
 
-        for (status, stable) in [
-            (Status::Secure, true),
-            (Status::Unknown, true),
-            (Status::NotSecure, false),
-        ] {
-            let publications = IdentityPublications::new();
-            let target = pointer_test_probe(0).target;
-            let accepted = Cell::new('C');
-            let _ = probe_observed_identity(
-                true,
-                (|| true, || true),
-                || publications.publish(target, true, false),
-                |revision| publications.retire(target, revision),
-                || status,
-                || stable,
-                || {
-                    accepted.set('B');
-                    true
-                },
-            );
-            assert_eq!(accepted.get(), 'C');
-        }
+        let publications = IdentityPublications::new();
+        let target = pointer_test_probe(0).target;
+        let accepted = Cell::new('C');
+        let result = probe_observed_identity(
+            true,
+            (|| true, || true),
+            || publications.publish(target, true, false),
+            |revision| publications.retire(target, revision),
+            || Status::Unknown,
+            || {
+                accepted.set('B');
+                true
+            },
+        );
+        assert_eq!(result.status, Status::Unknown);
+        assert_eq!(accepted.get(), 'C');
+        assert_eq!(
+            publications.at_admission(target, publications.frontier()),
+            None
+        );
     }
 
     #[test]
@@ -2161,15 +2224,11 @@ mod tests {
             (|| validate_capture_generation(request.generation), || true),
             || publications.publish(request.target, true, false),
             |revision| publications.retire(request.target, revision),
-            || Status::NotSecure,
-            || true,
+            || Status::Verified,
             || accept_observed_identity(request, true, || accepted.set('B')),
         );
         assert_eq!(accepted.get(), 'B');
-        assert_eq!(
-            complete_refresh(request, result, || true),
-            Status::NotSecure
-        );
+        assert_eq!(complete_refresh(request, result, || true), Status::Verified);
         assert!(validate_generation(context));
         assert_eq!(ring_buffer::raw_foreground_for_test(), 202);
         assert_eq!(ring_buffer::runs_snapshot(), other_runs);
@@ -2239,9 +2298,8 @@ mod tests {
                                     if pause == UnacceptedOwnerPause::Metadata {
                                         wait();
                                     }
-                                    Status::NotSecure
+                                    Status::Verified
                                 },
-                                || true,
                                 || {
                                     if pause == UnacceptedOwnerPause::Acceptance {
                                         wait();
@@ -2276,11 +2334,10 @@ mod tests {
                                 (|| validate_capture_generation(generation), || true),
                                 || worker_publications.publish(request.target, false, false),
                                 |revision| worker_publications.retire(request.target, revision),
-                                || Status::NotSecure,
-                                || true,
+                                || Status::Verified,
                                 || accept_observed_identity(current, false, || {}),
                             );
-                            assert_eq!(fresh.status, Status::NotSecure);
+                            assert_eq!(fresh.status, Status::Verified);
                             assert!(!fresh.element_changed);
                             let appended = if capture_metadata_allows(revision, fresh) {
                                 ring_buffer::push_text("b");
@@ -2364,15 +2421,13 @@ mod tests {
 
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum TimeoutPause {
-        Password,
-        Stability,
+        Focus,
         Reply,
     }
 
     fn run_clean_timeout_case(
         pause: TimeoutPause,
         status: Status,
-        stable: bool,
         current_after_timeout: bool,
         retirement: bool,
     ) -> usize {
@@ -2417,16 +2472,10 @@ mod tests {
                                     }
                                 },
                                 || {
-                                    if pause == TimeoutPause::Password {
+                                    if pause == TimeoutPause::Focus {
                                         wait();
                                     }
                                     status
-                                },
-                                || {
-                                    if pause == TimeoutPause::Stability {
-                                        wait();
-                                    }
-                                    stable
                                 },
                                 || true,
                             );
@@ -2443,8 +2492,7 @@ mod tests {
                             (|| true, || true),
                             || worker_publications.publish(request.target, false, false),
                             |revision| worker_publications.retire(request.target, revision),
-                            || Status::NotSecure,
-                            || true,
+                            || Status::Verified,
                             || true,
                         ),
                     }
@@ -2476,7 +2524,7 @@ mod tests {
         assert!(validate_capture_generation(raw));
         assert!(!validate_generation(context));
 
-        // A password-era key arrives only AFTER that clean timeout, while the
+        // A key from the unverified field arrives AFTER that clean timeout, while the
         // provider is still finishing the old observation.
         let frontier = publications.frontier();
         let (captured, pending) = {
@@ -2484,9 +2532,9 @@ mod tests {
             let captured = publications.at_admission(request.target, frontier);
             (captured, PendingCapture::new(raw))
         };
-        if retirement && pause != TimeoutPause::Password && !status.is_allowed() {
-            // Secure/Unknown must retire before a stability call or reply can
-            // stall, rather than waiting to discover that the request expired.
+        if retirement && pause == TimeoutPause::Reply && !status.is_allowed() {
+            // Unverified focus must retire before reply delivery can stall,
+            // rather than waiting to discover that the request expired.
             assert_eq!(captured, None);
         } else {
             assert!(captured.is_some());
@@ -2494,7 +2542,7 @@ mod tests {
         }
         current.store(current_after_timeout, Ordering::Release);
         finish.send(()).unwrap();
-        // The same element now reports ordinary text. The real provider FIFO
+        // The same element now has verified focus. The real provider FIFO
         // finishes/drops the expired response before handling this fresh query.
         let fresh = provider
             .request(Query::FreshCapture, Duration::from_secs(2))
@@ -2516,32 +2564,22 @@ mod tests {
     }
 
     #[test]
-    fn clean_timeout_cannot_preserve_a_later_password_capture_binding() {
+    fn clean_timeout_cannot_preserve_an_unverified_capture_binding() {
         let _guard = ring_buffer::test_guard();
-        for (pause, status, stable, current) in [
-            (TimeoutPause::Password, Status::Secure, true, false),
-            (TimeoutPause::Password, Status::Unknown, true, false),
-            (TimeoutPause::Password, Status::NotSecure, true, false),
-            (TimeoutPause::Stability, Status::NotSecure, false, true),
-            (TimeoutPause::Stability, Status::Secure, true, false),
-            (TimeoutPause::Reply, Status::Secure, true, true),
-            (TimeoutPause::Reply, Status::Unknown, true, true),
+        for (pause, status, current) in [
+            (TimeoutPause::Focus, Status::Unknown, true),
+            (TimeoutPause::Focus, Status::Verified, false),
+            (TimeoutPause::Reply, Status::Unknown, true),
         ] {
             // Disabling retirement must reproduce an actual append after the
             // clean timeout, not refusal caused by an invalid native target.
-            assert_eq!(
-                run_clean_timeout_case(pause, status, stable, current, false),
-                1
-            );
-            assert_eq!(
-                run_clean_timeout_case(pause, status, stable, current, true),
-                0
-            );
+            assert_eq!(run_clean_timeout_case(pause, status, current, false), 1);
+            assert_eq!(run_clean_timeout_case(pause, status, current, true), 0);
         }
         // A valid ordinary observation can outlive reply delivery; a later key
         // still has matching observed identity and its own fresh allowed check.
         assert_eq!(
-            run_clean_timeout_case(TimeoutPause::Reply, Status::NotSecure, true, true, true),
+            run_clean_timeout_case(TimeoutPause::Reply, Status::Verified, true, true),
             1
         );
     }
@@ -2600,7 +2638,6 @@ mod tests {
 
     fn run_superseded_observation_case(
         status: Status,
-        stable: bool,
         deadline_valid: bool,
         native_current: bool,
         element_changed: bool,
@@ -2654,7 +2691,6 @@ mod tests {
                                     resume.recv_timeout(Duration::from_secs(2)).unwrap();
                                     status
                                 },
-                                || stable,
                                 || accept_observed_identity(request, element_changed, || accepted.set(true)),
                             );
                             assert_eq!(verdict.status, Status::Unknown);
@@ -2674,8 +2710,7 @@ mod tests {
             (|| validate_capture_generation(generation), || true),
                                     || worker_publications.publish(request.target, changed, false),
                                     |revision| worker_publications.retire(request.target, revision),
-                                    || Status::NotSecure,
-                                    || true,
+                                    || Status::Verified,
                                     || accept_observed_identity(current, changed, || accepted.set(true)),
                                 );
                                 if capture_metadata_allows(revision, fresh) {
@@ -2752,31 +2787,20 @@ mod tests {
             // The old retirement rule really refuses an otherwise valid new
             // segment; retaining identity must not resurrect the old raw key.
             assert_eq!(
-                run_superseded_observation_case(Status::NotSecure, true, true, true, changed, true),
+                run_superseded_observation_case(Status::Verified, true, true, changed, true),
                 (0, 0)
             );
             assert_eq!(
-                run_superseded_observation_case(
-                    Status::NotSecure,
-                    true,
-                    true,
-                    true,
-                    changed,
-                    false
-                ),
+                run_superseded_observation_case(Status::Verified, true, true, changed, false),
                 (0, usize::from(!changed))
             );
-            for (status, stable, deadline, native) in [
-                (Status::Secure, true, true, true),
-                (Status::Unknown, true, true, true),
-                (Status::NotSecure, false, true, true),
-                (Status::NotSecure, true, false, true),
-                (Status::NotSecure, true, true, false),
+            for (status, deadline, native) in [
+                (Status::Unknown, true, true),
+                (Status::Verified, false, true),
+                (Status::Verified, true, false),
             ] {
                 assert_eq!(
-                    run_superseded_observation_case(
-                        status, stable, deadline, native, changed, false
-                    ),
+                    run_superseded_observation_case(status, deadline, native, changed, false),
                     (0, 0)
                 );
             }
@@ -2824,15 +2848,13 @@ mod tests {
             published_test_verdict(revision, false)
         ));
         assert!(!capture_metadata_allows(Some(revision), Verdict::UNKNOWN));
-        for status in [Status::Secure, Status::Unknown] {
-            assert!(!capture_metadata_allows(
-                Some(revision),
-                Verdict {
-                    status,
-                    ..published_test_verdict(revision, false)
-                }
-            ));
-        }
+        assert!(!capture_metadata_allows(
+            Some(revision),
+            Verdict {
+                status: Status::Unknown,
+                ..published_test_verdict(revision, false)
+            }
+        ));
     }
 
     #[test]
@@ -2908,7 +2930,7 @@ mod tests {
         assert_ne!(old, promoted);
         assert_eq!(
             complete_refresh(request, published_test_verdict(promoted, true), || true),
-            Status::NotSecure
+            Status::Verified
         );
         finish.send(()).unwrap();
         let (captured, pending) = snapshot.join().unwrap();
@@ -2926,66 +2948,109 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_password_observation_cannot_use_pristine_recovery() {
-        use std::cell::Cell;
-
+    fn command_origin_survives_identity_acceptance_but_not_navigation() {
         let _guard = ring_buffer::test_guard();
-        for status in [Status::Secure, Status::Unknown] {
-            ring_buffer::clear_secure_input_data();
-            let raw = capture_generation();
-            let context = generation();
-            let recovered_observation = Cell::new(false);
-            assert_eq!(
-                apply_refresh_metadata(
-                    pointer_test_probe(raw),
-                    Verdict {
-                        status,
-                        element_changed: false,
-                        identity: MetadataIdentity::Published(1),
-                    },
-                    |request| {
-                        // Isolate the shared status policy from live native
-                        // focus. Model the successful pristine-observation path:
-                        // raw input survives, but old conversion guards expire.
-                        recovered_observation.set(true);
-                        ring_buffer::discard_changed_capture_context(request.generation);
-                    },
-                ),
-                status
-            );
-            assert!(!validate_generation(context));
-            assert_eq!(recovered_observation.get(), status == Status::Unknown);
-            assert_eq!(validate_capture_generation(raw), status == Status::Unknown);
+        ring_buffer::clear_secure_input_data();
+        ring_buffer::push_text("previous-owner");
+        let raw = capture_generation();
+        let context = generation();
+        let origin = CommandContext::for_test(raw, 1, 2);
+        assert!(origin.is_current_with(|| true));
+        assert!(!origin.is_current_with(|| false));
 
-            // The key entered the confirmed password field. Its queued query
-            // now sees the same element after it was changed to ordinary text.
-            let captured = capture_generation();
-            let pending = {
-                let _dispatch = begin_capture_dispatch(captured).unwrap();
-                PendingCapture::new(captured)
-            };
-            assert_eq!(
-                complete_refresh(
-                    pointer_test_probe(captured),
-                    Verdict {
-                        status: Status::NotSecure,
-                        element_changed: false,
-                        identity: MetadataIdentity::Published(1),
-                    },
-                    || true,
-                ),
-                Status::NotSecure
-            );
-            assert!(validate_capture_generation(captured));
-            ring_buffer::push_text("queued-key");
-            drop(pending);
-            // Unknown is a positive control: synthetic decoding must really
-            // append, so the Secure rejection cannot pass through a fake HWND.
-            assert_eq!(
-                ring_buffer::runs_snapshot().is_empty(),
-                status == Status::Secure
-            );
+        // First UIA observation evicts an old owner's history, but the command
+        // still belongs to the same original field and navigation epoch.
+        ring_buffer::discard_changed_capture_context(raw);
+        assert!(!validate_generation(context));
+        assert!(ring_buffer::runs_snapshot().is_empty());
+        assert!(origin.is_current_with(|| true));
+
+        // Tab takes this same production navigation boundary. A later return
+        // to the original native HWND must not revive the queued command.
+        ring_buffer::invalidate_capture_context();
+        assert!(!origin.is_current_with(|| true));
+        let current = CommandContext::for_test(capture_generation(), 1, 2);
+        assert!(!current.is_current_with(|| {
+            // A same-HWND Tab can invalidate the epoch during native lookup.
+            ring_buffer::invalidate_capture_context();
+            true
+        }));
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn delayed_autoconvert_keeps_the_captured_origin_after_navigation() {
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        let mut notification = AutoconvertNotification::default();
+        let origin = CommandContext::for_test(capture_generation(), 1, 2);
+        let ticket = notification.publish(origin).unwrap();
+
+        // The word-end event belongs to A even if its message arrives after
+        // Tab and fresh typing in B. Receipt must not capture B as its origin.
+        ring_buffer::invalidate_capture_context();
+        ring_buffer::push_text("new-field");
+        let received = notification.take(ticket).unwrap();
+        assert_eq!(received, origin);
+        assert!(!received.is_current_with(|| true));
+        let before = ring_buffer::runs_snapshot();
+        {
+            let _scope = received.enter();
+            assert_eq!(protect_new_command(), Status::Unknown);
+            assert_eq!(protect_current_context(), Status::Unknown);
         }
+        assert_eq!(ring_buffer::runs_snapshot(), before);
+
+        // A new event in B remains valid and preserves its own capture epoch.
+        let current = CommandContext::for_test(capture_generation(), 3, 4);
+        let ticket = notification.publish(current).unwrap();
+        let received = notification.take(ticket).unwrap();
+        assert_eq!(received, current);
+        assert!(received.is_current_with(|| true));
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn older_autoconvert_message_cannot_consume_a_newer_origin() {
+        let mut notification = AutoconvertNotification::default();
+        let first = CommandContext::for_test(1, 1, 2);
+        let current = CommandContext::for_test(1, 3, 4);
+        let old_ticket = notification.publish(first).unwrap();
+        let current_ticket = notification.publish(current).unwrap();
+        assert_ne!(old_ticket, current_ticket);
+        // The same operation handles old messages and failed-post cleanup.
+        assert_eq!(notification.take(old_ticket), None);
+        assert_eq!(notification.take(current_ticket), Some(current));
+        assert_eq!(notification.take(current_ticket), None);
+
+        // Never reuse a ticket, including after exhausting the counter.
+        notification.last_ticket = usize::MAX;
+        assert_eq!(notification.publish(first), None);
+        assert_eq!(notification.take(old_ticket), None);
+    }
+
+    #[test]
+    fn stale_command_scope_cancels_without_clearing_the_new_fields_text() {
+        let _guard = ring_buffer::test_guard();
+        ring_buffer::clear_secure_input_data();
+        let origin = CommandContext::for_test(capture_generation(), 1, 2);
+        let scope = origin.enter();
+        assert_eq!(ACTIVE_COMMAND.get(), Some(origin));
+        ring_buffer::invalidate_capture_context();
+        ring_buffer::push_text("new-field");
+        let current = CommandContext::for_test(capture_generation(), 3, 4);
+        {
+            let _nested = current.enter();
+            assert_eq!(ACTIVE_COMMAND.get(), Some(current));
+        }
+        assert_eq!(ACTIVE_COMMAND.get(), Some(origin));
+        let before = ring_buffer::runs_snapshot();
+        assert_eq!(protect_new_command(), Status::Unknown);
+        assert_eq!(protect_current_context(), Status::Unknown);
+        assert_eq!(ring_buffer::runs_snapshot(), before);
+        assert!(current.is_current_with(|| true));
+        drop(scope);
+        assert_eq!(ACTIVE_COMMAND.get(), None);
         ring_buffer::clear_secure_input_data();
     }
 
@@ -3091,7 +3156,7 @@ mod tests {
                                 if !ring_buffer::runs_snapshot().is_empty() {
                                     worker_appended.fetch_add(1, Ordering::Relaxed);
                                 }
-                                Status::NotSecure
+                                Status::Verified
                             } else {
                                 reject_probe(Probe {
                                     generation,
@@ -3154,25 +3219,25 @@ mod tests {
         let _guard = ring_buffer::test_guard();
         for pointer in [false, true] {
             // An older queued Refresh and a waiting pointer anchor must both
-            // reject password-A input after they publish ordinary B. Disabling
+            // reject field-A input after they publish field B. Disabling
             // only revision binding reproduces the old erroneous append.
             assert_eq!(
                 run_publication_fifo_case(pointer, true, true, false),
-                (Status::NotSecure, 3, true)
+                (Status::Verified, 3, true)
             );
             assert_eq!(
                 run_publication_fifo_case(pointer, true, true, true),
-                (Status::NotSecure, 0, false)
+                (Status::Verified, 0, false)
             );
             assert_eq!(
                 run_publication_fifo_case(pointer, true, false, true),
-                (Status::NotSecure, 3, true)
+                (Status::Verified, 3, true)
             );
             // A known, unchanged ordinary B remains usable while its pointer
             // metadata is queried. Every key still needs its own fresh verdict.
             assert_eq!(
                 run_publication_fifo_case(pointer, false, true, true),
-                (Status::NotSecure, 3, true)
+                (Status::Verified, 3, true)
             );
         }
     }
@@ -3186,23 +3251,27 @@ mod tests {
         let result = complete_refresh(
             pointer_test_probe(generation),
             Verdict {
-                status: Status::NotSecure,
+                status: Status::Verified,
                 element_changed: false,
                 identity: MetadataIdentity::Native,
             },
             || true,
         );
-        assert_eq!(result, Status::NotSecure);
+        assert_eq!(result, Status::Verified);
         let native = Verdict {
-            status: Status::NotSecure,
+            status: Status::Verified,
             element_changed: false,
             identity: MetadataIdentity::Native,
         };
         assert!(capture_metadata_allows(None, native));
         assert!(capture_metadata_allows(Some(u64::MAX), native));
-        for status in [Status::Secure, Status::Unknown] {
-            assert!(!capture_metadata_allows(None, Verdict { status, ..native }));
-        }
+        assert!(!capture_metadata_allows(
+            None,
+            Verdict {
+                status: Status::Unknown,
+                ..native
+            }
+        ));
         assert!(validate_capture_generation(generation));
         ring_buffer::push_text("known-native-input");
         assert!(!ring_buffer::runs_snapshot().is_empty());
@@ -3261,13 +3330,7 @@ mod tests {
 
     #[test]
     fn refresh_completion_waits_for_started_snapshot_to_register_its_lease() {
-        for status in [Status::Secure, Status::Unknown] {
-            let verdict = Verdict {
-                status,
-                ..Verdict::UNKNOWN
-            };
-            assert_refresh_waits_for_started_snapshot(verdict);
-        }
+        assert_refresh_waits_for_started_snapshot(Verdict::UNKNOWN);
     }
 
     fn assert_contended_key_stays_rejected(verdict: Verdict) {
@@ -3297,17 +3360,13 @@ mod tests {
 
     #[test]
     fn contended_key_cannot_be_reopened_by_a_denied_observation() {
-        for status in [Status::Secure, Status::Unknown] {
-            let verdict = Verdict {
-                status,
-                ..Verdict::UNKNOWN
-            };
-            assert_contended_key_stays_rejected(verdict);
-        }
+        assert_contended_key_stays_rejected(Verdict::UNKNOWN);
     }
 
     #[test]
-    fn native_password_style_is_checked_without_reading_text() -> windows::core::Result<()> {
+    fn native_capture_verifies_plain_and_password_edit_controls_equally()
+    -> windows::core::Result<()> {
+        let _guard = ring_buffer::test_guard();
         for password in [false, true] {
             let hwnd = unsafe {
                 CreateWindowExW(
@@ -3329,9 +3388,21 @@ mod tests {
                     None,
                 )
             }?;
-            let result = win32_password_state(hwnd);
+            let mut request = pointer_test_probe(capture_generation());
+            request.target.focus = hwnd.0 as usize;
+            let result = native_status(request.target);
             unsafe { DestroyWindow(hwnd) }?;
-            assert_eq!(result, Some(password));
+            assert_eq!(result, Some(Status::Verified));
+            let verdict = Verdict {
+                status: result.unwrap(),
+                element_changed: false,
+                identity: MetadataIdentity::Native,
+            };
+            assert!(capture_metadata_allows(None, verdict));
+            assert_eq!(
+                complete_protection(request, verdict, ProtectionMode::ExistingContext, || true),
+                Status::Verified,
+            );
         }
         Ok(())
     }

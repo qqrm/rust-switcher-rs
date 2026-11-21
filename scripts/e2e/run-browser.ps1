@@ -195,6 +195,21 @@ public static class BrowserInput {
         result.afterRest = Snapshot(window);
         return result;
     }
+    public static double DoubleShiftThenTab(IntPtr window, int delayMs) {
+        if (GetForegroundWindow() != window || delayMs < 0)
+            throw new InvalidOperationException("Invalid shortcut/Tab destination");
+        var shortcut = new[] {Event(0xA0, false), Event(0xA0, true), Event(0xA0, false), Event(0xA0, true)};
+        if (delayMs == 0) {
+            Send(new[] {shortcut[0], shortcut[1], shortcut[2], shortcut[3], Event(0x09, false), Event(0x09, true)});
+            return 0;
+        }
+        Send(shortcut);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Thread.Sleep(delayMs);
+        double elapsed = clock.Elapsed.TotalMilliseconds;
+        Send(new[] {Event(0x09, false), Event(0x09, true)});
+        return elapsed;
+    }
     public static void Click(IntPtr window, int x, int y) {
         RECT bounds;
         if (GetForegroundWindow() != window || !GetWindowRect(window, out bounds) ||
@@ -267,6 +282,15 @@ function Tap-BrowserDoubleShift {
     Tap-BrowserKey 0xA0
     Start-Sleep -Milliseconds 100
     Tap-BrowserKey 0xA0
+}
+
+function Assert-DiagnosticRedaction([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { throw 'Debug redaction check requires actual diagnostic output' }
+    foreach ($secret in @('ghbdtnvbh', 'приветмир')) {
+        if ($Text.Contains($secret, [StringComparison]::Ordinal)) {
+            throw 'INPUT_LOG_VIOLATION: diagnostics contain the synthetic password or its conversion'
+        }
+    }
 }
 function Set-BrowserEnglish($Session) {
     if (-not [BrowserInput]::PostMessage($Session.Handle, 0x50, [UIntPtr]::Zero, $english)) { throw 'Browser layout request failed' }
@@ -658,16 +682,25 @@ try {
     $securityStart = $results.Count
     & (Join-Path $PSScriptRoot 'browser-security-cases.ps1') -Sessions $sessions `
         -SwitcherProcess $switcher -Results $results -Failures $failures
-    if ($results.Count - $securityStart -ne 7) {
-        throw "Expected 7 browser password cases, found $($results.Count - $securityStart)"
+    if ($results.Count - $securityStart -ne 6) {
+        throw "Expected 5 mandatory password cases and 1 provider-capability result, found $($results.Count - $securityStart)"
     }
-    if ($ReleaseExe -and -not $SecurityOnly) {
-        # The production executable owns this phase. Stop the debug hook using
-        # the application's Exit command; the mutation-only invocation skips it.
-        if (-not [BrowserInput]::PostMessage($switcher.MainWindowHandle, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
-            -not $switcher.WaitForExit(8000) -or $switcher.ExitCode -ne 0) {
-            throw 'Debug Switcher did not exit before release browser checks'
+    # End the debug phase cleanly before inspecting its actual diagnostics/profile.
+    if (-not [BrowserInput]::PostMessage($switcher.MainWindowHandle, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
+        -not $switcher.WaitForExit(8000) -or $switcher.ExitCode -ne 0) {
+        throw 'Debug Switcher did not exit after password checks'
+    }
+    $switcherOutput.Wait()
+    $switcherErrors.Wait()
+    Assert-DiagnosticRedaction ($switcherOutput.Result + "`n" + $switcherErrors.Result)
+    foreach ($file in Get-ChildItem -LiteralPath $switcherProfile -File -Recurse) {
+        $contents = [System.IO.File]::ReadAllText($file.FullName)
+        if ($contents.Contains('ghbdtnvbh') -or $contents.Contains('приветмир')) {
+            throw 'INPUT_PERSISTENCE_VIOLATION: profile contains the synthetic password'
         }
+    }
+    Write-Output 'PASS: actual debug diagnostics and saved profile exclude synthetic password text'
+    if ($ReleaseExe -and -not $SecurityOnly) {
         $releaseProfile = Join-Path $runRoot 'release-double-shift-profile'
         New-Item -ItemType Directory -Path $releaseProfile | Out-Null
         # Let the application create its complete default configuration,
@@ -834,7 +867,10 @@ try {
             if ($null -ne $outputTask -and $outputTask.Wait(1000)) { Write-Output $outputTask.Result }
         }
     }
-    $report = [ordered]@{passed = @($results | Where-Object { $null -eq $_.error }).Count;
+    $report = [ordered]@{passed = @($results | Where-Object {
+            $null -eq $_.error -and -not ($_.PSObject.Properties['uncovered'] -and $_.uncovered)
+        }).Count;
+        uncovered = @($results | Where-Object { $_.PSObject.Properties['uncovered'] -and $_.uncovered }).Count;
         total = $results.Count; ordinaryOutcomes = $ordinaryOutcomes; cases = $results.ToArray(); failures = $failures.ToArray(); failure = $failure;
         cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID}
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')

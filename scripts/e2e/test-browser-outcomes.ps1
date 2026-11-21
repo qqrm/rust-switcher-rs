@@ -9,7 +9,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path -LiteralPath $HarnessPath), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Test-BrowserValueWithin', 'Assert-BrowserTargetFocus', 'Assert-BrowserSafeFocusRefusal')) {
+foreach ($name in @('Test-BrowserValueWithin', 'Assert-BrowserTargetFocus', 'Assert-BrowserSafeFocusRefusal', 'Assert-DiagnosticRedaction')) {
     $functions = @($ast.FindAll({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -21,7 +21,7 @@ $securityPath = Join-Path (Split-Path -Parent $HarnessPath) 'browser-security-ca
 $securityAst = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path -LiteralPath $securityPath), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Assert-DelayedPasswordStimulus', 'Assert-CompleteOrdinarySegment', 'Get-OrdinaryTransitionOutcome')) {
+foreach ($name in @('Assert-PasswordTabOutcome')) {
     $helpers = @($securityAst.FindAll({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -119,129 +119,112 @@ foreach ($message in @('fixture protocol error', 'Timed out: exact Double Alt br
     $checks.Add("browser error propagated: $message")
 }
 
-function New-DelayedPasswordFixture {
-    return @{Values = [pscustomobject]@{a = 'g'; b = ''}; Proof = [pscustomobject]@{
-        complete = $true; prevented = $true; delayMs = 45; downOwner = 'a'; finalOwner = 'b';
-        downAt = 100.0; focusAt = 145.0; events = @(
-            [pscustomobject]@{type = 'mouseup'; target = 'b'; key = ''; data = ''; trusted = $true; at = 101.0},
-            [pscustomobject]@{type = 'keydown'; target = 'a'; key = 'g'; data = ''; trusted = $true; at = 102.0},
-            [pscustomobject]@{type = 'input'; target = 'a'; key = ''; data = 'g'; trusted = $true; at = 103.0},
-            [pscustomobject]@{type = 'keyup'; target = 'a'; key = 'g'; data = ''; trusted = $true; at = 104.0},
-            [pscustomobject]@{type = 'focusin'; target = 'b'; key = ''; data = ''; trusted = $true; at = 145.0}
-        )
-    }}
+function New-PasswordTabFixture {
+    return @{Values = [pscustomobject]@{a = 'ghbdtn '; b = 'b-sentinel'; guard = 'guard-sentinel'};
+        Timing = [pscustomobject]@{requestedMs = 30; nativeMs = 30.5};
+        Proof = [pscustomobject]@{sourceBefore = 'ghbdtn '; destinationBefore = 'b-sentinel';
+            sourceOwner = 'a'; finalOwner = 'b'; complete = $true; events = @(
+                [pscustomobject]@{type = 'keyup'; target = 'a'; key = 'Shift'; trusted = $true; eventAt = 100.0; at = 100.0},
+                [pscustomobject]@{type = 'keyup'; target = 'a'; key = 'Shift'; trusted = $true; eventAt = 101.0; at = 101.0},
+                [pscustomobject]@{type = 'keydown'; target = 'a'; key = 'Tab'; trusted = $true; eventAt = 131.0; at = 131.0},
+                [pscustomobject]@{type = 'focusin'; target = 'b'; key = ''; trusted = $true; eventAt = 132.0; at = 132.0})}}
 }
-function Assert-DelayedStimulusRejected([string]$Name, [scriptblock]$Change) {
-    $fixture = New-DelayedPasswordFixture
+function Assert-PasswordTabRejected([string]$Name, [scriptblock]$Change, [string]$ExpectedMarker = '') {
+    $fixture = New-PasswordTabFixture
     & $Change $fixture
     $rejected = $false
-    try { Assert-DelayedPasswordStimulus $fixture.Proof $fixture.Values | Out-Null }
+    try { Assert-PasswordTabOutcome $fixture.Proof $fixture.Values 'ghbdtn ' 'привет ' $fixture.Timing }
     catch {
-        if ($_.Exception.Message.Contains('SECURITY_CAPTURE_VIOLATION:')) { throw 'Invalid stimulus masqueraded as a security finding' }
+        if ($ExpectedMarker -and -not $_.Exception.Message.StartsWith($ExpectedMarker)) { throw }
+        if (-not $ExpectedMarker -and $_.Exception.Message.Contains('WRONG_TARGET_WRITE:')) {
+            throw 'An invalid stimulus was mistaken for a wrong-target write'
+        }
         $rejected = $true
     }
-    if (-not $rejected) { throw "Invalid delayed password stimulus was accepted: $Name" }
+    if (-not $rejected) { throw "Invalid shortcut/Tab outcome was accepted: $Name" }
     $checks.Add($Name)
 }
-$fixture = New-DelayedPasswordFixture
-if ((Assert-DelayedPasswordStimulus $fixture.Proof $fixture.Values) -ne 45) {
-    throw 'Valid delayed password stimulus did not preserve observed timing'
+foreach ($source in @('ghbdtn ', 'привет ')) {
+    $fixture = New-PasswordTabFixture
+    $fixture.Values.a = $source
+    Assert-PasswordTabOutcome $fixture.Proof $fixture.Values 'ghbdtn ' 'привет ' $fixture.Timing
+    $checks.Add('complete source with untouched Tab destination: ' + $source)
 }
-$checks.Add('trusted password input precedes delayed ordinary focus')
-Assert-DelayedStimulusRejected 'password never received input' { param($f) $f.Values.a = '' }
-Assert-DelayedStimulusRejected 'ordinary field received test key' { param($f) $f.Values.b = 'g' }
-Assert-DelayedStimulusRejected 'mousedown did not prevent focus' { param($f) $f.Proof.prevented = $false }
-Assert-DelayedStimulusRejected 'password was not original focus owner' { param($f) $f.Proof.downOwner = 'b' }
-Assert-DelayedStimulusRejected 'ordinary field never gained focus' { param($f) $f.Proof.finalOwner = 'a' }
-Assert-DelayedStimulusRejected 'focus timer too early' { param($f) $f.Proof.focusAt = 124.0 }
-Assert-DelayedStimulusRejected 'focus timer outside provider budget' { param($f) $f.Proof.focusAt = 175.0 }
-Assert-DelayedStimulusRejected 'actual focus event later than timer timestamp' { param($f) $f.Proof.events[4].at = 180.0 }
-Assert-DelayedStimulusRejected 'missing focus timestamp' { param($f) $f.Proof.focusAt = $null }
-Assert-DelayedStimulusRejected 'nonfinite focus timestamp' { param($f) $f.Proof.focusAt = [double]::NaN }
-Assert-DelayedStimulusRejected 'scripted keyboard event' { param($f) $f.Proof.events[1].trusted = $false }
-Assert-DelayedStimulusRejected 'scripted input event' { param($f) $f.Proof.events[2].trusted = $false }
-Assert-DelayedStimulusRejected 'key targeted ordinary field' { param($f) $f.Proof.events[1].target = 'b' }
-Assert-DelayedStimulusRejected 'input targeted ordinary field' { param($f) $f.Proof.events[2].target = 'b' }
-Assert-DelayedStimulusRejected 'input occurred after focus moved' { param($f) $f.Proof.events[2].at = 146.0 }
-Assert-DelayedStimulusRejected 'input event absent' { param($f) $f.Proof.events = @($f.Proof.events | Where-Object type -ne 'input') }
-Assert-DelayedStimulusRejected 'duplicate input event' { param($f) $f.Proof.events += $f.Proof.events[2] }
-
-function New-OrdinaryTransitionFixture {
-    $focus = New-FocusFixture
-    $focus.dom.field = 'guard'
-    $focus.dom.activeId = 'guard'
-    return @{Purpose = 'password-recovery'; Record = @{
-        field = 'guard'; text = 'ghbdtn'; actual = 'ghbdtn'; otherFieldsUnchanged = $true;
-        before = [pscustomobject]@{capturedChars = [long]100}; focusAfter = $focus;
-        inputTrace = @{before = (New-FocusFixture).native; afterFirst = (New-FocusFixture).native;
-            afterRest = (New-FocusFixture).native}
-    }; Journal = [pscustomobject]@{capturedChars = [long]100; pointerBaseline = [long]100;
-        activeChars = 0; cachedChars = 0; captureUnavailable = 1}}
+Assert-PasswordTabRejected 'Tab never happened' { param($f) $f.Proof.complete = $false }
+Assert-PasswordTabRejected 'missing source proof' { param($f) $f.Proof.sourceBefore = '' }
+Assert-PasswordTabRejected 'wrong source owner' { param($f) $f.Proof.sourceOwner = 'b' }
+Assert-PasswordTabRejected 'wrong destination owner' { param($f) $f.Proof.finalOwner = 'a' }
+Assert-PasswordTabRejected 'scripted Tab' { param($f) $f.Proof.events[2].trusted = $false }
+Assert-PasswordTabRejected 'scripted focus' { param($f) $f.Proof.events[3].trusted = $false }
+Assert-PasswordTabRejected 'Tab sent to wrong field' { param($f) $f.Proof.events[2].target = 'b' }
+Assert-PasswordTabRejected 'focus preceded Tab' { param($f) $f.Proof.events[3].at = 130.0 }
+Assert-PasswordTabRejected 'missing Tab timestamp' { param($f) $f.Proof.events[2].at = $null }
+Assert-PasswordTabRejected 'nonfinite focus timestamp' { param($f) $f.Proof.events[3].at = [double]::NaN }
+Assert-PasswordTabRejected 'missing Tab event' { param($f) $f.Proof.events = @($f.Proof.events[0], $f.Proof.events[1], $f.Proof.events[3]) }
+Assert-PasswordTabRejected 'duplicate Tab event' { param($f) $f.Proof.events += $f.Proof.events[2] }
+$fixture = New-PasswordTabFixture
+$fixture.Timing.requestedMs = 0
+$fixture.Timing.nativeMs = 0.0
+$fixture.Proof.events[2].eventAt = 101.0
+$fixture.Proof.events[2].at = 101.0
+Assert-PasswordTabOutcome $fixture.Proof $fixture.Values 'ghbdtn ' 'привет ' $fixture.Timing
+$checks.Add('same-batch timing with trusted final Shift release passes')
+Assert-PasswordTabRejected 'missing timing proof' { param($f) $f.Timing = $null }
+Assert-PasswordTabRejected 'missing native observation' { param($f) $f.Timing.PSObject.Properties.Remove('nativeMs') }
+Assert-PasswordTabRejected 'null native observation' { param($f) $f.Timing.nativeMs = $null }
+Assert-PasswordTabRejected 'nonfinite native observation' { param($f) $f.Timing.nativeMs = [double]::NaN }
+Assert-PasswordTabRejected 'infinite native observation' { param($f) $f.Timing.nativeMs = [double]::PositiveInfinity }
+Assert-PasswordTabRejected 'native observation is not numeric' { param($f) $f.Timing.nativeMs = '30.0' }
+Assert-PasswordTabRejected 'native observation too early' { param($f) $f.Timing.nativeMs = 24.0 }
+Assert-PasswordTabRejected 'native observation at upper bound' { param($f) $f.Timing.nativeMs = 75.0 }
+Assert-PasswordTabRejected 'native observation after conversion delay' { param($f) $f.Timing.nativeMs = 150.0 }
+Assert-PasswordTabRejected 'unsupported requested timing' { param($f) $f.Timing.requestedMs = 100 }
+Assert-PasswordTabRejected 'missing final Shift release' { param($f) $f.Proof.events = @($f.Proof.events[0], $f.Proof.events[2], $f.Proof.events[3]) }
+Assert-PasswordTabRejected 'scripted Shift release' { param($f) $f.Proof.events[1].trusted = $false }
+Assert-PasswordTabRejected 'wrong Shift release owner' { param($f) $f.Proof.events[1].target = 'b' }
+Assert-PasswordTabRejected 'duplicate Shift release' { param($f) $f.Proof.events += $f.Proof.events[1] }
+Assert-PasswordTabRejected 'missing Shift event timestamp' { param($f) $f.Proof.events[1].eventAt = $null }
+Assert-PasswordTabRejected 'missing Shift handler timestamp' { param($f) $f.Proof.events[1].at = $null }
+Assert-PasswordTabRejected 'nonfinite Shift event timestamp' { param($f) $f.Proof.events[1].eventAt = [double]::NaN }
+Assert-PasswordTabRejected 'missing Tab event timestamp' { param($f) $f.Proof.events[2].PSObject.Properties.Remove('eventAt') }
+Assert-PasswordTabRejected 'nonfinite Tab event timestamp' { param($f) $f.Proof.events[2].eventAt = [double]::PositiveInfinity }
+Assert-PasswordTabRejected 'DOM event interval too short' { param($f) $f.Proof.events[2].eventAt = 125.0 }
+Assert-PasswordTabRejected 'DOM event interval at upper bound' { param($f) $f.Proof.events[2].eventAt = 176.0 }
+Assert-PasswordTabRejected 'DOM event interval after conversion delay' { param($f) $f.Proof.events[2].eventAt = 251.0 }
+$fixture = New-PasswordTabFixture
+$fixture.Proof.events[2].at = 251.0
+$fixture.Proof.events[3].at = 252.0
+Assert-PasswordTabOutcome $fixture.Proof $fixture.Values 'ghbdtn ' 'привет ' $fixture.Timing
+$checks.Add('timely input remains valid when DOM handlers are delayed')
+Assert-PasswordTabRejected 'native zero batch carries delay' { param($f) $f.Timing.requestedMs = 0; $f.Timing.nativeMs = 1.0 }
+Assert-PasswordTabRejected 'same-batch event interval too late' {
+    param($f)
+    $f.Timing.requestedMs = 0; $f.Timing.nativeMs = 0.0
+    $f.Proof.events[2].eventAt = 176.0
 }
-function Assert-OrdinaryTransitionRejected([string]$Name, [scriptblock]$Change) {
-    $fixture = New-OrdinaryTransitionFixture
-    & $Change $fixture
+Assert-PasswordTabRejected 'same-batch Tab preceded Shift release' {
+    param($f)
+    $f.Timing.requestedMs = 0; $f.Timing.nativeMs = 0.0
+    $f.Proof.events[2].eventAt = 100.0
+}
+Assert-PasswordTabRejected 'original password leaked' { param($f) $f.Values.b += 'ghbdtn ' } 'WRONG_TARGET_WRITE:'
+Assert-PasswordTabRejected 'converted password leaked' { param($f) $f.Values.b += 'привет ' } 'WRONG_TARGET_WRITE:'
+Assert-PasswordTabRejected 'suffix leaked' { param($f) $f.Values.b += ' ' } 'WRONG_TARGET_WRITE:'
+Assert-PasswordTabRejected 'partial source replacement' { param($f) $f.Values.a = 'пhbdtn ' } 'PARTIAL_SOURCE_WRITE:'
+Assert-PasswordTabRejected 'unrelated field changed' { param($f) $f.Values.guard = '' }
+Assert-DiagnosticRedaction 'TRACE conversion completed; converted_len=9'
+$checks.Add('metadata-only diagnostics pass')
+foreach ($text in @('TRACE original=ghbdtnvbh', 'TRACE converted=приветмир')) {
     $rejected = $false
-    try { Get-OrdinaryTransitionOutcome $fixture.Purpose $fixture.Record $fixture.Journal 123 | Out-Null }
-    catch { $rejected = $true }
-    if (-not $rejected) { throw "Invalid ordinary transition was accepted: $Name" }
-    $checks.Add($Name)
-}
-foreach ($purpose in @('password-recovery', 'type-change-prefix')) {
-    $fixture = New-OrdinaryTransitionFixture
-    $fixture.Purpose = $purpose
-    if ($purpose -eq 'type-change-prefix') {
-        $fixture.Record.field = 'a'; $fixture.Record.text = 'keep'; $fixture.Record.actual = 'keep'
-        $fixture.Record.focusAfter.dom.field = 'a'; $fixture.Record.focusAfter.dom.activeId = 'a'
+    try { Assert-DiagnosticRedaction $text } catch {
+        if (-not $_.Exception.Message.StartsWith('INPUT_LOG_VIOLATION:')) { throw }
+        $rejected = $true
     }
-    if ((Get-OrdinaryTransitionOutcome $purpose $fixture.Record $fixture.Journal 123) -cne 'safe_focus_refusal') {
-        throw 'A complete zero-capture ordinary refusal was not identified'
-    }
-    $checks.Add("verified initial refusal: $purpose")
-    $fixture.Journal.capturedChars += $fixture.Record.text.Length
-    $fixture.Journal.activeChars = $fixture.Record.text.Length
-    $fixture.Journal.captureUnavailable = 0
-    if ((Get-OrdinaryTransitionOutcome $purpose $fixture.Record $fixture.Journal 123) -cne 'captured') {
-        throw 'A complete initial ordinary capture was not identified'
-    }
-    $checks.Add("complete initial capture: $purpose")
+    if (-not $rejected) { throw 'Raw fixture input was accepted in diagnostics' }
+    $checks.Add('secret diagnostic rejected')
 }
-Assert-OrdinaryTransitionRejected 'unrelated case cannot use ordinary refusal' { param($f) $f.Purpose = 'last-word-positive' }
-Assert-OrdinaryTransitionRejected 'wrong ordinary field' { param($f) $f.Record.field = 'a' }
-Assert-OrdinaryTransitionRejected 'ordinary input never arrived' { param($f) $f.Record.actual = '' }
-Assert-OrdinaryTransitionRejected 'partial ordinary input' { param($f) $f.Record.actual = 'hbdtn' }
-Assert-OrdinaryTransitionRejected 'ordinary neighbor changed' { param($f) $f.Record.otherFieldsUnchanged = $false }
-Assert-OrdinaryTransitionRejected 'ordinary native focus changed' { param($f) $f.Record.focusAfter.native.focus = 457 }
-Assert-OrdinaryTransitionRejected 'ordinary DOM focus changed' { param($f) $f.Record.focusAfter.dom.field = 'a' }
-Assert-OrdinaryTransitionRejected 'ordinary document blurred' { param($f) $f.Record.focusAfter.dom.documentFocused = $false }
-Assert-OrdinaryTransitionRejected 'partial physical capture before refusal' { param($f) $f.Journal.capturedChars++ }
-Assert-OrdinaryTransitionRejected 'transient complete capture before refusal' { param($f) $f.Journal.capturedChars += 6 }
-Assert-OrdinaryTransitionRejected 'ordinary refusal was not explicit' { param($f) $f.Journal.captureUnavailable = 0 }
-Assert-OrdinaryTransitionRejected 'ordinary refusal retains active text' { param($f) $f.Journal.activeChars = 1 }
-Assert-OrdinaryTransitionRejected 'ordinary refusal retains cached text' { param($f) $f.Journal.cachedChars = 1 }
-Assert-OrdinaryTransitionRejected 'ordinary pointer baseline differs' { param($f) $f.Journal.pointerBaseline-- }
-Assert-OrdinaryTransitionRejected 'ordinary metadata missing' { param($f) $f.Journal = $null }
-Assert-OrdinaryTransitionRejected 'ordinary counter missing' { param($f) $f.Journal.PSObject.Properties.Remove('capturedChars') }
-Assert-OrdinaryTransitionRejected 'ordinary counter null' { param($f) $f.Journal.capturedChars = $null }
-Assert-OrdinaryTransitionRejected 'ordinary counter string' { param($f) $f.Journal.capturedChars = '100' }
-
-$freshBefore = [pscustomobject]@{capturedChars = [long]100}
-$freshAfter = [pscustomobject]@{capturedChars = [long]106; activeChars = 6; cachedChars = 0; captureUnavailable = 0}
-Assert-CompleteOrdinarySegment $freshBefore $freshAfter 6
-$checks.Add('fresh segment captured exactly six characters')
-foreach ($change in @(
-    @{name = 'fresh segment lost one character'; property = 'capturedChars'; value = [long]105},
-    @{name = 'fresh segment captured an extra character'; property = 'capturedChars'; value = [long]107},
-    @{name = 'fresh segment journal is incomplete'; property = 'activeChars'; value = 5},
-    @{name = 'fresh segment remains unavailable'; property = 'captureUnavailable'; value = 1},
-    @{name = 'fresh segment retains another cache'; property = 'cachedChars'; value = 1}
-)) {
-    $after = [pscustomobject]@{capturedChars = [long]106; activeChars = 6; cachedChars = 0; captureUnavailable = 0}
-    $after.($change.property) = $change.value
-    $rejected = $false
-    try { Assert-CompleteOrdinarySegment $freshBefore $after 6 } catch { $rejected = $true }
-    if (-not $rejected) { throw "Invalid fresh ordinary segment accepted: $($change.name)" }
-    $checks.Add($change.name)
-}
-if ($checks.Count -ne 81) { throw "Browser outcome regression discovery was incomplete: $($checks.Count)" }
+$rejected = $false
+try { Assert-DiagnosticRedaction '' } catch { $rejected = $true }
+if (-not $rejected) { throw 'Absent diagnostics cannot prove redaction' }
+$checks.Add('missing diagnostics rejected')
 Write-Output "PASS: $($checks.Count) browser outcome helper assertions"

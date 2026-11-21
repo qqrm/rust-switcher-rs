@@ -29,8 +29,9 @@ Results are printed in the job log without adding stored workflow artifacts.
 | First character after focus/modifiers | Debug journal matrix switches between two unowned external windows and two controls, releases Ctrl/Alt in the destination, and asserts exact before/after strings | Synthetic input and native Edit controls do not reproduce every Telegram/Qt or physical-keyboard interaction |
 | Browser fields and first-character timing | Debug Double Alt in a real Chrome/Edge process, two windows, input/textarea/contenteditable/shadow DOM/iframe fields, first-key timing and Tab/click navigation | Synthetic input and a local fixture do not prove behavior in the user's exact browser, extensions or web application |
 | Browser selected text with Double Shift | Release EXE with its default Double Shift binding converts prepopulated two-word input/contenteditable selections both ways through UIA, once per gesture, preserving exact text, selection, focus, other fields and clipboard | Chrome/Edge local fixture only; Firefox and the user's actual web applications remain unverified |
-| Browser password fields | Seven debug cases require a real UIA `IsPassword` signal without an Edit/RichEdit HWND, zero captured password characters, empty active/cache journals, blocked text hotkeys, same-HWND transitions, and ordinary-field recovery | Local synthetic passwords and the installed Chrome/Edge version; unknown custom controls and OS races are not universal guarantees |
-| Password test sensitivity | A temporary source mutation makes UIA report ordinary input; the real browser suite must detect journal capture | This mutation targets the UIA password signal; native password styles and other guard layers have separate tests |
+| Browser password fields | Five debug cases require a real UIA `IsPassword` signal without an Edit/RichEdit HWND, complete journal capture, exact default Double Shift/Double Alt conversion both ways, a dynamic type change, and Double Shift immediately followed by Tab | Release physical password typing remains unverified; debug uses the existing hosted-only injection opt-in |
+| Native password selection | The release executable converts a real `ES_PASSWORD` Edit selection with default Double Shift both ways, preserves clipboard and the neighboring field, and cancels or completes in the source when Tab immediately follows | Native message-based selection only; no claim that UIA or clipboard can extract arbitrary password fields |
+| Wrong-target test sensitivity | An unmodified executable must cancel a verified source-read/focus race; a temporary combined target-guard mutation must write into the actual destination and fail the specific assertion | Proves that the race assertion catches the combined fault, not that each overlapping guard is independently necessary |
 | Journal capacity | Native Edit checks 99/100/101 characters; browser checks 101 with a letter and a leading dot; journal unit tests cover 4096 and overflow | Overflow refuses any conversion that reaches the discarded prefix; a complete last word after a retained boundary can still convert |
 | Automatic last-word conversion | Debug runtime toggle followed by a word and space | Other delimiters are not exercised by this GUI scenario |
 | Selected text | Release default Double Shift in a separate native Edit, including after restart; converts a prepopulated two-word phrase once per gesture in both directions, preserving selection, focus, the other field and clipboard | Other applications, rich editors and elevated targets are not exercised |
@@ -40,7 +41,7 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
 | Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
 | Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |
-| Pause and CapsLock layout switching | Browser password cases verify runtime pause state changes and two layout switches while text conversion remains blocked | Tray menu actions are not exercised |
+| CapsLock layout switching | Two ordinary browser click cases switch layouts twice before journal conversion | Pause and tray menu actions are not exercised by these scenarios |
 | Focus and selection changes | Release conversion cancels after the external fixture changes focus or selection, then recovers | Does not make programmatic OS focus changes atomic with input delivery |
 | Unresponsive editors | External Edit blocks for three seconds; release UI stays responsive, does not type later and recovers | A permanently hung UIA provider consumes the one bounded probe worker until restart |
 | Interrupted config writes | Windows unit tests inject partial writes and denied replacement; prior bytes and cleanup are checked | Sudden power loss and non-local filesystems are not simulated |
@@ -182,89 +183,102 @@ unchanged keyboard focus after the first glyph, and assert that changing the
 focused control still starts a separate journal. This tests the state transition
 directly; browser results establish which transitions occurred on that runner.
 
-### Password input acceptance
+### Password conversion and target ownership
 
-`browser-security-cases.ps1` adds exactly seven cases to the browser suite. The
-browser starts with `--force-renderer-accessibility` so the runner exercises its
-real Windows UI Automation provider. Each protected fixture is an HTML password
-input: the harness verifies the focused element's `IsPassword` property and that
-the focused native HWND is not Edit/RichEdit. This prevents a native-style-only
-implementation from accidentally satisfying the browser test.
+`browser-security-cases.ps1` adds five mandatory cases and one provider-dependent
+selection check to the browser suite. The
+browser starts with `--force-renderer-accessibility`; setup requires its real
+Windows UI Automation provider to report the focused HTML input as a password
+and verifies that the native HWND is not Edit/RichEdit. Password classification
+is a fixture prerequisite, not a reason for the application to refuse input.
+All values are synthetic and belong to the launched local fixture.
 
-`browser-config.toml` explicitly enables all eight tested shortcut sequences,
-smart conversion, and the AutoConvert feature. Omitted optional bindings in a
-partial config deserialize as disabled; they do not inherit `Config::default()`.
-A Windows regression loads this exact fixture through the production config
-loader and verifies every active runtime binding. Before password hotkey checks,
-all six text commands must convert ordinary input with the same native key
-sequences. Selection controls contain two words so converting only the last word
-cannot pass. An absent binding cannot satisfy password immutability by doing
-nothing.
+The first two cases type through native input delivery, require a complete
+journal append, and use the default Double Shift or Double Alt gesture to produce
+an exact conversion and then the exact original text. They check native/DOM
+focus, all neighboring fields in both browser windows, and the clipboard
+sequence after each conversion. A third case changes the focused control from
+text to password without moving focus, immediately appends more input, and
+requires conversion of the complete original-plus-new sequence.
 
-All tested input and hotkeys use `SendInput`. CDP changes only the owned fixture's
-setup and reads its synthetic values. Tests cover normal-to-password clicks,
-Shift+Tab under the same native HWND, and changing the currently focused input
-from `text` to `password` without changing focus. No wait for the application's
-guard is inserted between the tested transition and the first password character. Last word, last sequence,
-selected text, their smart variants, and AutoConvert must preserve the complete
-password. Pause and CapsLock layout switching must remain functional. An explicit
-new segment in ordinary contenteditable must journal and convert all fresh
-`ghbdtn` to `привет`.
+The additional selection check changes only the DOM selection to the first two
+characters of an already journaled password. When the real UIA provider exposes
+noncollapsed selection endpoints, Double Shift must leave that source intact:
+masked or unavailable selection text cannot justify replacing it with the whole
+journal. There is no refocus or selection repair after the gesture. If the
+installed browser withholds these endpoints, the result is explicitly
+`UNCOVERED` and excluded from the passed count. Programmatic caret or selection
+changes that the provider does not expose remain a coverage and behavior limit.
 
-Two ordinary-input prerequisites have an explicit first-burst outcome: the
-`keep` prefix before the focused input changes type, and `ghbdtn` on returning
-from a password to contenteditable. Their original immediate bursts are retained
-and recorded before recovery. They must either be completely captured or have
-an exact zero-capture refusal: full original text, unchanged native/DOM focus
-and other fields, empty active/cache journals, unavailable capture, and equality
-with both the pre-burst counter and the pointer-down baseline. Partial or
-transient capture fails. After ordinary UIA metadata is verified, Escape starts
-a new segment in the same field and fresh physical input is appended. The type
-change test requires `keepkeep` with exactly four fresh captured characters,
-then performs its existing value reset/type change immediately followed by the
-password key. The recovery test requires `ghbdtnпривет`, preserving the first
-burst and the neighboring password while converting exactly six fresh captured
-characters. These two paths have dedicated outcome checks. The six text-command
-positive controls, cache-seeding controls, and the 53-case ordinary matrix retain
-their existing strict assertions.
+The two remaining cases type a password with a trailing space, then send Double
+Shift followed by Tab at a requested gap of 0 or 30 ms. The 0 ms scenario sends
+all six key events in one `SendInput` batch. The page records trusted Shift
+releases, Tab and focus events, their owners, event timestamps and handler times.
+The 30 ms case requires both the native measured submission gap and the DOM gap
+from the final Shift release to Tab to be at least 25 ms and below 75 ms. The
+0 ms case requires a zero native gap and a nonnegative DOM event gap below 75 ms.
+This leaves margin before the 100 ms conversion delay. Missing, nonfinite,
+out-of-order or late event/submission observations fail the stimulus instead of
+being accepted as a successful cancellation. Handler times must be ordered but
+may lag while the application blocks in its keyboard hook; delayed processing
+does not invalidate an otherwise timely input submission.
+The assertion validates that the
+prepared source actually received Tab and that the neighboring destination
+received focus before evaluating output. The source must remain fully original
+or become fully converted; partial replacement fails. The destination and every
+other field must remain exactly unchanged, including after a later Double Shift
+in the destination. Before that separate later-command check, any selection that
+Tab created in the destination is collapsed without changing focus or values;
+the original race is already fully observed. The clipboard must also remain unchanged. These cases
+observe the command long enough for the deferred shortcut to execute or cancel;
+they do not claim all possible operating-system scheduling interleavings.
 
-The delayed-focus case starts with verified password field A focused. Ordinary
-field B cancels the click's default focus change and schedules its own focus
-after 45 ms. A single native input batch sends the click and physical `g` key;
-there is no CDP call or protection probe between them. Trusted DOM key/input
-events must show that A received `g` before B gained focus, with B still empty
-and the same native HWND. The observed delay must be at least 25 ms and less
-than 75 ms; a missed timing window or wrong input owner fails the stimulus.
-After the transition, the physical capture counter must remain unchanged and
-all retained text must be empty, including after Double Alt and 2.25 seconds of
-observation. Escape starts a new segment in already-focused B, where fresh
-`ghbdtn` must become `привет` while A remains unchanged. This proves the observed
-password-to-ordinary transition; a deterministic unit test separately forces
-the internal pointer-wait branch. `test-browser-outcomes.ps1` also rejects
-untrusted/missing input events, wrong owners, invalid ordering, and out-of-range
-timestamps so an invalid stimulus cannot masquerade as a security finding.
+The release native suite separately enables `ES_PASSWORD` on the external
+Windows Edit control and verifies exact selected-password conversion in both
+directions using default Double Shift, with full reselection and unchanged focus,
+neighbor and clipboard. It then submits Double Shift and Tab in one input batch;
+the fixture handles the actual Tab message to move focus to its second native
+Edit. Source and destination are checked after the deferred-command lifetime.
+No debug injection override is enabled in this release process. These are
+selection-path tests: the production release journal continues to reject
+injected typing, so this harness does not claim release physical-password capture.
 
-A debug-only, explicitly hosted inspection message (`0x83F0`) returns a version
-marker, active/cache character counts, a monotonic count of physical characters
-appended to the journal, and the runtime AutoConvert state. It exposes no text
-and does not invoke detection or clear state. Comparing the monotonic counter
-before and after password entry detects transient recording even if a later
-guard clears the buffer. Normal-input controls prove the counter is live. Empty
-buffers or an absence of plaintext logs alone are not accepted as proof. The
-cache-clearing case first requires nonempty active and cached journals in two
-ordinary browser windows, then requires both counts to become zero. Old ordinary
-history may take up to one second to clear while the asynchronous verdict arrives;
-the capture counter must remain unchanged from the first check after input and
-on every delivery/cleanup poll. Transition cases then observe for 2.25 seconds,
-longer than the two-second deferred-input lifetime, to detect delayed capture.
+The hosted debug inspection message (`0x83F0`) reports a version marker,
+active/cache character counts, and a cumulative journal append count. It exposes
+no input text and cannot clear state. The browser checks require exact append
+deltas and actual conversions, so a disabled capture path or unbound shortcut
+cannot satisfy them by doing nothing. The 53 ordinary browser cases remain part
+of the same run. After the debug process exits, its real stdout/stderr and its
+isolated application profile are scanned for the distinctive synthetic password
+and its conversion. This covers those known diagnostic and persistence surfaces,
+not arbitrary files or another application's storage.
 
-The mandatory `run-security-mutation.ps1` gate temporarily makes the production
-UIA property helper report `NotSecure`, compiles a separate test executable, and
-restores both source bytes and the protected executable before continuing. It
-runs the same seven browser cases with `-SecurityOnly`. The gate accepts only a
-nonzero exit containing the specific journal-capture assertion; build failures,
-missing inspection support, provider setup errors and timeouts do not count.
-No setting or feature to disable protection is added to release builds.
+`test-browser-outcomes.ps1` checks the production result predicates without
+Windows input. It rejects invalid/untrusted Tab stimuli, wrong event owners,
+missing or unordered timestamps, original/converted/suffix writes to the wrong
+field, partial source edits, and a changed unrelated guard. It also checks that
+the diagnostic canary predicate rejects plaintext and converted input and cannot
+pass on absent diagnostics. These helper checks supplement actual input tests.
+
+### Wrong-target negative control
+
+`run-target-regression.ps1` first proves ordinary selected-text conversion using
+the default Double Shift binding. It then arms the native fixture: the first
+actual source `WM_GETTEXT` starts a 40 ms timer that moves focus to the second
+Edit. The harness requires the fixture's completion signal and the independently
+observed destination HWND before checking that both strings and the clipboard
+are unchanged. This makes source acquisition followed by a focus change a
+repeatable test condition; no command is retried or repaired.
+
+`run-security-mutation.ps1` first requires that test to pass on the unmodified
+executable. It temporarily bypasses the overlapping selection-target,
+command-origin, and final-context guards, compiles one separate debug executable,
+and restores both source bytes and the original debug executable. The same
+native test must then complete its conversion positive control and fail with
+`WRONG_TARGET_WRITE` because the actual destination text changed. Compile errors,
+setup failures, process crashes, timeouts, and a generic nonzero exit do not count
+as detecting the mutation. This deliberately combined fault tests the observed
+wrong-target result; it does not attribute protection to any single guard.
 
 ### Installed layouts and language models
 
