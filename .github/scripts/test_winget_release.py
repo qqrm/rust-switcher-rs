@@ -254,6 +254,16 @@ class ReleaseTests(OfflineTestCase):
 
 
 class ManifestTests(OfflineTestCase):
+    def test_inno_manifest_accepts_the_official_portable_registration_without_uninstalling_it_first(self):
+        files = winget.manifests(VERSION, PUBLISHED, SHA256, "inno")
+        installer = files[f"{winget.MANIFEST_ROOT}/{VERSION}/{winget.PACKAGE_ID}.installer.yaml"]
+        self.assertIn("InstallerType: inno\nScope: user\nUpgradeBehavior: install\n", installer)
+        self.assertIn("ProductCode: QQRM.RustSwitcher_is1\n  InstallerType: inno", installer)
+        self.assertIn("ProductCode: QQRM.RustSwitcher_Microsoft.Winget.Source_8wekyb3d8bbwe\n  InstallerType: portable", installer)
+        self.assertIn(f"releases/download/{TAG}/rust-switcher-setup.exe", installer)
+        self.assertNotIn("uninstallPrevious", installer)
+        self.assertNotIn("Commands:", installer)
+
     def test_generated_manifest_set_has_consistent_identity_and_verified_installer(self):
         files = winget.manifests(VERSION, PUBLISHED, SHA256.lower())
         prefix = f"manifests/q/QQRM/RustSwitcher/{VERSION}/QQRM.RustSwitcher"
@@ -293,6 +303,40 @@ class ManifestTests(OfflineTestCase):
 
 
 class AssetTests(OfflineTestCase):
+    def test_installer_asset_is_preferred_and_its_x86_bootstrap_is_verified(self):
+        data = bytearray(executable())
+        data[68:70] = (0x14C).to_bytes(2, "little")
+        data = bytes(data)
+        setup_url = ASSET_URL.replace("rust-switcher.exe", "rust-switcher-setup.exe")
+        value = release()
+        setup = copy.deepcopy(value["assets"][0])
+        setup.update(name="rust-switcher-setup.exe", browser_download_url=setup_url,
+                     digest="sha256:" + hashlib.sha256(data).hexdigest())
+        value["assets"].append(setup)
+        self.network.return_value = Response(data, setup_url)
+        self.network.side_effect = None
+        self.assertEqual(winget.verify_executable(value, TAG), hashlib.sha256(data).hexdigest().upper())
+        self.assertEqual(self.network.call_args.args[0].full_url, setup_url)
+        self.assertFalse(Path("rust-switcher.exe").exists())
+        with self.assertRaises(ValueError):
+            winget.verify_pe_x64(Path("rust-switcher-setup.exe"))
+
+    def test_invalid_installer_asset_never_falls_back_to_the_portable_executable(self):
+        for invalid in ("digest", "duplicate"):
+            with self.subTest(invalid=invalid):
+                value = release()
+                setup = copy.deepcopy(value["assets"][0])
+                setup.update(name="rust-switcher-setup.exe",
+                             browser_download_url=ASSET_URL.replace("rust-switcher.exe", "rust-switcher-setup.exe"))
+                if invalid == "digest":
+                    setup["digest"] = ""
+                value["assets"].append(setup)
+                if invalid == "duplicate":
+                    value["assets"].append(copy.deepcopy(setup))
+                with self.assertRaises(ValueError):
+                    winget.verify_executable(value, TAG)
+        self.network.assert_not_called()
+
     def test_real_hash_and_pe_verification_use_tokenless_asset_download(self):
         self.network.side_effect = lambda request, **kwargs: Response(executable())
         self.assertEqual(winget.verify_executable(release(), TAG), SHA256)

@@ -40,16 +40,35 @@ cargo install rust-switcher
 
 ### From GitHub Releases
 
-Download `rust-switcher.exe` from Releases.
+The standalone executable is `rust-switcher.exe`. The installer build adds
+`rust-switcher-setup.exe` for a per-user installation when its release is published.
+
+### Via WinGet or UniGetUI
+
+```powershell
+winget install --id QQRM.RustSwitcher --exact --source winget --scope user
+```
+
+The installer updates a running instance automatically and restarts it only if
+it was running before the update. It preserves the existing autostart setting
+and configuration. Existing per-user WinGet portable installations are migrated
+in their current directory, keeping their command alias. A fresh silent install
+does not launch the app or enable autostart. UniGetUI uses the same WinGet package.
+
+This behavior reaches UniGetUI after the installer release is published and its
+manifest is accepted in `microsoft/winget-pkgs`. The existing catalog release
+1.0.29 is still a portable EXE; merging the source change alone does not update
+that catalog entry.
 
 ### Updating
 
 Right-click the tray icon and select **Check for updates**. When a newer stable
-GitHub Release is available, Rust Switcher downloads `rust-switcher.exe`,
-verifies its size and GitHub-published SHA-256 digest, then gracefully exits.
-A detached PowerShell helper replaces the executable and restarts the app.
-The previous executable is kept for rollback until the replacement launches.
-This also works for installations made through Cargo, without running Cargo.
+GitHub Release is available, Rust Switcher verifies the download's size and
+GitHub-published SHA-256 digest. An installer-managed installation uses
+`rust-switcher-setup.exe`, which also updates the installed version reported to
+WinGet. A standalone or Cargo installation uses `rust-switcher.exe`; a detached
+PowerShell helper replaces it and restarts the app, retaining the previous
+executable for rollback until the replacement launches.
 
 Updates require Windows PowerShell 5.1, HTTPS access to GitHub, and write access
 to the installation directory. The update log is saved to
@@ -151,6 +170,17 @@ tooltip and retries briefly if the shell is not ready yet.
 ## Development
 
 This project includes a ready-to-use `bacon.toml` for a fast development loop.
+
+### Windows acceptance checks
+
+CI and release preparation exercise the actual autostart command and WinGet
+upgrades on a disposable Windows runner. Candidate installers are served by an
+isolated trusted REST source generated from the production manifests; WinGet
+still performs package selection and hash verification. The source's HTTPS and
+protocol tests and the native Inno process snapshot controls are required before
+package-manager acceptance. See the
+[E2E coverage and setup](scripts/e2e/README.md#autostart-and-package-manager-updates)
+for prerequisites, temporary certificate handling and the limits of these checks.
 
 ### Bacon hotkeys (from `bacon.toml`)
 

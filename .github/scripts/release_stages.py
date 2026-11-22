@@ -278,7 +278,7 @@ def await_version(args):
 
 def expected_files(version):
     checked_version(version)
-    return {"rust-switcher.exe", f"rust-switcher-{version}-x86_64-pc-windows-msvc.zip",
+    return {"rust-switcher.exe", "rust-switcher-setup.exe", f"rust-switcher-{version}-x86_64-pc-windows-msvc.zip",
             *(f"{name}-{version}.crate" for name in PACKAGES)}
 
 
@@ -294,6 +294,7 @@ def make_bundle(args):
     directory = Path(args.directory)
     directory.mkdir(parents=True, exist_ok=False)
     shutil.copyfile(ROOT / "target/release/rust-switcher.exe", directory / "rust-switcher.exe")
+    shutil.copyfile(ROOT / "target/installer/rust-switcher-setup.exe", directory / "rust-switcher-setup.exe")
     with zipfile.ZipFile(directory / f"rust-switcher-{version}-x86_64-pc-windows-msvc.zip", "w") as archive:
         info = zipfile.ZipInfo("rust-switcher.exe", date_time=(1980, 1, 1, 0, 0, 0))
         info.compress_type = zipfile.ZIP_DEFLATED

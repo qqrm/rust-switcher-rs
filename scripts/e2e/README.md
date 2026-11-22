@@ -18,7 +18,7 @@ must cause the application to replace and reselect it.
 Assertions fail on missing desktop capabilities or timeouts, never skip to green.
 Only unique temporary profiles and processes created by the scenario are used.
 No local Sandbox, shutdown, driver installation or paid runner is required.
-Results are printed in the job log without adding stored workflow artifacts.
+Desktop input results are printed in the job log without adding stored workflow artifacts.
 
 ### Coverage manifest
 
@@ -43,7 +43,7 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Stale updater | A PID-bound shutdown rejects the previous PID; updater recovery does not replace an already running app | Network/download overlap is not injected by the desktop harness |
 | Update log access | A real failing owned helper goes through exit monitoring and the failure notification, then a v4 callback opens the exact Unicode log path in a temporarily configured `.log` reader. The real tray menu opens a read-only log, a Windows no-association result invokes System32 Notepad, ordinary notices clear the action, and a missing log produces an error without creating a file | Callback injection tests the production handler, not a physical toast click or old-process Notification Center history. The disposable VM restores the existing reader's HKCU command default and extension mapping, removes its owned fixture class, and removes only newly created empty parent keys; UserChoice and delegated handlers are never changed |
 | Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
-| Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
+| Autostart | Release UI enables the exact Run command for a path containing spaces; Windows executes that stored command, the app remains responsive and hidden, and disabling survives a normal restart | Actual logon/reboot is not exercised on the disposable job VM |
 | Exit and cleanup | Release and debug Exit, forced predecessor termination, bounded owned-process cleanup | Unexpected crash recovery is not exercised |
 | CapsLock layout switching | Two ordinary browser click cases switch layouts twice before journal conversion | Pause and tray menu actions are not exercised by these scenarios |
 | Focus and selection changes | Release conversion cancels after the external fixture changes focus or selection, then recovers | Does not make programmatic OS focus changes atomic with input delivery |
@@ -54,6 +54,90 @@ Results are printed in the job log without adding stored workflow artifacts.
 The manifest describes assertions implemented by the harness, not a permanent
 claim of success: use the `windows-full` log for the exact tested commit. All
 rows without a hosted assertion remain coverage gaps even when CI is green.
+
+### Autostart and package-manager updates
+
+`autostart-live.ps1` executes the exact registry command through `CreateProcessW`
+without reparsing it into a known executable and arguments. This catches quoting
+and startup-argument defects. It uses a copied release executable and isolated
+APPDATA directory, restores the original Run value and legacy startup shortcut,
+and never needs a real logoff or reboot.
+
+The required `updater-live` CI job also runs `winget-upgrade.ps1`. It installs
+the published 1.0.29 package from the official WinGet source into an owned path,
+then upgrades through the actual WinGet client using an explicit trusted REST
+source on the disposable runner. `winget-test-source.py` reads the validated,
+production-generated Inno manifests and preserves their installer fields,
+including both migration product codes. Metadata uses loopback HTTPS and the
+installer payload uses the local HTTP fixture. WinGet performs its normal
+package selection, hash verification and trusted-source handling. The installer
+fixture versions do not change Cargo versions or publish a release.
+
+The declared Visual C++ runtime dependency is resolved from an official
+`winget export` of the installed version. The harness uses `winget download`
+against the official source for that exact version and serves its exported
+manifest metadata alongside the application. It preserves the original product
+codes and verifies them against the installed version and registration. Normal
+dependency selection and payload hash verification remain active.
+
+Assertions cover a running portable migration, later Inno updates, enabled and
+disabled autostart, stopped-app updates, locked-file failure recovery, fresh
+silent install and uninstall. They check
+the exact executable hash, installed version, process identity and actual tray
+readiness, not merely the installer's exit code. These scenarios also run before
+release publication files are bundled.
+
+Before WinGet acceptance, `inno-array-probe.ps1` compiles and runs an inert Inno 6
+setup. Required controls verify that a global fixed process-handle buffer and
+its count survive native enumeration and image-path calls, retain the expected
+process identity, and release the handle. Separate dynamic-array parameter and
+return-value cases record their actual results, including mismatches; they do
+not determine whether the static controls pass. The included token probe also
+compares duplicate-handle access masks `0xB`, `0x8B`, `0x10B` and `0x18B` using
+only its own primary token. The `0x18B` case must launch an owned `cmd.exe`,
+preserve its logon identity, elevation and session, and exit successfully; the
+other masks remain observations. Every handle and environment release is a
+required control. The probe enables no privileges, installs no application
+files, and bounds cleanup of its own short-lived children. Its observations,
+compiler output and setup log are retained with the package-manager diagnostics.
+This gate runs in both CI and release preparation; the log for the tested commit
+establishes the actual runtime result.
+
+`installer-updater.ps1` tests the production built-in updater against a locally
+built installer. Only GitHub transport is replaced in a separate PowerShell 5.1
+fixture process; normal URL and digest verification remain active. A bad digest
+must leave the original process and installation untouched. A verified update
+must use the installer, preserve preferences and update the installed version.
+The existing standalone updater tests continue to exercise the raw EXE path.
+
+The trusted source requires the already-elevated, disposable hosted runner.
+Its helper temporarily installs one generated CA certificate in
+`LocalMachine\Root`, with bounded import and exact certificate identity checks.
+Cleanup removes the owned source and certificate. The CA private key remains
+in memory; temporary server keys are kept outside diagnostic artifacts. This
+fixture exercises the same source-trust decision as a trusted catalog. It does
+not change Windows protection policies or modify installer verification.
+
+Both CI and release acceptance install the pinned PyYAML dependency and require
+OpenSSL before running the source's Python tests. These tests use real HTTPS,
+verify certificate trust, exercise manifest selection and product-code searches,
+and check bounded shutdown. They can also run locally without registering a
+WinGet source or launching the application:
+
+```powershell
+Get-Command python, openssl -ErrorAction Stop | Out-Null
+python -m pip install -r scripts/e2e/winget-test-source-requirements.txt
+python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+```
+
+The package-manager scenarios exercise official catalog installation and the
+installed registration, followed by candidate upgrades from the owned trusted
+REST source. Publication to the community catalog and subsequent catalog
+indexing are separate operations.
+CI retains package-manager result JSON and installer logs for seven days,
+including failed runs, so failures remain inspectable after the VM is removed.
+The runner remains Windows Server 2025; these checks do not claim a Windows 11
+client reboot or a physical keyboard test.
 
 ### Windows native-input regression workflow
 
