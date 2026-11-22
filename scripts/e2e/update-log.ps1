@@ -137,6 +137,10 @@ function Assert-Receipts([int]$Count) {
 
 $classes = [Microsoft.Win32.Registry]::CurrentUser
 $extensionPath = 'Software\Classes\.log'
+$openWithPath = $extensionPath + '\OpenWithProgids'
+$openWith = $classes.OpenSubKey($openWithPath, $true)
+$openWithExisted = $null -ne $openWith
+if ($null -ne $openWith) { $openWith.Dispose() }
 $progId = 'RSLog.' + [guid]::NewGuid().ToString('N')
 if ($progId.Length -gt 39) { throw 'Owned ProgID exceeds the documented 39-character limit' }
 $progIdPath = 'Software\Classes\' + $progId
@@ -155,6 +159,12 @@ if ($null -ne $extension) {
 }
 $process = $null
 $notepad = $null
+function Read-LogAssociationValue([Microsoft.Win32.RegistryKey]$Hive, [string]$Path) {
+    $key = $Hive.OpenSubKey($Path)
+    if ($null -eq $key) { return '<absent key>' }
+    try { return $key.GetValue('', '<absent value>', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+    finally { $key.Dispose() }
+}
 function Write-LogAssociationDiagnostics([string]$Stage) {
     $choice = $classes.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.log\UserChoice')
     $choiceValue = '<absent>'
@@ -162,6 +172,9 @@ function Write-LogAssociationDiagnostics([string]$Stage) {
         try { $choiceValue = [string]$choice.GetValue('ProgId', '<absent>') } finally { $choice.Dispose() }
     }
     Write-Output "Association $Stage : ProgID=$([UpdateLogShell]::Describe('.log', 0x400, 20)); reader=$([UpdateLogShell]::Describe('.log', 0x400, 2)); owned=$([UpdateLogShell]::Describe($progId, 0x800, 2)); UserChoice=$choiceValue"
+    $merged = [Microsoft.Win32.Registry]::ClassesRoot
+    $machine = [Microsoft.Win32.Registry]::LocalMachine
+    Write-Output "Association registry $Stage : HKCU .log=$(Read-LogAssociationValue $classes $extensionPath); HKLM .log=$(Read-LogAssociationValue $machine $extensionPath); HKCR .log=$(Read-LogAssociationValue $merged '.log'); HKCR owned command=$(Read-LogAssociationValue $merged ($progId + '\shell\open\command'))"
 }
 try {
     Write-LogAssociationDiagnostics 'before setup'
@@ -171,6 +184,11 @@ try {
     try { $shell.SetValue('', 'open') } finally { $shell.Dispose() }
     $command = $classes.CreateSubKey($progIdPath + '\shell\open\command')
     try { $command.SetValue('', '"' + $recorder + '" "' + $capture + '" "%1"') } finally { $command.Dispose() }
+    # Register the candidate as documented for changing an extension default.
+    # Own only this unique value; never replace another application's entry.
+    $openWith = $classes.CreateSubKey($openWithPath)
+    try { $openWith.SetValue($progId, [byte[]]::new(0), [Microsoft.Win32.RegistryValueKind]::None) }
+    finally { $openWith.Dispose() }
     $extension = $classes.CreateSubKey($extensionPath)
     try { $extension.SetValue('', $progId) } finally { $extension.Dispose() }
     [UpdateLogShell]::Refresh()
@@ -278,6 +296,16 @@ try {
             }
         } catch { $cleanupFailures.Add($_.Exception.Message) }
     }
+    try {
+        $openWith = $classes.OpenSubKey($openWithPath, $true)
+        if ($null -ne $openWith) {
+            try {
+                $openWith.DeleteValue($progId, $false)
+                $openWithEmpty = $openWith.SubKeyCount -eq 0 -and $openWith.ValueCount -eq 0
+            } finally { $openWith.Dispose() }
+            if (-not $openWithExisted -and $openWithEmpty) { $classes.DeleteSubKey($openWithPath, $false) }
+        }
+    } catch { $cleanupFailures.Add($_.Exception.Message) }
     $extension = $classes.OpenSubKey($extensionPath, $true)
     if ($null -ne $extension) {
         try {
