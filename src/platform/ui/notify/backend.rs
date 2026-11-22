@@ -50,6 +50,11 @@ fn present_one(hwnd: HWND, n: &Notification) {
         NotifyKind::Error => {
             let _ = crate::platform::win::tray::balloon_error(hwnd, &n.title, &n.text);
         }
+        NotifyKind::UpdateFailure => {
+            let result =
+                crate::platform::win::tray::balloon_update_failure(hwnd, &n.title, &n.text);
+            crate::platform::win::updater::record_failure_notification(result);
+        }
         NotifyKind::Roar => {
             let _ = crate::platform::win::tray::balloon_info(hwnd, &n.title, &n.text);
         }

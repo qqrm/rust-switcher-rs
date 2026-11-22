@@ -18,7 +18,8 @@ mod secure_input_probe;
 pub mod state;
 pub(crate) mod tray;
 mod tray_dispatch;
-mod updater;
+mod update_log;
+pub(crate) mod updater;
 mod visuals;
 mod window;
 mod winutil;
@@ -968,6 +969,7 @@ fn show_main_window(hwnd: HWND) {
 }
 
 unsafe fn on_ncdestroy(hwnd: HWND) -> LRESULT {
+    tray::clear_balloon_action();
     let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut AppState;
     if p.is_null() {
         return LRESULT(0);

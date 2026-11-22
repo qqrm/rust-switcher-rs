@@ -19,6 +19,7 @@ use windows::Win32::{
 pub enum NotifyKind {
     Info,
     Error,
+    UpdateFailure,
     Roar,
 }
 #[allow(dead_code)]
@@ -110,7 +111,9 @@ pub fn push(hwnd: HWND, kind: NotifyKind, title: &str, text: &str) {
     let ts_ms = now_ms();
     let key = hash_key(kind, title, text);
 
-    if is_fast_duplicate(key, ts_ms) {
+    // Each completed update attempt must re-arm its action, even when its
+    // text matches a recently consumed failure notification.
+    if is_fast_duplicate(key, ts_ms) && kind != NotifyKind::UpdateFailure {
         return;
     }
 
@@ -138,6 +141,15 @@ pub fn push_info(hwnd: HWND, title: &str, text: &str) {
 
 pub fn push_error(hwnd: HWND, title: &str, text: &str) {
     push(hwnd, NotifyKind::Error, title, text);
+}
+
+pub(crate) fn push_update_failure(hwnd: HWND, text: &str) {
+    push(
+        hwnd,
+        NotifyKind::UpdateFailure,
+        "Rust Switcher update failed",
+        text,
+    );
 }
 
 #[allow(dead_code)]

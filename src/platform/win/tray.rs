@@ -1,6 +1,9 @@
-use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+use std::{
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+    time::Instant,
 };
 
 use windows::{
@@ -30,21 +33,54 @@ pub enum TrayMenuAction {
     None,
     ToggleAutoConvert,
     Update,
+    OpenUpdateLog,
 }
 
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
-const TRAY_UID: u32 = 1;
+pub(super) const TRAY_UID: u32 = 1;
 const ID_EXIT: u32 = 1001;
 const ID_SHOW_HIDE: u32 = 1002;
 const ID_AUTOCONVERT_TOGGLE: u32 = 1003;
 const ID_CHANGE_THEME: u32 = 1004;
 const ID_UPDATE: u32 = 1005;
+const ID_OPEN_UPDATE_LOG: u32 = 1006;
 const DEFAULT_TRAY_TOOLTIP: &str = "Rust Switcher";
 const RECOVERY_TIMER: usize = 0x5157_0002;
 const MAX_RECOVERY_ATTEMPTS: u32 = 6;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static RECOVERY_ATTEMPT: AtomicU32 = AtomicU32::new(0);
 static GREEN_ICON: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub(super) enum BalloonAction {
+    #[default]
+    None,
+    OpenUpdateLog,
+}
+
+#[derive(Default)]
+struct BalloonState {
+    last_fp: u64,
+    last_at: Option<Instant>,
+    suppressed: u64,
+    action: BalloonAction,
+}
+
+fn balloon_state() -> &'static Mutex<BalloonState> {
+    static STATE: OnceLock<Mutex<BalloonState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(BalloonState::default()))
+}
+
+pub(super) fn take_balloon_action() -> BalloonAction {
+    balloon_state()
+        .lock()
+        .map(|mut state| std::mem::take(&mut state.action))
+        .unwrap_or_default()
+}
+
+pub(super) fn clear_balloon_action() {
+    let _ = take_balloon_action();
+}
 
 pub(crate) fn initialize_recovery() -> Result<()> {
     let message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
@@ -254,32 +290,24 @@ fn balloon_common(
     text: &str,
     flags: u32,
     what: &str,
+    action: BalloonAction,
 ) -> windows::core::Result<()> {
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
-        sync::{Mutex, OnceLock},
         time::{Duration, Instant},
     };
 
-    #[derive(Default)]
-    struct Guard {
-        last_fp: u64,
-        last_at: Option<Instant>,
-        suppressed: u64,
-    }
-
-    static GUARD: OnceLock<Mutex<Guard>> = OnceLock::new();
-
-    fn fingerprint(title: &str, text: &str, flags: u32) -> u64 {
+    fn fingerprint(title: &str, text: &str, flags: u32, action: BalloonAction) -> u64 {
         let mut h = DefaultHasher::new();
         title.hash(&mut h);
         text.hash(&mut h);
         flags.hash(&mut h);
+        action.hash(&mut h);
         h.finish()
     }
 
-    let fp = fingerprint(title, text, flags);
+    let fp = fingerprint(title, text, flags, action);
 
     tracing::debug!(
         msg = "tray_balloon_attempt",
@@ -291,7 +319,9 @@ fn balloon_common(
     let now = Instant::now();
 
     // No unwrap: clippy::unwrap-used is denied.
-    let guard_lock = GUARD.get_or_init(|| Mutex::new(Guard::default())).lock();
+    // Serialize the shell call and action publication with click consumption.
+    // Notifications are also delivered from the notification worker thread.
+    let guard_lock = balloon_state().lock();
     let mut guard = match guard_lock {
         Ok(g) => Some(g),
         Err(_) => {
@@ -306,7 +336,7 @@ fn balloon_common(
             .map(|t| now.duration_since(t) < Duration::from_millis(1500))
             .unwrap_or(false);
 
-        if too_soon && g.last_fp == fp {
+        if too_soon && g.last_fp == fp && g.action == action {
             g.suppressed += 1;
             tracing::debug!(
                 msg = "tray_balloon_suppressed",
@@ -315,9 +345,6 @@ fn balloon_common(
             );
             return Ok(());
         }
-
-        g.last_fp = fp;
-        g.last_at = Some(now);
     }
 
     ensure_icon(hwnd)?;
@@ -337,23 +364,56 @@ fn balloon_common(
     fill_wide(&mut nid.szInfoTitle, title);
     fill_wide(&mut nid.szInfo, text);
 
-    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const nid).as_bool() } {
-        tracing::debug!(msg = "tray_balloon_shown", title = title);
-        return Ok(());
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const nid).as_bool() } {
+        remove_icon(hwnd);
+        ensure_icon(hwnd)?;
+        shell_notify(NIM_MODIFY, &nid, what)?;
     }
 
-    remove_icon(hwnd);
-    ensure_icon(hwnd)?;
-
-    shell_notify(NIM_MODIFY, &nid, what)
+    if let Some(state) = guard.as_mut() {
+        state.last_fp = fp;
+        state.last_at = Some(now);
+        state.action = action;
+    }
+    tracing::debug!(msg = "tray_balloon_shown", title = title, ?action);
+    Ok(())
 }
 
 pub fn balloon_error(hwnd: HWND, title: &str, text: &str) -> windows::core::Result<()> {
-    balloon_common(hwnd, title, text, NIIF_ERROR.0, "balloon_error: NIM_MODIFY")
+    balloon_common(
+        hwnd,
+        title,
+        text,
+        NIIF_ERROR.0,
+        "balloon_error: NIM_MODIFY",
+        BalloonAction::None,
+    )
 }
 
 pub fn balloon_info(hwnd: HWND, title: &str, text: &str) -> windows::core::Result<()> {
-    balloon_common(hwnd, title, text, NIIF_INFO.0, "balloon_info: NIM_MODIFY")
+    balloon_common(
+        hwnd,
+        title,
+        text,
+        NIIF_INFO.0,
+        "balloon_info: NIM_MODIFY",
+        BalloonAction::None,
+    )
+}
+
+pub(crate) fn balloon_update_failure(
+    hwnd: HWND,
+    title: &str,
+    text: &str,
+) -> windows::core::Result<()> {
+    balloon_common(
+        hwnd,
+        title,
+        text,
+        NIIF_ERROR.0,
+        "balloon_update_failure: NIM_MODIFY",
+        BalloonAction::OpenUpdateLog,
+    )
 }
 
 pub fn set_tooltip(hwnd: HWND, tooltip: &str) -> windows::core::Result<()> {
@@ -511,6 +571,14 @@ fn build_tray_menu(
     unsafe { AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()) }?;
 
     unsafe { append_update_item(hmenu) }?;
+    unsafe {
+        AppendMenuW(
+            hmenu,
+            windows::Win32::UI::WindowsAndMessaging::MF_STRING,
+            ID_OPEN_UPDATE_LOG as usize,
+            w!("Open update log"),
+        )
+    }?;
     unsafe { AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()) }?;
 
     unsafe { append_exit_item(hmenu) }?;
@@ -637,6 +705,7 @@ unsafe fn handle_tray_menu_cmd(
         }
 
         ID_UPDATE => Ok(TrayMenuAction::Update),
+        ID_OPEN_UPDATE_LOG => Ok(TrayMenuAction::OpenUpdateLog),
 
         ID_EXIT => {
             (unsafe { request_process_exit(hwnd) })?;
