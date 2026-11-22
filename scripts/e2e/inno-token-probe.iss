@@ -74,13 +74,24 @@ end;
 
 procedure ProbeReadToken(Token: THandle; Information: Integer; var Buffer: TProbeTokenBuffer);
 var
-  Needed: Cardinal;
+  Needed, Expected, ErrorCode: Cardinal;
 begin
+  case Information of
+    20, 12: Expected := 4;
+    10: Expected := 56;
+  else
+    RaiseException('Unsupported token snapshot information class.');
+  end;
   Needed := 0;
-  if not ProbeTokenInformation(Token, Information, Buffer, 1024, Needed) then
-    RaiseException(ProbeTokenError('GetTokenInformation/' + IntToStr(Information)));
-  if (Needed = 0) or (Needed > 1024) then
-    RaiseException('The token snapshot did not fit its fixed buffer.');
+  if not ProbeTokenInformation(Token, Information, Buffer, Expected, Needed) then begin
+    ErrorCode := DLLGetLastError;
+    RaiseException('GetTokenInformation/' + IntToStr(Information) +
+      ';win32=' + IntToStr(ErrorCode) + ';provided=' + IntToStr(Expected) +
+      ';returned=' + IntToStr(Needed));
+  end;
+  if Needed <> Expected then
+    RaiseException('Unexpected token snapshot length;class=' + IntToStr(Information) +
+      ';provided=' + IntToStr(Expected) + ';returned=' + IntToStr(Needed));
 end;
 
 function ProbeTokenSnapshot(Token: THandle): String;
