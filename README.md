@@ -53,7 +53,19 @@ This also works for installations made through Cargo, without running Cargo.
 
 Updates require Windows PowerShell 5.1, HTTPS access to GitHub, and write access
 to the installation directory. The update log is saved to
-`%LOCALAPPDATA%\RustSwitcher\updater.log`. Debug builds cannot self-update.
+`%LOCALAPPDATA%\RustSwitcher\updater.log`. Click the latest update failure
+notification or choose **Open update log** from the tray menu to open that file
+with your default `.log` reader. If no reader is associated, Rust Switcher uses
+Windows Notepad. A missing or unreadable log, or a reader that cannot start,
+produces a visible error; opening the log does not create or overwrite it.
+Debug builds cannot self-update.
+
+Failure notifications remain clickable after their banner disappears while
+the same application instance owns the latest notification. Ordinary
+notifications replace that action. Older notification history and notifications
+from a previous process cannot identify their original action through the
+legacy tray API; use **Open update log** for those cases. The updater records
+helper launch failures, exit status, and bounded stderr diagnostics in the log.
 
 External `cargo install rust-switcher --force` still cannot replace a running
 executable. Exit Rust Switcher first when installing through Cargo.
