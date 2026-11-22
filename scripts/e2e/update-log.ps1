@@ -143,9 +143,11 @@ $classes = [Microsoft.Win32.Registry]::CurrentUser
 $extensionPath = 'Software\Classes\.log'
 $baselineProgId = 'txtfile'
 $systemNotepad = Join-Path ([Environment]::GetFolderPath('System')) 'notepad.exe'
-$missingProgId = 'RSLog.' + [guid]::NewGuid().ToString('N')
-$missingClass = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($missingProgId)
-if ($null -ne $missingClass) { $missingClass.Dispose(); throw 'Missing-association fixture class unexpectedly exists' }
+$unassociatedProgId = 'RSLog.' + [guid]::NewGuid().ToString('N')
+$unassociatedClassPath = 'Software\Classes\' + $unassociatedProgId
+$existingClass = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($unassociatedProgId)
+if ($null -ne $existingClass) { $existingClass.Dispose(); throw 'Owned association fixture class unexpectedly exists' }
+$unassociatedClassCreated = $false
 # Read snapshots without creating an empty per-user extension shadow key.
 $extension = $classes.OpenSubKey($extensionPath, $true)
 $extensionExisted = $null -ne $extension
@@ -273,14 +275,23 @@ try {
     Wait-Condition { (Failure-NotificationCount) -eq 3 } 'held helper completion'
     Record-Pass 'release ordinary notification clears the update log action while the UI stays responsive'
 
-    # A nonexistent unique class supplies the separate no-association case.
+    # A missing class mapping is ignored by this Windows image. Register the
+    # owned candidate used in the earlier native reproduction, then require
+    # Windows itself to report no effective association before testing fallback.
     # This is the first extension-mapping write; no user-choice data is touched.
+    $type = $classes.CreateSubKey($unassociatedClassPath)
+    $unassociatedClassCreated = $true
+    try { $type.SetValue('', 'Rust Switcher unselected log reader fixture') } finally { $type.Dispose() }
+    $shell = $classes.CreateSubKey($unassociatedClassPath + '\shell')
+    try { $shell.SetValue('', 'open') } finally { $shell.Dispose() }
+    $command = $classes.CreateSubKey($unassociatedClassPath + '\shell\open\command')
+    try { $command.SetValue('', '"' + $recorder + '" "' + $capture + '" "%1"') } finally { $command.Dispose() }
     $extension = $classes.CreateSubKey($extensionPath)
-    try { $extension.SetValue('', $missingProgId) } finally { $extension.Dispose() }
+    try { $extension.SetValue('', $unassociatedProgId) } finally { $extension.Dispose() }
     [UpdateLogShell]::Refresh()
     try {
         Wait-Condition { [UpdateLogShell]::AssociationResult() -eq [uint32]2147943555 } 'exact ERROR_NO_ASSOCIATION for .log'
-    } finally { Write-LogAssociationDiagnostics 'after selecting nonexistent fixture ProgID' }
+    } finally { Write-LogAssociationDiagnostics 'after selecting unassociated fixture ProgID' }
     Invoke-LogTrayItem $process $handle 'Open update log'
     Wait-Condition {
         @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)" | Where-Object {
@@ -295,7 +306,7 @@ try {
     Wait-Condition { $notepad.Refresh(); $notepad.MainWindowHandle -ne [IntPtr]::Zero } 'owned Notepad window'
     [HostedInput]::PostMessage($notepad.MainWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     if (-not $notepad.WaitForExit(5000)) { throw 'Owned Notepad did not close' }
-    Record-Pass 'release missing .log association falls back to System32 Notepad with the exact path'
+    Record-Pass 'release opens System32 Notepad with the exact path when Windows reports no effective .log association'
 
     Remove-Item -LiteralPath $logPath
     Invoke-LogTrayItem $process $handle 'Open update log'
@@ -339,6 +350,9 @@ try {
             } finally { $extension.Dispose() }
             if (-not $extensionExisted -and $empty) { $classes.DeleteSubKey($extensionPath, $false) }
         }
+    } catch { $cleanupFailures.Add($_.Exception.Message) }
+    try {
+        if ($unassociatedClassCreated) { $classes.DeleteSubKeyTree($unassociatedClassPath, $false) }
     } catch { $cleanupFailures.Add($_.Exception.Message) }
     for ($index = $handlerParents.Count - 1; $index -ge 0; $index--) {
         $parent = $handlerParents[$index]
