@@ -573,42 +573,78 @@ try {
     $port = $reservation.LocalEndpoint.Port
     $reservation.Stop()
     $script:serverUrl = "http://127.0.0.1:$port/"
-    $serverJob = Start-Job -ArgumentList $script:serverUrl, $serveDirectory -ScriptBlock {
-        param($Prefix, $Directory)
+    $serverLog = Join-Path $logDirectory 'loopback-server.log'
+    $serverJob = Start-Job -ArgumentList $script:serverUrl, $serveDirectory, $serverLog -ScriptBlock {
+        param($Prefix, $Directory, $LogPath)
         $ErrorActionPreference = 'Stop'
+        function Write-ServerLog([string]$Message) {
+            [IO.File]::AppendAllText($LogPath,
+                ([DateTime]::UtcNow.ToString('o') + ' ' + $Message + [Environment]::NewLine))
+        }
         $listener = [Net.HttpListener]::new()
-        $listener.Prefixes.Add($Prefix)
-        $listener.Start()
         try {
+            $listener.Prefixes.Add($Prefix)
+            $listener.Start()
+            Write-ServerLog "Listening on $Prefix; serving $Directory"
             while ($listener.IsListening) {
-                $context = $listener.GetContext()
+                # A synchronous GetContext blocks Stop-Job indefinitely when
+                # no client is connected. Poll async acceptance so PowerShell
+                # can stop the job and run the listener's finally block.
+                $pending = $listener.GetContextAsync()
+                while (-not $pending.Wait(200)) { }
+                $context = $pending.GetAwaiter().GetResult()
                 try {
                     $name = $context.Request.Url.AbsolutePath.TrimStart('/')
-                    if ($name -eq 'health') {
+                    $method = $context.Request.HttpMethod
+                    if ($method -notin @('GET', 'HEAD')) {
+                        $context.Response.StatusCode = 405
+                    } elseif ($name -eq 'health') {
                         $bytes = [Text.Encoding]::UTF8.GetBytes('ready')
+                        # Without a text Content-Type, PowerShell 7 exposes
+                        # Content as byte[], so comparing it with 'ready' fails.
+                        $context.Response.ContentType = 'text/plain; charset=utf-8'
                         $context.Response.ContentLength64 = $bytes.Length
-                        $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+                        if ($method -eq 'GET') { $context.Response.OutputStream.Write($bytes, 0, $bytes.Length) }
                     } elseif ($name -cmatch '^[a-z0-9-]+-setup\.exe$' -and
                         (Test-Path -LiteralPath (Join-Path $Directory $name))) {
                         $stream = [IO.File]::OpenRead((Join-Path $Directory $name))
                         try {
                             $context.Response.ContentType = 'application/octet-stream'
                             $context.Response.ContentLength64 = $stream.Length
-                            $stream.CopyTo($context.Response.OutputStream)
+                            if ($method -eq 'GET') { $stream.CopyTo($context.Response.OutputStream) }
                         } finally { $stream.Dispose() }
                     } else { $context.Response.StatusCode = 404 }
+                    Write-ServerLog "$method /$name -> $($context.Response.StatusCode), $($context.Response.ContentLength64) bytes"
                 } finally { $context.Response.Close() }
             }
+        } catch {
+            Write-ServerLog ("Server failure: " + $_.Exception.ToString())
+            throw
         } finally { $listener.Close() }
     }
     $ready = $false
-    for ($attempt = 0; $attempt -lt 50; $attempt++) {
-        if ($serverJob.State -eq 'Failed') { throw "Loopback server failed: $(Receive-Job $serverJob 2>&1)" }
-        try { $ready = (Invoke-WebRequest ($script:serverUrl + 'health') -TimeoutSec 1).Content -eq 'ready' } catch { }
+    $lastProbe = 'No HTTP response received.'
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        if ($serverJob.State -notin @('NotStarted', 'Running')) { break }
+        try {
+            $response = Invoke-WebRequest ($script:serverUrl + 'health') -TimeoutSec 2 -NoProxy
+            $lastProbe = "HTTP $($response.StatusCode), content type '$($response.Headers['Content-Type'])', body type $($response.Content.GetType().FullName)"
+            $ready = $response.StatusCode -eq 200 -and $response.Content -ceq 'ready'
+        } catch { $lastProbe = $_.Exception.ToString() }
         if ($ready) { break }
         Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $readyDeadline)
+    if (-not $ready) {
+        $diagnostics = @("Job state: $($serverJob.State)", "Last health probe: $lastProbe")
+        foreach ($job in @($serverJob) + @($serverJob.ChildJobs)) {
+            if ($null -ne $job.JobStateInfo.Reason) { $diagnostics += $job.JobStateInfo.Reason.ToString() }
+            $diagnostics += @($job.Error | ForEach-Object { $_.ToString() })
+        }
+        if (Test-Path -LiteralPath $serverLog) { $diagnostics += Get-Content -LiteralPath $serverLog -Tail 20 }
+        throw ("Loopback download server did not become ready.`n" + ($diagnostics -join [Environment]::NewLine))
     }
-    if (-not $ready) { throw 'Loopback download server did not become ready.' }
+    Write-Host "Loopback download server ready: $script:serverUrl ($lastProbe)"
     $initialManifest = Prepare-Manifest $ManifestDirectory $InstallerPath $PackageVersion 'migration'
 
     $installedByTest = $true

@@ -30,8 +30,6 @@ $failure = $null
 $registrySnapshot = $null
 $legacyMoved = $false
 
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -42,10 +40,16 @@ using System.Text;
 public static class AutostartAcceptance {
     private delegate bool EnumWindowCallback(IntPtr window, IntPtr parameter);
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumWindowCallback callback, IntPtr parameter);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr window);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongW", ExactSpelling=true)] private static extern int GetWindowLong(IntPtr window, int index);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
     private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
@@ -81,6 +85,51 @@ public static class AutostartAcceptance {
     public static bool Responsive(IntPtr window) {
         UIntPtr result;
         return SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 2, 500, out result) != IntPtr.Zero;
+    }
+    public static IntPtr Button(IntPtr parent, string caption) {
+        uint parentProcess;
+        if (GetWindowThreadProcessId(parent, out parentProcess) == 0)
+            throw new InvalidOperationException("Owned settings window no longer exists");
+        var matches = new List<IntPtr>();
+        EnumChildWindows(parent, (window, parameter) => {
+            uint process;
+            GetWindowThreadProcessId(window, out process);
+            if (process == parentProcess && GetParent(window) == parent) {
+                var name = new StringBuilder(256);
+                var text = new StringBuilder(256);
+                GetClassName(window, name, name.Capacity);
+                GetWindowText(window, text, text.Capacity);
+                if (name.ToString().Equals("Button", StringComparison.OrdinalIgnoreCase) &&
+                    text.ToString().Equals(caption, StringComparison.Ordinal)) matches.Add(window);
+            }
+            return true;
+        }, IntPtr.Zero);
+        if (matches.Count > 1) throw new InvalidOperationException("Multiple owned buttons: " + caption);
+        if (matches.Count == 0 || !IsWindowVisible(matches[0]) || !IsWindowEnabled(matches[0]))
+            return IntPtr.Zero;
+        return matches[0];
+    }
+    private static UIntPtr ButtonMessage(IntPtr button, uint message) {
+        if (!IsWindowVisible(button) || !IsWindowEnabled(button))
+            throw new InvalidOperationException("Owned button is not visible and enabled");
+        UIntPtr result;
+        if (SendMessageTimeout(button, message, UIntPtr.Zero, IntPtr.Zero, 2, 2000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned button message failed");
+        return result;
+    }
+    public static bool Checked(IntPtr button) {
+        // BS_AUTOCHECKBOX is the production control style. A non-checkbox also
+        // returns zero for BM_GETCHECK, so reject it before interpreting the state.
+        if ((GetWindowLong(button, -16) & 0xF) != 3)
+            throw new InvalidOperationException("Owned control is not an automatic checkbox");
+        ulong state = ButtonMessage(button, 0xF0).ToUInt64(); // BM_GETCHECK
+        if (state > 1) throw new InvalidOperationException("Checkbox returned an indeterminate state");
+        return state == 1;
+    }
+    public static void Click(IntPtr button) {
+        // BM_CLICK sends mouse down/up and BN_CLICKED to the actual UI handler.
+        // Do not set the check state or write the setting from this harness.
+        ButtonMessage(button, 0xF5);
     }
     public static string DescribeWindows(int processId) {
         var windows = new List<string>();
@@ -199,25 +248,24 @@ function Wait-StartupWindow($Process, [bool]$Visible, [string]$Description) {
     }
     return Get-Window $Process
 }
-function Get-Control($Window, [string]$Name) {
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
-    $condition = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
-    $control = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-    if ($null -eq $control) { throw "Missing control: $Name" }
-    return $control
+function Get-Button($Window, [string]$Name) {
+    Wait-Condition { [AutostartAcceptance]::Button($Window, $Name) -ne [IntPtr]::Zero } "visible enabled owned button: $Name"
+    return [AutostartAcceptance]::Button($Window, $Name)
 }
 function Get-Toggle($Window, [string]$Name) {
-    return (Get-Control $Window $Name).GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+    return [AutostartAcceptance]::Checked((Get-Button $Window $Name))
+}
+function Click-Button($Window, [string]$Name) {
+    [AutostartAcceptance]::SetForegroundWindow($Window) | Out-Null
+    Wait-Condition { [AutostartAcceptance]::GetForegroundWindow() -eq $Window } 'owned settings window foreground'
+    [AutostartAcceptance]::Click((Get-Button $Window $Name))
 }
 function Set-Toggle($Window, [string]$Name, [bool]$Enabled) {
-    $pattern = Get-Toggle $Window $Name
-    $state = if ($Enabled) { [System.Windows.Automation.ToggleState]::On } else { [System.Windows.Automation.ToggleState]::Off }
-    if ($pattern.Current.ToggleState -ne $state) { $pattern.Toggle() }
-    Wait-Condition { $pattern.Current.ToggleState -eq $state } "toggle $Name"
+    if ((Get-Toggle $Window $Name) -ne $Enabled) { Click-Button $Window $Name }
+    Wait-Condition { (Get-Toggle $Window $Name) -eq $Enabled } "toggle $Name"
 }
 function Quit-Release($Process, $Window) {
-    (Get-Control $Window 'Exit').GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Click-Button $Window 'Exit'
     if (-not $Process.WaitForExit(10000)) { throw 'Application did not exit gracefully' }
     if ($Process.ExitCode -ne 0) { throw "Application exit code was $($Process.ExitCode)" }
 }
@@ -268,8 +316,7 @@ try {
 
     [AutostartAcceptance]::ShowWindow($window, 9) | Out-Null
     Wait-Condition { [AutostartAcceptance]::IsWindowVisible($window) } 'reveal owned settings window'
-    if ((Get-Toggle $window 'Start on startup').Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On -or
-        (Get-Toggle $window 'Start minimized').Current.ToggleState -ne [System.Windows.Automation.ToggleState]::Off) {
+    if (-not (Get-Toggle $window 'Start on startup') -or (Get-Toggle $window 'Start minimized')) {
         throw 'Autostart state or independent start-minimized preference was not preserved'
     }
     Set-Toggle $window 'Start on startup' $false
@@ -278,7 +325,7 @@ try {
     $process = Start-Release
     $window = Wait-StartupWindow $process $true 'manual restart after disabling autostart'
     if ((Read-Registration).Exists -or
-        (Get-Toggle $window 'Start on startup').Current.ToggleState -ne [System.Windows.Automation.ToggleState]::Off -or
+        (Get-Toggle $window 'Start on startup') -or
         -not [AutostartAcceptance]::IsWindowVisible($window)) {
         throw 'Disabled autostart did not remain disabled across a normal restart'
     }

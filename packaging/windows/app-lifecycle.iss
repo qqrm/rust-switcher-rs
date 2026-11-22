@@ -3,11 +3,11 @@
 #endif
 #pragma message "Compiling native lifecycle with Inno Setup " + DecodeVer(VER)
 
-; Shared per-user application lifecycle. Include after [Code].
-; Required defines: AppName, AppExeName, PackageIdentifier, RunValueName,
-; AppId, RestartArguments, AutostartArguments, DefaultInstallDirectory.
-; CloseApplications and RestartApplications must both be disabled: legacy
-; portable releases do not register with Windows Restart Manager.
+{ Shared per-user application lifecycle. Include after [Code].
+  Required defines: AppName, AppExeName, PackageIdentifier, RunValueName,
+  AppId, RestartArguments, AutostartArguments, DefaultInstallDirectory.
+  CloseApplications and RestartApplications must both be disabled: legacy
+  portable releases do not register with Windows Restart Manager. }
 #ifndef AdditionalPayloadName
   #define AdditionalPayloadName ""
 #endif
