@@ -621,6 +621,13 @@ try {
             [IO.File]::AppendAllText($LogPath,
                 ([DateTime]::UtcNow.ToString('o') + ' ' + $Message + [Environment]::NewLine))
         }
+        function Test-TransferInterruption([Exception]$Exception) {
+            while ($null -ne $Exception) {
+                if ($Exception -is [Net.HttpListenerException] -or $Exception -is [IO.IOException]) { return $true }
+                $Exception = $Exception.InnerException
+            }
+            return $false
+        }
         $listener = [Net.HttpListener]::new()
         try {
             $listener.Prefixes.Add($Prefix)
@@ -636,8 +643,11 @@ try {
                 try {
                     $name = $context.Request.Url.AbsolutePath.TrimStart('/')
                     $method = $context.Request.HttpMethod
+                    $rangeHeader = [string]$context.Request.Headers['Range']
+                    Write-ServerLog "Request $method /$name; Range='$rangeHeader'; User-Agent='$($context.Request.UserAgent)'"
                     if ($method -notin @('GET', 'HEAD')) {
                         $context.Response.StatusCode = 405
+                        $context.Response.ContentLength64 = 0
                     } elseif ($name -eq 'health') {
                         $bytes = [Text.Encoding]::UTF8.GetBytes('ready')
                         # Without a text Content-Type, PowerShell 7 exposes
@@ -650,12 +660,71 @@ try {
                         $stream = [IO.File]::OpenRead((Join-Path $Directory $name))
                         try {
                             $context.Response.ContentType = 'application/octet-stream'
-                            $context.Response.ContentLength64 = $stream.Length
-                            if ($method -eq 'GET') { $stream.CopyTo($context.Response.OutputStream) }
+                            $context.Response.Headers['Accept-Ranges'] = 'bytes'
+                            $modified = [IO.File]::GetLastWriteTimeUtc((Join-Path $Directory $name))
+                            $etag = '"{0:x}-{1:x}"' -f $stream.Length, $modified.Ticks
+                            $lastModified = $modified.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+                            $context.Response.Headers['ETag'] = $etag
+                            $context.Response.Headers['Last-Modified'] = $lastModified
+                            [long]$start = 0
+                            [long]$end = $stream.Length - 1
+                            $valid = $true
+                            $ifRange = [string]$context.Request.Headers['If-Range']
+                            if ($method -eq 'GET' -and $rangeHeader -and
+                                (-not $ifRange -or $ifRange -ceq $etag -or $ifRange -ceq $lastModified)) {
+                                # Delivery Optimization probes and downloads in ranges.
+                                # Return exactly the requested bytes, not the entire file.
+                                $range = [regex]::Match($rangeHeader.Trim(), '^bytes=(\d*)-(\d*)$')
+                                if (-not $range.Success -or $stream.Length -eq 0) { $valid = $false }
+                                elseif (-not $range.Groups[1].Value) {
+                                    [long]$suffix = 0
+                                    $valid = [long]::TryParse($range.Groups[2].Value, [ref]$suffix) -and $suffix -gt 0
+                                    if ($valid) { $start = [Math]::Max(0L, $stream.Length - $suffix) }
+                                } else {
+                                    $valid = [long]::TryParse($range.Groups[1].Value, [ref]$start)
+                                    if ($valid -and $range.Groups[2].Value) {
+                                        $valid = [long]::TryParse($range.Groups[2].Value, [ref]$end)
+                                    }
+                                    $end = [Math]::Min($end, $stream.Length - 1)
+                                    $valid = $valid -and $start -lt $stream.Length -and $end -ge $start
+                                }
+                                if ($valid) {
+                                    $context.Response.StatusCode = 206
+                                    $context.Response.Headers['Content-Range'] = "bytes $start-$end/$($stream.Length)"
+                                } else {
+                                    $context.Response.StatusCode = 416
+                                    $context.Response.Headers['Content-Range'] = "bytes */$($stream.Length)"
+                                }
+                            }
+                            $context.Response.ContentLength64 = $(if ($valid) { $end - $start + 1 } else { 0 })
+                            Write-ServerLog "Response $method /$name -> $($context.Response.StatusCode), $($context.Response.ContentLength64) bytes"
+                            if ($method -eq 'GET' -and $valid) {
+                                $null = $stream.Seek($start, [IO.SeekOrigin]::Begin)
+                                $buffer = [byte[]]::new(65536)
+                                [long]$remaining = $end - $start + 1
+                                while ($remaining -gt 0) {
+                                    $count = $stream.Read($buffer, 0, [int][Math]::Min($remaining, $buffer.Length))
+                                    if ($count -eq 0) { throw 'The staged installer changed during its download.' }
+                                    $context.Response.OutputStream.Write($buffer, 0, $count)
+                                    $remaining -= $count
+                                }
+                            }
                         } finally { $stream.Dispose() }
-                    } else { $context.Response.StatusCode = 404 }
-                    Write-ServerLog "$method /$name -> $($context.Response.StatusCode), $($context.Response.ContentLength64) bytes"
-                } finally { $context.Response.Close() }
+                    } else {
+                        $context.Response.StatusCode = 404
+                        $context.Response.ContentLength64 = 0
+                    }
+                    Write-ServerLog "Completed $method /$name -> $($context.Response.StatusCode), $($context.Response.ContentLength64) bytes"
+                } catch {
+                    if (-not (Test-TransferInterruption $_.Exception)) { throw }
+                    # A downloader may cancel a probe or range. That connection
+                    # is finished; the listener must remain available for retry.
+                    Write-ServerLog ("Transfer interrupted for $method /$name`: " + $_.Exception.ToString())
+                    try { $context.Response.Abort() } catch { }
+                } finally {
+                    try { $context.Response.Close() }
+                    catch { Write-ServerLog ("Response close failed: " + $_.Exception.Message) }
+                }
             }
         } catch {
             Write-ServerLog ("Server failure: " + $_.Exception.ToString())

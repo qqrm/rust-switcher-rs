@@ -157,7 +157,17 @@ public static class AutostartAcceptance {
         if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero,
                 false, 0, IntPtr.Zero, directory, ref startup, out created))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Stored Run command failed");
-        try { return Process.GetProcessById(checked((int)created.processId)); }
+        try {
+            var process = Process.GetProcessById(checked((int)created.processId));
+            try {
+                // GetProcessById is initially only a PID association. Retain a
+                // .NET-owned native handle before closing CreateProcess's handle
+                // so WaitForExit and ExitCode remain valid after the child exits.
+                if (process.Handle == IntPtr.Zero)
+                    throw new InvalidOperationException("Cannot retain the started process handle");
+                return process;
+            } catch { process.Dispose(); throw; }
+        }
         finally { CloseHandle(created.thread); CloseHandle(created.process); }
     }
 }
