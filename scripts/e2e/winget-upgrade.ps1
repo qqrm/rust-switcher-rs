@@ -79,6 +79,7 @@ $cleanupErrors = [Collections.Generic.List[string]]::new()
 $serverJob = $null
 $fileLock = $null
 $winget = $null
+$wingetLogDirectory = $null
 $changedLocalManifestSetting = $false
 $settingsSnapshot = $null
 $runSnapshot = $null
@@ -387,6 +388,7 @@ function Stop-Installed {
         if ($process.HasExited) { continue }
         $quitArguments = @('--quit-for-update')
         if ($Application -eq 'brightwheel') { $quitArguments += "--quit-for-update=$($process.Id)" }
+        elseif ($Application -eq 'rust-switcher') { $quitArguments += @('--parent-pid', "$($process.Id)") }
         $null = Invoke-Logged $installedExe $quitArguments "application-quit-$($process.Id)" 15
         if (-not $process.WaitForExit(10000)) { throw 'Installed application did not stop after its quit command.' }
     }
@@ -486,9 +488,37 @@ function Build-Fixture([int]$Offset) {
     return @{ Version = $fixtureVersion; Setup = $setup; Manifests = (Join-Path $output 'winget') }
 }
 function Upgrade-Package([string]$Manifest, [string]$Stage, [switch]$AllowFailure) {
-    return Invoke-WinGet @('upgrade', '--manifest', $Manifest, '--silent',
+    # WinGet 1.29.380 rejects --log with upgrade --manifest: --log belongs
+    # to SingleInstallerBehavior, which UpgradeCommand requires a query for.
+    # Its Inno handler still adds /LOG automatically. Capture that default log
+    # without changing the production manifest or weakening the upgrade path.
+    $priorLogs = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
+        $priorLogs[$file.FullName] = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
+    }
+    $result = Invoke-WinGet @('upgrade', '--manifest', $Manifest, '--silent',
         '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity',
-        '--log', (Join-Path $logDirectory "$Stage-installer.log"), '--verbose-logs') $Stage -AllowFailure:$AllowFailure
+        '--verbose-logs') $Stage -AllowFailure
+    $stageLogs = Join-Path $logDirectory "$Stage-winget"
+    $null = New-Item -ItemType Directory -Path $stageLogs
+    $installerLogs = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
+        $stamp = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
+        if ($priorLogs.ContainsKey($file.FullName) -and $priorLogs[$file.FullName] -ceq $stamp) { continue }
+        $captured = Join-Path $stageLogs $file.Name
+        Copy-Item -LiteralPath $file.FullName -Destination $captured
+        $content = [IO.File]::ReadAllText($captured)
+        if ($content -match 'Setup version: Inno Setup' -and $content -match [regex]::Escape($installedExe)) {
+            $installerLogs += $captured
+        }
+    }
+    if ($installerLogs.Count -gt 1) { throw "More than one Inno log targeted the owned executable during $Stage." }
+    if ($installerLogs.Count -eq 1) {
+        Copy-Item -LiteralPath $installerLogs[0] -Destination (Join-Path $logDirectory "$Stage-installer.log")
+    }
+    Write-Host "Captured default WinGet logs for ${Stage}: $stageLogs"
+    if ($result.ExitCode -ne 0 -and -not $AllowFailure) { throw "$Stage failed: $($result.Text)" }
+    return $result
 }
 
 $script:configHash = $null
@@ -560,6 +590,16 @@ try {
         if ($probe.Text.Trim() -ne "v$wingetVersion") { throw "Expected WinGet v$wingetVersion, got $($probe.Text)" }
     }
     $settings = Invoke-WinGet @('settings', 'export') 'settings-before'
+    # DefaultLogLocation in the pinned client's Runtime.cpp. The packaged
+    # client uses its own LocalState; the unpackaged client uses TEMP/WinGet.
+    $wingetLogDirectory = if ($appInstaller) {
+        Join-Path $env:LOCALAPPDATA "Packages/$($appInstaller.PackageFamilyName)/LocalState/DiagOutputDir"
+    } else {
+        Join-Path ([IO.Path]::GetTempPath()) 'WinGet/defaultState'
+    }
+    if (-not (Test-Path -LiteralPath $wingetLogDirectory -PathType Container)) {
+        throw "The pinned client's default log directory was not found: $wingetLogDirectory"
+    }
     $settingsSnapshot = $settings.Text | ConvertFrom-Json -AsHashtable
     if (-not $settingsSnapshot.adminSettings.ContainsKey('LocalManifestFiles')) { throw 'WinGet did not export the LocalManifestFiles setting.' }
     if (-not $settingsSnapshot.adminSettings.LocalManifestFiles) {

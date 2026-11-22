@@ -12,7 +12,8 @@
 #define PackageIdentifier "QQRM.RustSwitcher"
 #define RunValueName "RustSwitcher"
 #define AppId "QQRM.RustSwitcher"
-#define RestartArguments "--autostart --skip-startup-update"
+#define RestartArguments "--autostart --skip-startup-update --ensure-running"
+#define QuitPidArgument "--parent-pid "
 #define AutostartArguments "--autostart"
 #define DefaultInstallDirectory "{localappdata}\Programs\RustSwitcher"
 

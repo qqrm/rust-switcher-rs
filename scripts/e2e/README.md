@@ -35,10 +35,13 @@ Desktop input results are printed in the job log without adding stored workflow 
 | Selected text | Release double Shift in a separate native Edit, both directions, restored selection | Other applications, rich editors and elevated targets are not exercised |
 | Clipboard isolation | Clipboard sequence unchanged during selection conversion | Does not audit unrelated applications on the desktop |
 | Unicode boundary | A 510-character selection containing emoji must remain complete, followed by a short conversion | Does not prove every UI Automation provider's truncation behavior |
-| Startup and single instance | Release launch and duplicate-instance rejection | Focus activation by a second launch and a published release download are not exercised |
+| Startup and relaunch | A second release launch stops the old PID and starts a usable replacement; three rapid launches converge to one new process | Instances without a discoverable window and other Windows sessions are rejected rather than force-killed |
+| Tray lifecycle | Delete the real owned tray registration, broadcast TaskbarCreated/resume/display-change messages, and verify Shell_NotifyIconGetRect succeeds again while the main window is hidden | Real Explorer termination, actual sleep/hibernate, and Windows 11 display-driver timing are not exercised |
+| Unresponsive predecessor | Suspend the owned release UI thread, launch again, and require old-process termination plus a usable replacement | A process running at a higher integrity level may not grant termination rights |
+| Stale updater | A PID-bound shutdown rejects the previous PID; updater recovery does not replace an already running app | Network/download overlap is not injected by the desktop harness |
 | Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
 | Autostart | Release UI enables the exact Run command for a path containing spaces; Windows executes that stored command, the app remains responsive and hidden, and disabling survives a normal restart | Actual logon/reboot is not exercised on the disposable job VM |
-| Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |
+| Exit and cleanup | Release and debug Exit, forced predecessor termination, bounded owned-process cleanup | Unexpected crash recovery is not exercised |
 | Pause and CapsLock layout switching | Browser password cases verify runtime pause state changes and two layout switches while text conversion remains blocked | Tray menu actions are not exercised |
 | Focus and selection changes | Release conversion cancels after the external fixture changes focus or selection, then recovers | Does not make programmatic OS focus changes atomic with input delivery |
 | Unresponsive editors | External Edit blocks for three seconds; release UI stays responsive, does not type later and recovers | A permanently hung UIA provider consumes the one bounded probe worker until restart |

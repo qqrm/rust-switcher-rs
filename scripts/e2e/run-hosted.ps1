@@ -45,6 +45,48 @@ public static class HostedInput {
     [StructLayout(LayoutKind.Sequential)] private struct RECT {
         public int left, top, right, bottom;
     }
+    [StructLayout(LayoutKind.Sequential)] private struct ICON_ID {
+        public uint size; public IntPtr window; public uint id; public Guid guid;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] private struct ICON_DATA {
+        public uint size; public IntPtr window; public uint id, flags, callback; public IntPtr icon;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string tip;
+        public uint state, stateMask;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=256)] public string info;
+        public uint version;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=64)] public string title;
+        public uint infoFlags; public Guid guid; public IntPtr balloonIcon;
+    }
+    [DllImport("shell32.dll")] private static extern int Shell_NotifyIconGetRect(ref ICON_ID icon, out RECT rectangle);
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode)] private static extern bool Shell_NotifyIcon(uint message, ref ICON_DATA icon);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern uint RegisterWindowMessage(string name);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr OpenThread(uint access, bool inherit, uint id);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern uint SuspendThread(IntPtr thread);
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+    public static bool TrayIconPresent(IntPtr window) {
+        var icon = new ICON_ID { size = (uint)Marshal.SizeOf<ICON_ID>(), window = window, id = 1 };
+        RECT rectangle;
+        return Shell_NotifyIconGetRect(ref icon, out rectangle) == 0;
+    }
+    public static void DeleteTrayIcon(IntPtr window) {
+        var icon = new ICON_DATA { size = (uint)Marshal.SizeOf<ICON_DATA>(), window = window, id = 1 };
+        if (!Shell_NotifyIcon(2, ref icon)) throw new InvalidOperationException("Could not remove the owned app's tray icon");
+        if (TrayIconPresent(window)) throw new InvalidOperationException("Owned tray icon was not removed");
+    }
+    public static void Broadcast(uint message, uint value) {
+        if (message == 0 || !PostMessage(new IntPtr(0xffff), message, new UIntPtr(value), IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Tray recovery broadcast failed");
+    }
+    public static void SuspendOwnedWindowThread(IntPtr window, uint expectedProcess) {
+        uint process;
+        uint id = GetWindowThreadProcessId(window, out process);
+        if (id == 0 || process != expectedProcess) throw new InvalidOperationException("Refusing to suspend an unowned window");
+        IntPtr thread = OpenThread(2, false, id);
+        if (thread == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            if (SuspendThread(thread) == uint.MaxValue) throw new Win32Exception(Marshal.GetLastWin32Error());
+        } finally { CloseHandle(thread); }
+    }
     [StructLayout(LayoutKind.Sequential)] private struct GUI_THREAD_INFO {
         public uint size, flags;
         public IntPtr active, focus, capture, menuOwner, moveSize, caret;
@@ -186,11 +228,12 @@ function Get-AutostartCommand {
     try { return $key.GetValue('RustSwitcher', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
     finally { $key.Dispose() }
 }
-function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode, [uint]$JournalFixturePid = 0) {
+function Start-Switcher([string]$Exe, [string]$ProfilePath, [bool]$DebugMode, [uint]$JournalFixturePid = 0, [string[]]$ExtraArguments = @()) {
     $info = [System.Diagnostics.ProcessStartInfo]::new($Exe)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.WorkingDirectory = $runRoot
+    foreach ($argument in $ExtraArguments) { $info.ArgumentList.Add($argument) }
     $info.Environment['APPDATA'] = $ProfilePath
     $info.Environment['RUST_LOG'] = 'warn'
     $info.Environment.Remove('RUST_SWITCHER_E2E_TARGET_PID') | Out-Null
@@ -474,10 +517,66 @@ try {
     $window = Find-AppWindow $release
     Focus-App $window
     Record-Pass 'release application startup'
+    $originalPid = $release.Id
     $second = Start-Switcher $ReleaseExe $releaseProfile $false
-    if (-not $second.WaitForExit(8000) -or $second.ExitCode -ne 0) { throw 'Second instance did not exit successfully' }
-    if ($release.HasExited) { throw 'Primary instance exited during second launch' }
-    Record-Pass 'release duplicate-instance rejection'
+    if (-not $release.WaitForExit(8000)) { throw 'Relaunch did not stop the original process' }
+    Wait-Condition { -not $second.HasExited -and $null -ne (Find-AppWindow $second) } 'replacement main window'
+    $release = $second
+    $window = Find-AppWindow $release
+    Record-Pass 'release relaunch replaces the original PID'
+
+    # Remove the real shell registration, then use an actual broadcast. Sending
+    # TaskbarCreated directly to the app would incorrectly pass with HWND_MESSAGE.
+    $trayWindow = [IntPtr]$window.Current.NativeWindowHandle
+    [HostedInput]::ShowWindow($trayWindow, 0) | Out-Null
+    $taskbarCreated = [HostedInput]::RegisterWindowMessage('TaskbarCreated')
+    foreach ($event in @(
+        @{ Name = 'TaskbarCreated'; Message = $taskbarCreated; Value = 0 },
+        @{ Name = 'resume'; Message = 0x218; Value = 0x12 },
+        @{ Name = 'display change'; Message = 0x7e; Value = 32 },
+        @{ Name = 'repeated TaskbarCreated'; Message = $taskbarCreated; Value = 0 }
+    )) {
+        Wait-Condition { [HostedInput]::TrayIconPresent($trayWindow) } 'owned tray registration'
+        [HostedInput]::DeleteTrayIcon($trayWindow)
+        [HostedInput]::Broadcast($event.Message, $event.Value)
+        Wait-Condition { [HostedInput]::TrayIconPresent($trayWindow) } "tray recovery after $($event.Name)"
+        if ($release.HasExited) { throw "Application exited during $($event.Name)" }
+        Record-Pass "release hidden-window tray recovery after $($event.Name)"
+    }
+    [HostedInput]::ShowWindow($trayWindow, 9) | Out-Null
+
+    $staleQuit = Start-Switcher $ReleaseExe $releaseProfile $false -ExtraArguments @('--quit-for-update', '--parent-pid', "$originalPid")
+    if (-not $staleQuit.WaitForExit(3000) -or $staleQuit.ExitCode -eq 0 -or $release.HasExited) {
+        throw 'A stale updater shutdown was not rejected without touching the replacement'
+    }
+    $ensure = Start-Switcher $ReleaseExe $releaseProfile $false -ExtraArguments @('--ensure-running')
+    if (-not $ensure.WaitForExit(3000) -or $ensure.ExitCode -ne 0 -or $release.HasExited) {
+        throw 'Updater recovery replaced an already running application'
+    }
+    Record-Pass 'stale updater and updater recovery preserve the replacement PID'
+
+    [HostedInput]::SuspendOwnedWindowThread($trayWindow, $release.Id)
+    $replacement = Start-Switcher $ReleaseExe $releaseProfile $false
+    if (-not $release.WaitForExit(8000)) { throw 'Relaunch did not terminate the unresponsive predecessor' }
+    Wait-Condition { -not $replacement.HasExited -and $null -ne (Find-AppWindow $replacement) } 'replacement after suspended UI thread'
+    $release = $replacement
+    Record-Pass 'release relaunch replaces an unresponsive predecessor'
+
+    $previous = $release
+    $rapid = @(1..3 | ForEach-Object { Start-Switcher $ReleaseExe $releaseProfile $false })
+    Wait-Condition {
+        $running = @($rapid | Where-Object { -not $_.HasExited })
+        $previous.HasExited -and $running.Count -eq 1 -and $null -ne (Find-AppWindow $running[0])
+    } 'rapid relaunches converge to one new process' 20000
+    foreach ($process in $rapid) {
+        if ($process.HasExited -and $process.ExitCode -ne 0) { throw 'A rapid relaunch failed instead of handing over' }
+    }
+    $release = @($rapid | Where-Object { -not $_.HasExited })[0]
+    $window = Find-AppWindow $release
+    $trayWindow = [IntPtr]$window.Current.NativeWindowHandle
+    Wait-Condition { [HostedInput]::TrayIconPresent($trayWindow) } 'tray after rapid relaunches'
+    Focus-App $window
+    Record-Pass 'rapid relaunches leave one usable process and tray icon'
     $editorInfo = [System.Diagnostics.ProcessStartInfo]::new('powershell.exe')
     $editorInfo.UseShellExecute = $false
     $editorInfo.CreateNoWindow = $true
