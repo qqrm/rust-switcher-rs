@@ -33,14 +33,15 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::SetFocus,
             WindowsAndMessaging::{
-                DefWindowProcW, DestroyWindow, FindWindowW, GWLP_USERDATA, GetWindowLongPtrW, IsWindow,
-                IsWindowVisible, KillTimer, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
-                SC_CLOSE, SC_MINIMIZE, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL,
-                SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, WM_APP, WM_CLOSE,
-                WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
-                WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_PAINT,
-                WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WS_MAXIMIZEBOX,
-                WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+                DefWindowProcW, DestroyWindow, FindWindowW, GWLP_USERDATA, GetWindowLongPtrW,
+                GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, PostMessageW,
+                PostQuitMessage, RegisterWindowMessageW, SC_CLOSE, SC_MINIMIZE, SIZE_MINIMIZED,
+                SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, SetTimer,
+                SetWindowLongPtrW, ShowWindow, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
+                WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DISPLAYCHANGE,
+                WM_DRAWITEM, WM_HOTKEY, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_PAINT, WM_PARENTNOTIFY,
+                WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_SIZE, WM_SYSCOMMAND, WM_TIMER,
+                WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
             },
         },
     },
@@ -79,7 +80,7 @@ use crate::{
 
 const WM_APP_APPLY_THEME: u32 = WM_APP + 1;
 const WM_APP_RUN_RUNTIME_COMMAND: u32 = WM_APP + 2;
-const WM_APP_EXIT_FOR_UPDATE: u32 = WM_APP + 0x222;
+pub(crate) const WM_APP_EXIT_FOR_UPDATE: u32 = WM_APP + 0x222;
 const PLAYGROUND_HIDE_TIMER_ID: usize = 0x5300;
 const PLAYGROUND_VISIBLE_MS: u32 = 5 * 60 * 1000;
 
@@ -379,7 +380,6 @@ fn apply_theme(hwnd: HWND, state: &mut AppState, dark: bool) {
             );
         }
     }
-
 }
 
 fn apply_config_runtime(
@@ -629,9 +629,7 @@ fn on_create(hwnd: HWND) -> LRESULT {
     init_font_and_visuals(hwnd, &mut state);
     init_e2e_playground(hwnd, state.as_ref());
 
-    if let Err(e) = crate::platform::win::tray::ensure_icon(hwnd) {
-        tracing::warn!(error = ?e, "tray ensure_icon failed");
-    }
+    tray::recover_icon(hwnd);
 
     #[cfg(debug_assertions)]
     with_state_mut_do(hwnd, |state| {
@@ -649,7 +647,10 @@ fn on_create(hwnd: HWND) -> LRESULT {
 /// This function is called from `main` after the single instance
 /// guard has been acquired. It performs all initialization that
 /// requires unsafe code and returns any error to the caller.
-pub fn run(start_hidden: bool) -> Result<()> {
+pub fn run(
+    start_hidden: bool,
+    instance: &mut crate::utils::instance::SingleInstanceGuard,
+) -> Result<()> {
     unsafe {
         visuals::init_visuals();
         let class_name_w: Vec<u16> = app_identity::MAIN_WINDOW_CLASS
@@ -659,6 +660,7 @@ pub fn run(start_hidden: bool) -> Result<()> {
         let class_name = PCWSTR(class_name_w.as_ptr());
         let hinstance = GetModuleHandleW(PCWSTR::null())?.into();
 
+        tray::initialize_recovery()?;
         register_main_class(class_name, hinstance)?;
 
         let style = WS_OVERLAPPEDWINDOW & !WS_THICKFRAME & !WS_MAXIMIZEBOX;
@@ -676,6 +678,7 @@ pub fn run(start_hidden: bool) -> Result<()> {
             let _ = UpdateWindow(hwnd);
         }
 
+        instance.ready();
         message_loop()?;
     }
     Ok(())
@@ -697,11 +700,27 @@ pub extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         return LRESULT(0);
     }
 
+    if tray::is_taskbar_created(msg) {
+        tray::recover_icon(hwnd);
+        return LRESULT(0);
+    }
+
     match msg {
         WM_CREATE => on_create(hwnd),
         WM_COMMAND => commands::on_command(hwnd, wparam),
         WM_HOTKEY => on_hotkey(hwnd, wparam),
         WM_TIMER => on_timer(hwnd, wparam, lparam),
+        WM_DISPLAYCHANGE => {
+            tray::recover_icon(hwnd);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_POWERBROADCAST => {
+            // PBT_APMRESUMEAUTOMATIC / PBT_APMRESUMESUSPEND / PBT_APMRESUMECRITICAL.
+            if matches!(wparam.0, 0x12 | 0x7 | 0x6) {
+                tray::recover_icon(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_PAINT => crate::platform::ui::themes::on_paint(hwnd, wparam, lparam),
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             with_state_mut_do(hwnd, |state| stop_hotkey_capture_ui(hwnd, state));
@@ -910,35 +929,25 @@ fn show_window_message_id() -> u32 {
     })
 }
 
-pub fn request_running_instance_exit() -> windows::core::Result<bool> {
+pub fn request_running_instance_exit(expected_pid: Option<u32>) -> windows::core::Result<bool> {
     let class_name: Vec<u16> = app_identity::MAIN_WINDOW_CLASS
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let hwnd = unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) }
-        .unwrap_or_default();
+    let hwnd =
+        unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()) }.unwrap_or_default();
     if hwnd.0.is_null() {
         return Ok(false);
     }
-    unsafe { PostMessageW(Some(hwnd), WM_APP_EXIT_FOR_UPDATE, WPARAM(0), LPARAM(0))? };
-    Ok(true)
-}
-
-pub fn activate_running_instance() -> windows::core::Result<bool> {
-    unsafe {
-        let class_name: Vec<u16> = app_identity::MAIN_WINDOW_CLASS
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let hwnd = FindWindowW(PCWSTR(class_name.as_ptr()), PCWSTR::null()).unwrap_or_default();
-        if hwnd.0.is_null() {
+    if let Some(expected) = expected_pid {
+        let mut actual = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut actual)) };
+        if expected == 0 || actual != expected {
             return Ok(false);
         }
-
-        let msg = show_window_message_id();
-        let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
-        Ok(true)
     }
+    unsafe { PostMessageW(Some(hwnd), WM_APP_EXIT_FOR_UPDATE, WPARAM(0), LPARAM(0))? };
+    Ok(true)
 }
 
 fn show_main_window(hwnd: HWND) {
@@ -955,6 +964,7 @@ unsafe fn on_ncdestroy(hwnd: HWND) -> LRESULT {
     }
 
     remove_icon(hwnd);
+    tray::cancel_recovery(hwnd);
 
     let state = unsafe { &mut *p };
 
@@ -1181,6 +1191,9 @@ fn on_app_error(hwnd: HWND) -> LRESULT {
 }
 
 fn on_timer(hwnd: HWND, wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
+    if tray::handle_recovery_timer(hwnd, wparam.0) {
+        return LRESULT(0);
+    }
     if wparam.0 == PLAYGROUND_HIDE_TIMER_ID {
         with_state_mut_do(hwnd, |state| hide_playground(hwnd, state));
         return LRESULT(0);

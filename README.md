@@ -126,6 +126,16 @@ Pausing or disabling AutoConvert leaves keyboard tracking and manual hotkeys
 running. To stop all processing, right-click the tray icon and choose **Exit**;
 closing the settings window only hides it.
 
+Starting the executable again restarts Rust Switcher: the existing process exits
+and a fresh process takes over. If the old UI does not respond within two seconds,
+the launcher terminates that instance before starting. Saved settings are retained;
+unsaved UI edits and the in-memory input journal are reset. Concurrent launches are
+serialized, and debug and release applications retain separate identities.
+
+The tray icon is re-registered when Windows recreates the taskbar, after resume,
+and when the display configuration changes. Recovery retains the current icon and
+tooltip and retries briefly if the shell is not ready yet.
+
 ## Development
 
 This project includes a ready-to-use `bacon.toml` for a fast development loop.

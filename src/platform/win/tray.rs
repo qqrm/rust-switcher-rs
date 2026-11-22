@@ -1,4 +1,7 @@
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 
 use windows::{
     Win32::{
@@ -11,14 +14,14 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, DestroyMenu, GWLP_HINSTANCE, GetCursorPos,
-                GetWindowLongPtrW, HICON, HMENU, IMAGE_ICON, LR_SHARED, LoadImageW, MF_SEPARATOR,
-                SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_BOTTOMALIGN,
-                TPM_NOANIMATION, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu,
-                WM_APP,
+                GetWindowLongPtrW, HICON, HMENU, IMAGE_ICON, KillTimer, LR_SHARED, LoadImageW,
+                MF_SEPARATOR, RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SetForegroundWindow,
+                SetTimer, ShowWindow, TPM_BOTTOMALIGN, TPM_NOANIMATION, TPM_RETURNCMD,
+                TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
             },
         },
     },
-    core::{PCWSTR, Result},
+    core::{PCWSTR, Result, w},
 };
 
 use super::winutil::make_int_resource;
@@ -37,6 +40,60 @@ const ID_AUTOCONVERT_TOGGLE: u32 = 1003;
 const ID_CHANGE_THEME: u32 = 1004;
 const ID_UPDATE: u32 = 1005;
 const DEFAULT_TRAY_TOOLTIP: &str = "Rust Switcher";
+const RECOVERY_TIMER: usize = 0x5157_0002;
+const MAX_RECOVERY_ATTEMPTS: u32 = 6;
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static RECOVERY_ATTEMPT: AtomicU32 = AtomicU32::new(0);
+static GREEN_ICON: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn initialize_recovery() -> Result<()> {
+    let message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    if message == 0 {
+        return Err(windows::core::Error::from_thread());
+    }
+    TASKBAR_CREATED.store(message, Ordering::Relaxed);
+    Ok(())
+}
+
+pub(crate) fn is_taskbar_created(message: u32) -> bool {
+    let registered = TASKBAR_CREATED.load(Ordering::Relaxed);
+    registered != 0 && message == registered
+}
+
+/// Re-register after a shell restart or resume; retries only run while recovering.
+pub(crate) fn recover_icon(hwnd: HWND) {
+    cancel_recovery(hwnd);
+    RECOVERY_ATTEMPT.store(0, Ordering::Relaxed);
+    try_recover_icon(hwnd);
+}
+
+pub(crate) fn cancel_recovery(hwnd: HWND) {
+    let _ = unsafe { KillTimer(Some(hwnd), RECOVERY_TIMER) };
+}
+
+pub(crate) fn handle_recovery_timer(hwnd: HWND, timer: usize) -> bool {
+    if timer != RECOVERY_TIMER {
+        return false;
+    }
+    cancel_recovery(hwnd);
+    try_recover_icon(hwnd);
+    true
+}
+
+fn try_recover_icon(hwnd: HWND) {
+    let attempt = RECOVERY_ATTEMPT.fetch_add(1, Ordering::Relaxed) + 1;
+    match ensure_icon(hwnd) {
+        Ok(()) => tracing::info!(attempt, "tray icon registered"),
+        Err(error) if attempt < MAX_RECOVERY_ATTEMPTS => {
+            tracing::warn!(attempt, ?error, "tray is not ready; scheduling recovery");
+            let delay = (250_u32 << (attempt - 1)).min(2_000);
+            if unsafe { SetTimer(Some(hwnd), RECOVERY_TIMER, delay, None) } == 0 {
+                tracing::error!("could not schedule tray recovery");
+            }
+        }
+        Err(error) => tracing::error!(attempt, ?error, "tray recovery retries exhausted"),
+    }
+}
 
 unsafe fn show_popup_menu_at_cursor(hwnd: HWND, hmenu: HMENU) -> u32 {
     let mut pt = POINT { x: 0, y: 0 };
@@ -156,7 +213,11 @@ unsafe fn apply_tray_identity(nid: &mut NOTIFYICONDATAW, hwnd: HWND) -> windows:
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
 
-    nid.hIcon = unsafe { default_icon(hwnd) }?;
+    nid.hIcon = if GREEN_ICON.load(Ordering::Relaxed) {
+        unsafe { green_icon(hwnd) }?
+    } else {
+        unsafe { default_icon(hwnd) }?
+    };
     fill_wide(&mut nid.szTip, &current_tray_tooltip());
 
     Ok(())
@@ -316,6 +377,7 @@ pub fn set_tooltip(hwnd: HWND, tooltip: &str) -> windows::core::Result<()> {
 }
 
 pub fn switch_tray_icon(hwnd: HWND, use_green: bool) -> windows::core::Result<()> {
+    GREEN_ICON.store(use_green, Ordering::Relaxed);
     unsafe {
         let icon = if use_green {
             green_icon(hwnd)?
@@ -560,7 +622,9 @@ unsafe fn handle_tray_menu_cmd(
     cmd: u32,
 ) -> Result<TrayMenuAction> {
     match cmd {
-        ID_AUTOCONVERT_TOGGLE if autoconvert_feature_enabled => Ok(TrayMenuAction::ToggleAutoConvert),
+        ID_AUTOCONVERT_TOGGLE if autoconvert_feature_enabled => {
+            Ok(TrayMenuAction::ToggleAutoConvert)
+        }
 
         ID_SHOW_HIDE => {
             unsafe { toggle_window_visibility(hwnd, window_visible) };
