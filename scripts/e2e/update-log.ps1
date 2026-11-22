@@ -60,10 +60,19 @@ public static class UpdateLogShell {
     [DllImport("shlwapi.dll", CharSet=CharSet.Unicode)] static extern int AssocQueryString(uint flags, uint kind, string extension, string extra, StringBuilder output, ref uint length);
     [DllImport("shell32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CommandLineToArgvW(string line, out int count);
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
-    public static void Refresh() { SHChangeNotify(0x08000000, 0, IntPtr.Zero, IntPtr.Zero); }
+    public static void Refresh() { SHChangeNotify(0x08000000, 0x1000, IntPtr.Zero, IntPtr.Zero); }
     public static string Reader() {
         var value = new StringBuilder(32768); uint size = (uint)value.Capacity;
-        return AssocQueryString(0, 2, ".log", null, value, ref size) == 0 ? value.ToString() : null;
+        return AssocQueryString(0x400, 2, ".log", null, value, ref size) == 0 ? value.ToString() : null;
+    }
+    public static uint AssociationResult() {
+        var value = new StringBuilder(32768); uint size = (uint)value.Capacity;
+        return unchecked((uint)AssocQueryString(0x400, 20, ".log", null, value, ref size));
+    }
+    public static string Describe(string association, uint flags, uint kind) {
+        var value = new StringBuilder(32768); uint size = (uint)value.Capacity;
+        int result = AssocQueryString(flags, kind, association, null, value, ref size);
+        return "hr=0x" + unchecked((uint)result).ToString("X8") + "; value=" + value.ToString();
     }
     public static string[] Arguments(string line) {
         int count; IntPtr memory = CommandLineToArgvW(line, out count);
@@ -128,7 +137,8 @@ function Assert-Receipts([int]$Count) {
 
 $classes = [Microsoft.Win32.Registry]::CurrentUser
 $extensionPath = 'Software\Classes\.log'
-$progId = 'RustSwitcher.UpdateLogTest.' + [guid]::NewGuid().ToString('N')
+$progId = 'RSLog.' + [guid]::NewGuid().ToString('N')
+if ($progId.Length -gt 39) { throw 'Owned ProgID exceeds the documented 39-character limit' }
 $progIdPath = 'Software\Classes\' + $progId
 $extension = $classes.OpenSubKey($extensionPath, $true)
 $extensionExisted = $null -ne $extension
@@ -145,13 +155,27 @@ if ($null -ne $extension) {
 }
 $process = $null
 $notepad = $null
+function Write-LogAssociationDiagnostics([string]$Stage) {
+    $choice = $classes.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.log\UserChoice')
+    $choiceValue = '<absent>'
+    if ($null -ne $choice) {
+        try { $choiceValue = [string]$choice.GetValue('ProgId', '<absent>') } finally { $choice.Dispose() }
+    }
+    Write-Output "Association $Stage : ProgID=$([UpdateLogShell]::Describe('.log', 0x400, 20)); reader=$([UpdateLogShell]::Describe('.log', 0x400, 2)); owned=$([UpdateLogShell]::Describe($progId, 0x800, 2)); UserChoice=$choiceValue"
+}
 try {
+    Write-LogAssociationDiagnostics 'before setup'
+    $type = $classes.CreateSubKey($progIdPath)
+    try { $type.SetValue('', 'Rust Switcher owned update log test') } finally { $type.Dispose() }
+    $shell = $classes.CreateSubKey($progIdPath + '\shell')
+    try { $shell.SetValue('', 'open') } finally { $shell.Dispose() }
     $command = $classes.CreateSubKey($progIdPath + '\shell\open\command')
     try { $command.SetValue('', '"' + $recorder + '" "' + $capture + '" "%1"') } finally { $command.Dispose() }
     $extension = $classes.CreateSubKey($extensionPath)
     try { $extension.SetValue('', $progId) } finally { $extension.Dispose() }
     [UpdateLogShell]::Refresh()
-    Wait-Condition { [UpdateLogShell]::Reader() -eq $recorder } 'effective .log default reader; UserChoice is never changed'
+    try { Wait-Condition { [UpdateLogShell]::Reader() -eq $recorder } 'effective .log default reader; UserChoice is never changed' }
+    finally { Write-LogAssociationDiagnostics 'after setup' }
 
     $info = [Diagnostics.ProcessStartInfo]::new($Application)
     $info.UseShellExecute = $false
@@ -207,10 +231,13 @@ try {
     Wait-Condition { (Failure-NotificationCount) -eq 3 } 'held helper completion'
     Record-Pass 'release ordinary notification clears the update log action while the UI stays responsive'
 
-    # An owned ProgID without an open verb makes .log genuinely unassociated.
-    $classes.DeleteSubKeyTree($progIdPath + '\shell', $false)
+    # Remove only our entire class, leaving .log pointing to the missing owned
+    # ProgID. Ignore the generic Unknown/Open With fallback in the diagnostic.
+    $classes.DeleteSubKeyTree($progIdPath, $false)
     [UpdateLogShell]::Refresh()
-    Wait-Condition { $null -eq [UpdateLogShell]::Reader() } 'missing effective .log association'
+    try {
+        Wait-Condition { [UpdateLogShell]::AssociationResult() -eq [uint32]2147943555 } 'exact ERROR_NO_ASSOCIATION for .log'
+    } finally { Write-LogAssociationDiagnostics 'after removing owned ProgID' }
     Invoke-LogTrayItem $process $handle 'Open update log'
     $systemNotepad = Join-Path ([Environment]::GetFolderPath('System')) 'notepad.exe'
     Wait-Condition {

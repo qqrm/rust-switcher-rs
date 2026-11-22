@@ -1,3 +1,7 @@
+# Win32's notification callback constant is an API identifier, not prose.
+[default.extend-identifiers]
+NIN_BALLOONUSERCLICK = "NIN_BALLOONUSERCLICK"
+
 # ISO 639-3 identifiers in the immutable language-model manifest are not prose.
 [type.model-catalog]
 extend-glob = ["model_catalog.rs"]

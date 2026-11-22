@@ -19,11 +19,14 @@ use windows::{
             SystemInformation::GetSystemDirectoryW,
         },
         UI::{
-            Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
+            Shell::{
+                ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_PROGID, AssocQueryStringW, SEE_MASK_FLAG_NO_UI,
+                SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+            },
             WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL},
         },
     },
-    core::{HRESULT, PCWSTR, w},
+    core::{HRESULT, PCWSTR, PWSTR, w},
 };
 
 static OPENING: AtomicBool = AtomicBool::new(false);
@@ -81,6 +84,25 @@ fn open_path(hwnd: HWND, path: &Path) -> io::Result<()> {
         .ok()
         .map_err(io::Error::other)?;
     let _apartment = ComApartment;
+    // NULL/default-verb ShellExecute can launch the generic Open With picker.
+    // Only a definite absence of an effective ProgID selects Notepad here.
+    // Valid COM/UWP handlers need not expose an executable or command string;
+    // all other probe results still use the real default Shell operation.
+    let mut prog_id = [0_u16; 256];
+    let mut length = prog_id.len() as u32;
+    let association = unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN,
+            ASSOCSTR_PROGID,
+            w!(".log"),
+            PCWSTR::null(),
+            Some(PWSTR(prog_id.as_mut_ptr())),
+            &raw mut length,
+        )
+    };
+    if association == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) {
+        return open_notepad(path);
+    }
     let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut execute = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -94,15 +116,20 @@ fn open_path(hwnd: HWND, path: &Path) -> io::Result<()> {
     match unsafe { ShellExecuteExW(&raw mut execute) } {
         Ok(()) => Ok(()),
         Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_ASSOCIATION.0) => {
-            // Use the real system directory and structured argv. Neither the
-            // reader nor a Unicode/space-containing path goes through a shell.
-            Command::new(system_notepad()?)
-                .arg(path)
-                .spawn()
-                .map(|_| ())
+            // The association may have disappeared after the probe.
+            open_notepad(path)
         }
         Err(error) => Err(io::Error::other(error)),
     }
+}
+
+fn open_notepad(path: &Path) -> io::Result<()> {
+    // Use the real system directory and structured argv. Neither the reader
+    // nor a Unicode/space-containing path goes through a command shell.
+    Command::new(system_notepad()?)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
 }
 
 fn system_notepad() -> io::Result<PathBuf> {
