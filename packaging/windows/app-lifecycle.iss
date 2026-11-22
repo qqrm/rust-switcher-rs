@@ -167,8 +167,10 @@ var
   Key, PackageId, SourceId, InstallerType, Directory, Target: String;
 begin
   if LifecycleDetected then Exit;
+  Log('[lifecycle] Legacy discovery: begin');
   LifecycleDetected := True;
   if not RegGetSubkeyNames(HKCU64, LifecycleUninstallRoot, Names) then Exit;
+  Log('[lifecycle] Legacy discovery: registry entries=' + IntToStr(GetArrayLength(Names)));
   for Index := 0 to GetArrayLength(Names) - 1 do begin
     Key := LifecycleUninstallRoot + '\' + Names[Index];
     if not RegQueryStringValue(HKCU64, Key, 'WinGetPackageIdentifier', PackageId) then Continue;
@@ -178,6 +180,7 @@ begin
     if CompareText(Names[Index], '{#PackageIdentifier}_' + SourceId) <> 0 then Continue;
     if not RegQueryStringValue(HKCU64, Key, 'WinGetInstallerType', InstallerType) then Continue;
     if InstallerType <> 'portable' then Continue;
+    Log('[lifecycle] Legacy discovery: validating ' + Key);
     if not RegQueryStringValue(HKCU64, Key, 'InstallLocation', Directory) or
        not RegQueryStringValue(HKCU64, Key, 'TargetFullPath', Target) then
       RaiseException('The existing WinGet registration has no installation path.');
@@ -197,6 +200,7 @@ begin
       'InstallDirectoryAddedToPath', PathAdded) and (PathAdded <> 0);
     Log('Validated portable installation: ' + LifecycleLegacyTarget);
   end;
+  Log('[lifecycle] Legacy discovery: complete; target=' + LifecycleLegacyTarget);
 end;
 
 function GetDefaultInstallDirectory(Param: String): String;
@@ -204,6 +208,7 @@ begin
   LifecycleDiscoverLegacy;
   if LifecycleLegacyDirectory <> '' then Result := LifecycleLegacyDirectory
   else Result := ExpandConstant('{#DefaultInstallDirectory}');
+  Log('[lifecycle] Default installation directory: ' + Result);
 end;
 
 procedure LifecycleReleaseHandles(var Handles: TLifecycleHandles);
@@ -222,13 +227,17 @@ var
   Handle: THandle;
   Buffer, CanonicalTarget: String;
 begin
+  Log('[lifecycle] Process capture: begin; target=' + Target);
   SetArrayLength(Handles, 0);
   CanonicalTarget := LifecycleCanonicalPath(Target);
+  Log('[lifecycle] Process capture: canonical target=' + CanonicalTarget);
   if CanonicalTarget = '' then Exit;
   if not LifecycleProcessSession(LifecycleCurrentProcessId, CurrentSession) then
     RaiseException('Cannot identify the current Windows session.');
+  Log('[lifecycle] Process capture: enumerating session=' + IntToStr(CurrentSession));
   if not LifecycleEnumProcesses(Ids, 32768, Needed) or (Needed >= 32768) then
     RaiseException('Cannot take a complete process snapshot.');
+  Log('[lifecycle] Process capture: enumerated processes=' + IntToStr(Needed div 4));
   try
     for Index := 0 to (Needed div 4) - 1 do begin
       if not LifecycleProcessSession(Ids[Index], Session) or (Session <> CurrentSession) then Continue;
@@ -246,6 +255,7 @@ begin
             RaiseException('Cannot inspect the captured application process.');
           end;
           if WaitResult = LifecycleWaitTimeout then begin
+            Log('[lifecycle] Process capture: retained PID=' + IntToStr(Ids[Index]));
             Count := GetArrayLength(Handles);
             SetArrayLength(Handles, Count + 1);
             Handles[Count] := Handle;
@@ -256,9 +266,11 @@ begin
       if Handle <> 0 then LifecycleCloseHandle(Handle);
     end;
   except
+    Log('[lifecycle] Process capture: failed; ' + GetExceptionMessage);
     LifecycleReleaseHandles(Handles);
     RaiseException(GetExceptionMessage);
   end;
+  Log('[lifecycle] Process capture: complete; handles=' + IntToStr(GetArrayLength(Handles)));
 end;
 
 procedure LifecycleStop(const Target: String; var Handles: TLifecycleHandles);
@@ -267,6 +279,7 @@ var
   WaitResult, ProcessId: Cardinal;
   QuitArguments: String;
 begin
+  Log('[lifecycle] Process stop: begin; target=' + Target + '; handles=' + IntToStr(GetArrayLength(Handles)));
   if GetArrayLength(Handles) = 0 then Exit;
   { The command is the production graceful shutdown route, including old portable
     versions. Only captured exact-path/current-session handles can be forced. }
@@ -283,18 +296,23 @@ begin
         scoped argument and refuse to close a user-launched replacement. }
       QuitArguments := QuitArguments + ' {#QuitPidArgument}' + IntToStr(ProcessId);
     end;
+    Log('[lifecycle] Process stop: launching graceful helper; arguments=' + QuitArguments);
     if not Exec(Target, QuitArguments, ExtractFileDir(Target), SW_HIDE, ewNoWait, ResultCode) then
       Log('Graceful shutdown helper could not start: ' + SysErrorMessage(ResultCode));
+    Log('[lifecycle] Process stop: helper launch returned; waiting up to 10000 ms');
     WaitResult := LifecycleWait(Handles[Index], 10000);
+    Log('[lifecycle] Process stop: graceful wait result=' + IntToStr(WaitResult));
     if WaitResult = LifecycleWaitTimeout then begin
       Log('Graceful shutdown timed out; stopping the captured application handle.');
       if not LifecycleKill(Handles[Index], 0) then
         RaiseException('The running application could not be stopped.');
+      Log('[lifecycle] Process stop: termination returned; waiting up to 5000 ms');
       if LifecycleWait(Handles[Index], 5000) <> 0 then
         RaiseException('The running application did not exit before the update deadline.');
     end else if WaitResult <> 0 then
       RaiseException('Waiting for the captured application failed.');
   end;
+  Log('[lifecycle] Process stop: complete');
 end;
 
 function LifecycleSameLogon(Left, Right: THandle): Boolean;
@@ -302,12 +320,14 @@ var
   LeftStats, RightStats: TLifecycleTokenStatistics;
   Needed: Cardinal;
 begin
+  Log('[lifecycle] Token identity: reading both token statistics');
   if not LifecycleTokenStatistics(Left, 10, LeftStats, 56, Needed) or
     not LifecycleTokenStatistics(Right, 10, RightStats, 56, Needed) then
     RaiseException('Cannot compare application and installer logon identities.');
   { AuthenticationId is the LUID at byte offset 8; no native SID pointer is
     retained across Pascal Script's DLL marshalling boundary. }
   Result := (LeftStats[2] = RightStats[2]) and (LeftStats[3] = RightStats[3]);
+  Log('[lifecycle] Token identity: comparison complete');
 end;
 
 procedure LifecycleRetainLaunchToken(ApplicationProcess: THandle);
@@ -318,15 +338,20 @@ var
   Impersonate: TLifecycleLuid;
   Allowed, SameUser: Boolean;
 begin
+  Log('[lifecycle] Token retention: opening installer token');
   if not LifecycleOpenToken(THandle(-1), 8, OwnToken) then
     RaiseException('Cannot inspect the installer security token.');
   try
+    Log('[lifecycle] Token retention: reading installer elevation');
     if not LifecycleTokenDword(OwnToken, 20, Elevated, 4, Needed) then
       RaiseException('Cannot inspect installer elevation.');
+    Log('[lifecycle] Token retention: installer elevation=' + IntToStr(Elevated));
     if Elevated = 0 then Exit;
+    Log('[lifecycle] Token retention: opening application token');
     if not LifecycleOpenToken(ApplicationProcess, $B, ApplicationToken) then
       RaiseException('Cannot retain the running application security token.');
     try
+      Log('[lifecycle] Token retention: comparing logon identity');
       SameUser := LifecycleSameLogon(OwnToken, ApplicationToken);
       { UAC split tokens can identify different linked logon sessions. Only
         Windows' own linked token is accepted, never an unrelated user's token. }
@@ -337,6 +362,7 @@ begin
       end;
       if not SameUser then
         RaiseException('The running application belongs to another Windows logon.');
+      Log('[lifecycle] Token retention: verifying impersonation privilege');
       if not LifecycleLookupPrivilege(0, 'SeImpersonatePrivilege', Impersonate) or
         not LifecycleTokenPrivileges(OwnToken, 3, Privileges, 1024, Needed) then
         RaiseException('Cannot verify the privilege needed to preserve application elevation.');
@@ -350,13 +376,16 @@ begin
             ((Privileges[3 + Index * 3] and 2) <> 0) then Allowed := True;
       if not Allowed then
         RaiseException('The installer cannot restart the application with its original privileges.');
+      Log('[lifecycle] Token retention: duplicating primary token');
       if not LifecycleDuplicateToken(ApplicationToken, $B, 0, 2, 1, LifecycleLaunchToken) then
         RaiseException('The running application primary token could not be duplicated.');
+      Log('[lifecycle] Token retention: primary token duplicated');
     finally
       LifecycleCloseHandle(ApplicationToken);
     end;
   finally
     LifecycleCloseHandle(OwnToken);
+    Log('[lifecycle] Token retention: installer token released');
   end;
 end;
 
@@ -367,6 +396,7 @@ var
   Process: TLifecycleProcessInformation;
 begin
   Result := False;
+  Log('[lifecycle] Token restart: copying environment');
   Environment := LifecycleEnvironment;
   if Environment = 0 then Exit;
   try
@@ -378,17 +408,21 @@ begin
     Startup.StandardInput := 0; Startup.StandardOutput := 0; Startup.StandardError := 0;
     { The copied Unicode environment preserves APPDATA and the caller's other
       per-user settings while the retained token preserves the app's privileges. }
+    Log('[lifecycle] Token restart: CreateProcessWithTokenW begin; target=' + Target);
     if not LifecycleCreateWithToken(LifecycleLaunchToken, 0, Target,
         '"' + Target + '" {#RestartArguments}', $400, Environment,
         ExtractFileDir(Target), Startup, Process) then Exit;
+    Log('[lifecycle] Token restart: process created; PID=' + IntToStr(Process.ProcessId));
     try
       Result := LifecycleWait(Process.Process, 1000) = LifecycleWaitTimeout;
+      Log('[lifecycle] Token restart: initial 1000 ms wait complete');
     finally
       LifecycleCloseHandle(Process.Thread);
       LifecycleCloseHandle(Process.Process);
     end;
   finally
     LifecycleFreeEnvironment(Environment);
+    Log('[lifecycle] Token restart: environment released');
   end;
 end;
 
@@ -398,7 +432,9 @@ var
   Handles: TLifecycleHandles;
 begin
   Result := False;
+  Log('[lifecycle] Restart: begin; target=' + Target);
   if not FileExists(Target) then Exit;
+  Log('[lifecycle] Restart: launching through retained token or original-user route');
   if LifecycleLaunchToken <> 0 then begin
     Result := LifecycleStartWithToken(Target);
     { A user may win a concurrent launch. The internal --skip-if-running
@@ -409,12 +445,14 @@ begin
     Log('Restart failed: ' + SysErrorMessage(ResultCode));
     Exit;
   end;
+  Log('[lifecycle] Restart: launch returned; waiting for exactly one installed process');
   Result := False;
   for Attempt := 1 to 100 do begin
     LifecycleCapture(Target, Handles);
     try
       if GetArrayLength(Handles) = 1 then begin
         Result := LifecycleWait(Handles[0], 1000) = LifecycleWaitTimeout;
+        Log('[lifecycle] Restart: installed-process stability wait complete');
         Exit;
       end;
     finally
@@ -422,6 +460,7 @@ begin
     end;
     Sleep(50);
   end;
+  Log('[lifecycle] Restart: readiness deadline exhausted');
 end;
 
 function LifecycleRemovePathSegment(const Value, Directory: String): String;
@@ -485,15 +524,19 @@ end;
 
 function InitializeSetup: Boolean;
 begin
+  Log('[lifecycle] InitializeSetup: begin');
   LifecycleDiscoverLegacy;
   Result := True;
+  Log('[lifecycle] InitializeSetup: complete');
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  Log('[lifecycle] PrepareToInstall: begin');
   try
     LifecycleTarget := AddBackslash(ExpandConstant('{app}')) + '{#AppExeName}';
+    Log('[lifecycle] PrepareToInstall: target=' + LifecycleTarget);
     if (LifecycleLegacyTarget <> '') and
        (CompareText(LifecycleNormalizedPath(LifecycleTarget), LifecycleLegacyTarget) <> 0) then
       RaiseException('The portable installation must be upgraded in its existing directory.');
@@ -501,29 +544,40 @@ begin
       LifecycleOldInnoExists := RegQueryStringValue(HKCU64, LifecycleOwnKey,
         'DisplayVersion', LifecycleOldInnoVersion);
       if FileExists(LifecycleTarget) then begin
+        Log('[lifecycle] PrepareToInstall: hashing existing application');
         LifecycleOldHash := GetSHA256OfFile(LifecycleTarget);
         LifecycleBackup := ExpandConstant('{tmp}\previous-application.exe');
+        Log('[lifecycle] PrepareToInstall: copying application backup');
         if not FileCopy(LifecycleTarget, LifecycleBackup, False) then
           RaiseException('The existing executable could not be backed up.');
+        Log('[lifecycle] PrepareToInstall: application backup complete');
       end;
       if '{#AdditionalPayloadName}' <> '' then begin
         LifecycleExtraTarget := AddBackslash(ExpandConstant('{app}')) + '{#AdditionalPayloadName}';
         LifecycleExtraExisted := FileExists(LifecycleExtraTarget);
         if LifecycleExtraExisted then begin
+          Log('[lifecycle] PrepareToInstall: hashing additional payload');
           LifecycleExtraHash := GetSHA256OfFile(LifecycleExtraTarget);
           LifecycleExtraBackup := ExpandConstant('{tmp}\previous-additional-payload.exe');
+          Log('[lifecycle] PrepareToInstall: copying additional payload backup');
           if not FileCopy(LifecycleExtraTarget, LifecycleExtraBackup, False) then
             RaiseException('The additional executable could not be backed up.');
+          Log('[lifecycle] PrepareToInstall: additional payload backup complete');
         end;
       end;
+      Log('[lifecycle] PrepareToInstall: capturing running application');
       LifecycleCapture(LifecycleTarget, LifecycleHandles);
       LifecycleWasRunning := GetArrayLength(LifecycleHandles) > 0;
       if LifecycleWasRunning then LifecycleRetainLaunchToken(LifecycleHandles[0]);
       LifecyclePrepared := True;
+      Log('[lifecycle] PrepareToInstall: capture and token preparation complete');
     end;
+    Log('[lifecycle] PrepareToInstall: stopping captured application');
     LifecycleStop(LifecycleTarget, LifecycleHandles);
     LifecycleReleaseHandles(LifecycleHandles);
+    Log('[lifecycle] PrepareToInstall: complete');
   except
+    Log('[lifecycle] PrepareToInstall: failed; ' + GetExceptionMessage);
     if not LifecyclePrepared then LifecycleReleaseHandles(LifecycleHandles);
     Result := GetExceptionMessage;
   end;
@@ -531,19 +585,24 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
+  Log('[lifecycle] CurStepChanged: step=' + IntToStr(Ord(CurStep)));
   if CurStep = ssDone then begin
     if LifecycleWasRunning then begin
+      Log('[lifecycle] Installation complete: restarting previously running application');
       LifecycleRestarted := LifecycleStart(LifecycleTarget);
       if not LifecycleRestarted then RaiseException('The updated application did not restart.');
+      Log('[lifecycle] Installation complete: restart verified');
     end;
     { Keep the old ARP entry until the complete installation and requested
       relaunch succeed. The old WinGet alias still resolves to the same path. }
+    Log('[lifecycle] Installation complete: recording migrated alias and PATH');
     if LifecycleOwnedLink(LifecycleLegacyLink, LifecycleTarget) then
       if not RegWriteStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetSymlink', LifecycleLegacyLink) then
         RaiseException('The migrated command alias could not be recorded.');
     if LifecycleLegacyPathAdded then
       if not RegWriteStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetPath', LifecycleLegacyDirectory) then
         RaiseException('The migrated PATH entry could not be recorded.');
+    Log('[lifecycle] Installation complete: retiring legacy registration');
     if LifecycleLegacyKey <> '' then
       if not RegDeleteKeyIncludingSubkeys(HKCU64, LifecycleLegacyKey) then
         RaiseException('The old portable registration could not be retired.');
@@ -555,6 +614,7 @@ end;
 function GetCustomSetupExitCode: Integer;
 begin
   if LifecycleCompleted then Result := 0 else Result := 1;
+  Log('[lifecycle] Setup exit code=' + IntToStr(Result));
 end;
 
 procedure DeinitializeSetup;
@@ -562,28 +622,35 @@ var
   Handles: TLifecycleHandles;
   ExistingLocation: String;
 begin
+  Log('[lifecycle] DeinitializeSetup: begin');
   try
     LifecycleReleaseHandles(LifecycleHandles);
     if not LifecyclePrepared or LifecycleCompleted then Exit;
+  Log('[lifecycle] Rollback: begin');
   { Inno rolls its transaction back on installation failure. The private copy
     also covers failures during post-install relaunch, after file replacement. }
   if (LifecycleBackup <> '') and FileExists(LifecycleBackup) then begin
+    Log('[lifecycle] Rollback: checking application hash');
     if not FileExists(LifecycleTarget) or (GetSHA256OfFile(LifecycleTarget) <> LifecycleOldHash) then begin
       LifecycleCapture(LifecycleTarget, Handles);
       try
         LifecycleStop(LifecycleTarget, Handles);
+        Log('[lifecycle] Rollback: restoring application backup');
         if not FileCopy(LifecycleBackup, LifecycleTarget, False) then
           RaiseException('The previous executable could not be restored after installation failure.');
+        Log('[lifecycle] Rollback: application restored');
       finally
         LifecycleReleaseHandles(Handles);
       end;
     end;
+    Log('[lifecycle] Rollback: restoring registration');
     if LifecycleOldInnoExists then
       RegWriteStringValue(HKCU64, LifecycleOwnKey, 'DisplayVersion', LifecycleOldInnoVersion)
     else if RegQueryStringValue(HKCU64, LifecycleOwnKey, 'InstallLocation', ExistingLocation) and
       (CompareText(LifecycleNormalizedPath(ExistingLocation), ExtractFileDir(LifecycleTarget)) = 0) then
       RegDeleteKeyIncludingSubkeys(HKCU64, LifecycleOwnKey);
   end;
+  Log('[lifecycle] Rollback: restoring additional payload if needed');
   if LifecycleExtraTarget <> '' then begin
     if LifecycleExtraExisted then begin
       if not FileExists(LifecycleExtraTarget) or
@@ -594,6 +661,7 @@ begin
       if not DeleteFile(LifecycleExtraTarget) then
         RaiseException('The new additional executable could not be rolled back.');
   end;
+  Log('[lifecycle] Rollback: restoring previous running state if needed');
   if LifecycleWasRunning then begin
     LifecycleCapture(LifecycleTarget, Handles);
     try
@@ -604,17 +672,21 @@ begin
       LifecycleReleaseHandles(Handles);
     end;
   end;
+  Log('[lifecycle] Rollback: complete');
   finally
     if LifecycleLaunchToken <> 0 then begin
       LifecycleCloseHandle(LifecycleLaunchToken);
       LifecycleLaunchToken := 0;
     end;
+    Log('[lifecycle] DeinitializeSetup: complete');
   end;
 end;
 
 function InitializeUninstall: Boolean;
 begin
+  Log('[lifecycle] InitializeUninstall: begin');
   Result := True;
+  Log('[lifecycle] InitializeUninstall: complete');
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -622,14 +694,17 @@ var
   Target, Link, Command, ExpectedCommand, Directory: String;
   Handles: TLifecycleHandles;
 begin
+  Log('[lifecycle] CurUninstallStepChanged: step=' + IntToStr(Ord(CurUninstallStep)));
   if CurUninstallStep <> usUninstall then Exit;
   Target := ExpandConstant('{app}\{#AppExeName}');
+  Log('[lifecycle] Uninstall: capturing and stopping application; target=' + Target);
   LifecycleCapture(Target, Handles);
   try
     LifecycleStop(Target, Handles);
   finally
     LifecycleReleaseHandles(Handles);
   end;
+  Log('[lifecycle] Uninstall: removing owned autostart entry and alias');
   ExpectedCommand := '"' + Target + '"';
   if '{#AutostartArguments}' <> '' then ExpectedCommand := ExpectedCommand + ' {#AutostartArguments}';
   if RegQueryStringValue(HKCU64, LifecycleRunKey, '{#RunValueName}', Command) and
@@ -638,7 +713,9 @@ begin
   if RegQueryStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetSymlink', Link) and
     LifecycleOwnedLink(Link, Target) then
     if not DeleteFile(Link) then RaiseException('The owned command alias could not be removed.');
+  Log('[lifecycle] Uninstall: removing owned PATH entry if needed');
   if RegQueryStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetPath', Directory) and
     (CompareText(LifecycleNormalizedPath(Directory), ExtractFileDir(Target)) = 0) then
     LifecycleRemoveOwnedPath(Directory);
+  Log('[lifecycle] Uninstall: lifecycle complete');
 end;

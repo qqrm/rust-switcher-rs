@@ -273,6 +273,18 @@ function Focus-App($Window) {
     [HostedInput]::SetForegroundWindow($handle) | Out-Null
     Wait-Condition { [HostedInput]::GetForegroundWindow() -eq $handle } 'owned app foreground'
 }
+function Focus-SettingsEditor($Window, $Editor) {
+    # Apply/Cancel fixture setup must finish before its single hotkey injection.
+    $appHandle = [IntPtr]$Window.Current.NativeWindowHandle
+    $editorHandle = [IntPtr]$Editor.Current.NativeWindowHandle
+    if ($editorHandle -eq [IntPtr]::Zero) { throw 'Settings editor has no native window' }
+    Focus-App $Window
+    $Editor.SetFocus()
+    Wait-Condition {
+        [HostedInput]::GetForegroundWindow() -eq $appHandle -and
+            [HostedInput]::WindowFocus($appHandle) -eq $editorHandle
+    } 'settings hotkey editor native focus'
+}
 function Find-Control($Window, [string]$Name) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
@@ -358,7 +370,7 @@ try {
         [HostedInput]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 1201))
     $lastWordValue = Get-Pattern $lastWordEdit ([System.Windows.Automation.ValuePattern]::Pattern)
     $savedLastWord = $lastWordValue.Current.Value
-    $lastWordEdit.SetFocus()
+    Focus-SettingsEditor $window $lastWordEdit
     Tap-Key 0x77 # F8 is a draft only until Apply.
     Wait-Condition { $lastWordValue.Current.Value -match 'F8' } 'pending hotkey edit'
     $minimized = Get-Pattern (Find-Control $window 'Start minimized') ([System.Windows.Automation.TogglePattern]::Pattern)
@@ -398,13 +410,13 @@ try {
     $theme = Get-Pattern (Find-Control $window 'Dark theme') ([System.Windows.Automation.TogglePattern]::Pattern)
     if ($theme.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) { throw 'Cancel reverted a saved checkbox' }
     Record-Pass 'checkboxes save both states immediately and preserve hotkey drafts'
-    $lastWordEdit.SetFocus()
+    Focus-SettingsEditor $window $lastWordEdit
     Tap-Key 0x77
     Wait-Condition { $lastWordValue.Current.Value -match 'F8' } 'new hotkey draft for Apply'
     Apply-Settings $window
     Wait-Condition { (Get-Content -LiteralPath $debugConfig -Raw) -match '(?s)\[hotkey_convert_last_word_sequence.first\].*?vk = 119' } 'Apply saves the new hotkey'
     Assert-ConfigFlag $debugConfig 'theme_dark' $true
-    $lastWordEdit.SetFocus()
+    Focus-SettingsEditor $window $lastWordEdit
     Tap-Shift 2
     Assert-Value $lastWordValue $savedLastWord 'restore original hotkey draft'
     Apply-Settings $window

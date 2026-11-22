@@ -107,6 +107,16 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class PackageAcceptanceNative {
+    public sealed class WindowSnapshot {
+        public int ProcessId { get; set; }
+        public string Handle { get; set; }
+        public string TopLevelHandle { get; set; }
+        public string ClassName { get; set; }
+        public string Text { get; set; }
+        public bool Visible { get; set; }
+        public bool Enabled { get; set; }
+        public bool TextResponsive { get; set; }
+    }
     public sealed class TokenSnapshot {
         public string UserSid { get; set; }
         public string IntegritySid { get; set; }
@@ -133,6 +143,20 @@ public static class PackageAcceptanceNative {
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true)]
     private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr w,
         IntPtr l, uint flags, uint timeout, out UIntPtr result);
+    private delegate bool EnumWindowCallback(IntPtr window, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(IntPtr parent, EnumWindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr window, StringBuilder text, int capacity);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    private static extern IntPtr ReadWindowText(IntPtr window, uint message, UIntPtr capacity,
+        StringBuilder text, uint flags, uint timeout, out UIntPtr result);
     [StructLayout(LayoutKind.Sequential)] private struct IconIdentifier {
         public uint size; public IntPtr window; public uint id; public Guid guid;
     }
@@ -255,6 +279,40 @@ public static class PackageAcceptanceNative {
         Rectangle rect;
         return Shell_NotifyIconGetRect(ref icon, out rect) >= 0 && rect.right > rect.left && rect.bottom > rect.top;
     }
+    public static WindowSnapshot[] DescribeOwnedWindows(int[] processIds) {
+        var owners = new HashSet<uint>(processIds.Select(id => checked((uint)id)));
+        var windows = new List<WindowSnapshot>();
+        var elapsed = Stopwatch.StartNew();
+        Func<IntPtr, IntPtr, bool> capture = delegate(IntPtr window, IntPtr topLevel) {
+            if (elapsed.ElapsedMilliseconds >= 3000 || windows.Count >= 80) return false;
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            if (!owners.Contains(owner)) return true;
+            var className = new StringBuilder(256);
+            GetClassName(window, className, className.Capacity);
+            var text = new StringBuilder(2048);
+            UIntPtr result;
+            bool responsive = ReadWindowText(window, 0x000D, new UIntPtr((uint)text.Capacity),
+                text, 2, 100, out result) != IntPtr.Zero;
+            windows.Add(new WindowSnapshot { ProcessId = checked((int)owner),
+                Handle = "0x" + window.ToInt64().ToString("x"),
+                TopLevelHandle = "0x" + topLevel.ToInt64().ToString("x"),
+                ClassName = className.ToString(), Text = text.ToString(),
+                Visible = IsWindowVisible(window), Enabled = IsWindowEnabled(window),
+                TextResponsive = responsive });
+            return true;
+        };
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+            if (elapsed.ElapsedMilliseconds >= 3000 || windows.Count >= 80) return false;
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            if (!owners.Contains(owner)) return true;
+            if (!capture(window, window)) return false;
+            EnumChildWindows(window, delegate(IntPtr child, IntPtr ignored) { return capture(child, window); }, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
+        return windows.ToArray();
+    }
     public static Process StartStoredCommand(string command, string directory, IntPtr token) {
         var startup = new StartupInfo { size = (uint)Marshal.SizeOf<StartupInfo>() };
         ProcessInformation created;
@@ -322,6 +380,40 @@ function Read-Arp([string]$Code) {
         return $result
     } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
 }
+function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string]$Destination) {
+    $diagnostic = [ordered]@{ RootProcessId = $RootProcess.Id; CapturedUtc = [DateTime]::UtcNow;
+        Processes = @(); Windows = @(); Error = $null }
+    try {
+        # Inventory only parent/PID/creation metadata first. Command lines are
+        # fetched only for the root we started and its verified descendants.
+        $snapshot = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, CreationDate -OperationTimeoutSec 2)
+        $root = $snapshot | Where-Object ProcessId -eq $RootProcess.Id | Select-Object -First 1
+        if ($null -eq $root -or $RootProcess.HasExited -or
+            [Math]::Abs(($root.CreationDate.ToUniversalTime() - $RootProcess.StartTime.ToUniversalTime()).TotalSeconds) -gt 1) {
+            throw 'The original process exited before its owned tree could be inspected.'
+        }
+        $owned = @{}; $owned[[int]$root.ProcessId] = $root
+        do {
+            $added = $false
+            foreach ($entry in $snapshot) {
+                $parent = [int]$entry.ParentProcessId
+                if ($owned.Count -ge 64) { break }
+                if ($owned.ContainsKey($parent) -and -not $owned.ContainsKey([int]$entry.ProcessId) -and
+                    $entry.CreationDate -ge $owned[$parent].CreationDate) {
+                    $owned[[int]$entry.ProcessId] = $entry
+                    $added = $true
+                }
+            }
+        } while ($added -and $owned.Count -lt 64)
+        $filter = ($owned.Keys | ForEach-Object { "ProcessId=$($_)" }) -join ' OR '
+        $details = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -OperationTimeoutSec 2 |
+            Where-Object { $owned.ContainsKey([int]$_.ProcessId) -and $_.CreationDate -eq $owned[[int]$_.ProcessId].CreationDate } |
+            Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate, SessionId)
+        $diagnostic.Processes = $details
+        if ($details.Count) { $diagnostic.Windows = [PackageAcceptanceNative]::DescribeOwnedWindows([int[]]@($details.ProcessId)) }
+    } catch { $diagnostic.Error = $_.Exception.ToString() }
+    $diagnostic | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Destination -Encoding utf8
+}
 function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int]$TimeoutSeconds = 180) {
     $info = [Diagnostics.ProcessStartInfo]::new($File)
     $info.UseShellExecute = $false
@@ -329,22 +421,60 @@ function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
     foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
-    $process = [Diagnostics.Process]::Start($info)
+    $prefix = Join-Path $logDirectory (('{0:D2}-' -f $commands.Count) + $Label)
+    $log = "$prefix.log"
+    $stdoutPath = "$prefix.stdout.log"
+    $stderrPath = "$prefix.stderr.log"
+    $stdoutFile = [IO.File]::Open($stdoutPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $stderrFile = [IO.File]::Open($stderrPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $process = $null
+    $timedOut = $false
+    $captureError = $null
+    $diagnosticsPath = $null
     try {
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            $process.Kill($true)
-            $process.WaitForExit()
-            throw "Timed out after ${TimeoutSeconds}s: $Label"
+        $process = [Diagnostics.Process]::Start($info)
+        # Persist output while the command is running, not only after a normal
+        # return. A timeout must leave useful stdout/stderr artifacts behind.
+        $stdout = $process.StandardOutput.BaseStream.CopyToAsync($stdoutFile)
+        $stderr = $process.StandardError.BaseStream.CopyToAsync($stderrFile)
+        try {
+            if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                $timedOut = $true
+                if ($winget -and [string]::Equals($File, $winget, [StringComparison]::OrdinalIgnoreCase)) {
+                    $diagnosticsPath = "$prefix-timeout.json"
+                    try { Save-OwnedProcessDiagnostics $process $diagnosticsPath }
+                    catch { $captureError = 'Timeout diagnostics failed: ' + $_.Exception.ToString() }
+                }
+                if (-not $process.HasExited) { $process.Kill($true) }
+                if (-not $process.WaitForExit(5000)) { throw 'The timed-out process tree did not stop.' }
+            }
+        } catch { $captureError = $_.Exception.ToString() }
+        try {
+            if (-not [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($stdout, $stderr)).Wait(5000)) {
+                throw 'Redirected command output did not close after process exit.'
+            }
+        } catch {
+            $captureError = ($captureError, $_.Exception.ToString() | Where-Object { $_ }) -join [Environment]::NewLine
+        } finally {
+            $process.StandardOutput.Close()
+            $process.StandardError.Close()
+            $stdoutFile.Dispose()
+            $stderrFile.Dispose()
         }
-        $text = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
-        $log = Join-Path $logDirectory (('{0:D2}-' -f $commands.Count) + $Label + '.log')
+        $text = [IO.File]::ReadAllText($stdoutPath) + [IO.File]::ReadAllText($stderrPath)
+        if ($captureError) { $text += "`nHarness diagnostic: $captureError`n" }
         [IO.File]::WriteAllText($log, $text)
-        $commands.Add(@{ Label = $Label; Arguments = $Arguments; ExitCode = $process.ExitCode; Log = $log })
-        Write-Host "$Label returned $($process.ExitCode); log: $log"
-        return @{ ExitCode = $process.ExitCode; Text = $text; Log = $log }
-    } finally { $process.Dispose() }
+        $exitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null })
+        $commands.Add(@{ Label = $Label; Arguments = $Arguments; ExitCode = $exitCode; TimedOut = $timedOut;
+            Log = $log; StdoutLog = $stdoutPath; StderrLog = $stderrPath; TimeoutDiagnostics = $diagnosticsPath })
+        Write-Host "$Label returned $exitCode; timed out: $timedOut; log: $log"
+        if ($timedOut) { throw "Timed out after ${TimeoutSeconds}s: $Label; output: $log; owned process diagnostics: $diagnosticsPath" }
+        if ($captureError) { throw "Could not complete $Label`: $captureError" }
+        return @{ ExitCode = $exitCode; Text = $text; Log = $log }
+    } finally {
+        $stdoutFile.Dispose(); $stderrFile.Dispose()
+        if ($null -ne $process) { $process.Dispose() }
+    }
 }
 function Invoke-WinGet([string[]]$Arguments, [string]$Label, [switch]$AllowFailure) {
     $result = Invoke-Logged $winget $Arguments $Label
@@ -496,27 +626,32 @@ function Upgrade-Package([string]$Manifest, [string]$Stage, [switch]$AllowFailur
     foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
         $priorLogs[$file.FullName] = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
     }
-    $result = Invoke-WinGet @('upgrade', '--manifest', $Manifest, '--silent',
-        '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity',
-        '--verbose-logs') $Stage -AllowFailure
-    $stageLogs = Join-Path $logDirectory "$Stage-winget"
-    $null = New-Item -ItemType Directory -Path $stageLogs
-    $installerLogs = @()
-    foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
-        $stamp = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
-        if ($priorLogs.ContainsKey($file.FullName) -and $priorLogs[$file.FullName] -ceq $stamp) { continue }
-        $captured = Join-Path $stageLogs $file.Name
-        Copy-Item -LiteralPath $file.FullName -Destination $captured
-        $content = [IO.File]::ReadAllText($captured)
-        if ($content -match 'Setup version: Inno Setup' -and $content -match [regex]::Escape($installedExe)) {
-            $installerLogs += $captured
+    try {
+        $result = Invoke-WinGet @('upgrade', '--manifest', $Manifest, '--silent',
+            '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity',
+            '--verbose-logs') $Stage -AllowFailure
+    } finally {
+        # Invoke-Logged may throw on timeout. Still retain the client's trace
+        # and any partial Inno log after the owned process tree has been stopped.
+        $stageLogs = Join-Path $logDirectory "$Stage-winget"
+        $null = New-Item -ItemType Directory -Path $stageLogs
+        $installerLogs = @()
+        foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
+            $stamp = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
+            if ($priorLogs.ContainsKey($file.FullName) -and $priorLogs[$file.FullName] -ceq $stamp) { continue }
+            $captured = Join-Path $stageLogs $file.Name
+            Copy-Item -LiteralPath $file.FullName -Destination $captured
+            $content = [IO.File]::ReadAllText($captured)
+            if ($content -match 'Setup version: Inno Setup' -and $content -match [regex]::Escape($installedExe)) {
+                $installerLogs += $captured
+            }
         }
+        if ($installerLogs.Count -gt 1) { throw "More than one Inno log targeted the owned executable during $Stage." }
+        if ($installerLogs.Count -eq 1) {
+            Copy-Item -LiteralPath $installerLogs[0] -Destination (Join-Path $logDirectory "$Stage-installer.log")
+        }
+        Write-Host "Captured default WinGet logs for ${Stage}: $stageLogs"
     }
-    if ($installerLogs.Count -gt 1) { throw "More than one Inno log targeted the owned executable during $Stage." }
-    if ($installerLogs.Count -eq 1) {
-        Copy-Item -LiteralPath $installerLogs[0] -Destination (Join-Path $logDirectory "$Stage-installer.log")
-    }
-    Write-Host "Captured default WinGet logs for ${Stage}: $stageLogs"
     if ($result.ExitCode -ne 0 -and -not $AllowFailure) { throw "$Stage failed: $($result.Text)" }
     return $result
 }
