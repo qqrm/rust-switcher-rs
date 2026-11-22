@@ -974,6 +974,7 @@ try {
     Record-Pass 'release settings reloaded after restart'
     Quit-Owned $release $window
     Record-Pass 'release cleanup and exit'
+    & (Join-Path $PSScriptRoot 'update-log.ps1') -Application $ReleaseExe -Root $runRoot
     if ($scenarioFailures.Count -gt 0) { throw ($scenarioFailures -join '; ') }
 } catch {
     $failure = $_.Exception.Message

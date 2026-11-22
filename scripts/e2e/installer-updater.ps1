@@ -77,12 +77,145 @@ function Get-PreferenceSnapshot {
     return ($values | ConvertTo-Json -Compress)
 }
 
+function Receive-FixtureOutput([hashtable]$Stream) {
+    # Bound each pass so a noisy child cannot postpone the process deadline.
+    for ($chunkIndex = 0; $chunkIndex -lt 8 -and -not $Stream.Closed -and $Stream.Read.IsCompleted; $chunkIndex++) {
+        $count = $Stream.Read.GetAwaiter().GetResult()
+        if ($count -eq 0) { $Stream.Closed = $true; break }
+        $chunk = [string]::new($Stream.Buffer, 0, $count)
+        $Stream.Writer.Write($chunk)
+        $Stream.Characters += $count
+        Write-Host -NoNewline $chunk
+        if ($Stream.Characters -gt 8MB) { throw "Fixture $($Stream.Name) exceeded its diagnostic output limit." }
+        $Stream.Read = $Stream.Reader.ReadAsync($Stream.Buffer, 0, $Stream.Buffer.Length)
+    }
+}
+
+function Invoke-FixtureProcess(
+    [string]$FilePath, [string[]]$Arguments, [string]$OutputPrefix,
+    [int]$TimeoutSeconds = 240, [int]$DrainMilliseconds = 2000
+) {
+    $info = [Diagnostics.ProcessStartInfo]::new($FilePath)
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    $resultPath = "$OutputPrefix.result.json"
+    $record = [ordered]@{
+        StartedUtc = [DateTime]::UtcNow.ToString('o')
+        Executable = $FilePath
+        Arguments = $Arguments
+        TimeoutSeconds = $TimeoutSeconds
+        HelperPid = $null
+        ExitCode = $null
+        TimedOut = $false
+        TerminatedOwnedHelper = $false
+        Stdout = "$OutputPrefix.stdout.log"
+        Stderr = "$OutputPrefix.stderr.log"
+        StreamsClosed = $false
+        Failure = $null
+        CleanupErrors = @()
+    }
+    $streams = [Collections.Generic.List[hashtable]]::new()
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
+    $helperProcess = [Diagnostics.Process]::new()
+    $helperProcess.StartInfo = $info
+    $started = $false
+    $failureRecord = $null
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        if (-not $helperProcess.Start()) { throw 'The fixture helper process did not start.' }
+        $started = $true
+        $null = $helperProcess.Handle # Hold this process identity through cleanup.
+        $record.HelperPid = $helperProcess.Id
+        $helperProcess.StandardInput.Close()
+        foreach ($entry in @(
+            @{ Name = 'stdout'; Reader = $helperProcess.StandardOutput; Path = $record.Stdout },
+            @{ Name = 'stderr'; Reader = $helperProcess.StandardError; Path = $record.Stderr }
+        )) {
+            $stream = @{
+                Name = $entry.Name; Reader = $entry.Reader; Buffer = [char[]]::new(4096)
+                Writer = $null; Read = $null; Closed = $false; Characters = 0L
+            }
+            $streams.Add($stream)
+            $stream.Writer = [IO.StreamWriter]::new(
+                [IO.File]::Open($entry.Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read),
+                [Text.UTF8Encoding]::new($false))
+            $stream.Writer.AutoFlush = $true
+            $stream.Read = $stream.Reader.ReadAsync($stream.Buffer, 0, $stream.Buffer.Length)
+        }
+        while (-not $helperProcess.HasExited) {
+            foreach ($stream in $streams) { Receive-FixtureOutput $stream }
+            if ($elapsed.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $record.TimedOut = $true
+                throw "Managed updater fixture exceeded ${TimeoutSeconds}s; helper PID $($record.HelperPid); result: $resultPath"
+            }
+            $null = $helperProcess.WaitForExit(50)
+        }
+        $record.ExitCode = $helperProcess.ExitCode
+        # A failing child can leave inherited pipes open; retain its exit result
+        # immediately, before attempting the bounded output drain.
+        $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $resultPath -Encoding utf8NoBOM
+    } catch {
+        $failureRecord = $_
+        $record.Failure = $_.Exception.ToString()
+        # Save the failure before cleanup: a descendant may retain a pipe.
+        $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $resultPath -Encoding utf8NoBOM
+        Write-Host "Managed updater fixture failed: $($record.Failure)"
+    } finally {
+        if ($started) {
+            try {
+                if (-not $helperProcess.HasExited) {
+                    # Only this held helper is ours to terminate. Never terminate
+                    # its installer or the restarted application as a timeout fix.
+                    $helperProcess.Kill()
+                    $record.TerminatedOwnedHelper = $true
+                    if (-not $helperProcess.WaitForExit(5000)) { throw 'The owned helper did not stop within 5 seconds.' }
+                }
+                if ($helperProcess.HasExited) { $record.ExitCode = $helperProcess.ExitCode }
+            } catch { $cleanupErrors.Add($_.Exception.ToString()) }
+        }
+        $drain = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            do {
+                foreach ($stream in $streams) {
+                    if ($null -ne $stream.Read) { Receive-FixtureOutput $stream }
+                }
+                $record.StreamsClosed = $streams.Count -eq 2 -and @($streams | Where-Object { -not $_.Closed }).Count -eq 0
+                if ($record.StreamsClosed -or $drain.ElapsedMilliseconds -ge $DrainMilliseconds) { break }
+                Start-Sleep -Milliseconds 20
+            } while ($true)
+            if ($started -and -not $record.StreamsClosed) { $cleanupErrors.Add('Redirected output remained open after the bounded drain; a descendant may hold a pipe.') }
+        } catch { $cleanupErrors.Add($_.Exception.ToString()) }
+        foreach ($stream in $streams) {
+            try { $stream.Reader.Dispose() } catch { $cleanupErrors.Add($_.Exception.ToString()) }
+            if ($null -ne $stream.Writer) {
+                try { $stream.Writer.Dispose() } catch { $cleanupErrors.Add($_.Exception.ToString()) }
+            }
+        }
+        $helperProcess.Dispose()
+        $elapsed.Stop()
+        $record.ElapsedMilliseconds = $elapsed.ElapsedMilliseconds
+        $record.CleanupErrors = $cleanupErrors.ToArray()
+        $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $resultPath -Encoding utf8NoBOM
+        Write-Host "Managed updater helper result: $resultPath; exit=$($record.ExitCode); timedOut=$($record.TimedOut)"
+    }
+    if ($null -ne $failureRecord) { throw $failureRecord }
+    if ($cleanupErrors.Count) { throw "Managed updater fixture diagnostics/cleanup failed: $($cleanupErrors -join '; '); result: $resultPath" }
+    return [int]$record.ExitCode
+}
+
 $driver = Join-Path $testRoot 'invoke-helper.ps1'
 @'
 #requires -Version 5.1
 param([Parameter(Mandatory = $true)][string]$FixturePath)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $fixture = Get-Content -LiteralPath $FixturePath -Raw -Encoding UTF8 | ConvertFrom-Json
 function Invoke-RestMethod {
     param([string]$Uri, $Headers, [int]$TimeoutSec)
@@ -155,8 +288,9 @@ function Invoke-HelperFixture([string]$caseName, [bool]$badDigest) {
         }
     }
     $fixture | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fixturePath -Encoding utf8NoBOM
-    & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $driver -FixturePath $fixturePath | Out-Host
-    $code = $LASTEXITCODE
+    $code = Invoke-FixtureProcess $windowsPowerShell @(
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $driver, '-FixturePath', $fixturePath
+    ) (Join-Path $testRoot "$caseName.helper")
     $requests = @(Get-Content -LiteralPath $fixture.RequestLog)
     if ($requests.Count -ne 2 -or $requests[0] -cne $apiUrl -or $requests[1] -cne "$downloadRoot/$setupName") {
         throw 'The managed update did not use the expected GitHub API and installer download paths.'

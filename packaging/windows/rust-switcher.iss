@@ -52,8 +52,5 @@ Source: "{#ApplicationBinary}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Fla
 [Icons]
 Name: "{userprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 
-[Registry]
-Root: HKCU64; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{#AppId}_is1"; ValueType: string; ValueName: "WinGetInstallerType"; ValueData: "inno"; Flags: uninsdeletevalue
-
 [Code]
 #include "app-lifecycle.iss"

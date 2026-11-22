@@ -113,10 +113,12 @@ var
   LifecycleLegacyKey, LifecycleLegacyDirectory, LifecycleLegacyTarget: String;
   LifecycleLegacyLink, LifecycleTarget, LifecycleBackup, LifecycleOldHash: String;
   LifecycleExtraTarget, LifecycleExtraBackup, LifecycleExtraHash: String;
-  LifecycleOldInnoVersion: String;
+  LifecycleOldInnoVersion, LifecycleOldInnoType: String;
+  LifecycleOldInnoLink, LifecycleOldInnoPath: String;
   LifecycleDetected, LifecyclePrepared, LifecycleWasRunning: Boolean;
   LifecycleCompleted, LifecycleRestarted, LifecycleOldInnoExists: Boolean;
   LifecycleExtraExisted, LifecycleLegacyPathAdded: Boolean;
+  LifecycleOldInnoTypeExists: Boolean;
   LifecycleLaunchToken: THandle;
   LifecycleHandles: TLifecycleHandles;
   LifecycleHandleCount: Integer;
@@ -480,6 +482,7 @@ function LifecycleStart(const Target: String): Boolean;
 var
   ResultCode, Attempt: Integer;
   WaitResult: Cardinal;
+  ObservedSingleProcess, SingleProcessReady: Boolean;
 begin
   Result := False;
   Log('[lifecycle] Restart: begin; target=' + Target);
@@ -501,20 +504,26 @@ begin
   Result := False;
   for Attempt := 1 to 100 do begin
     LifecycleCapture(Target);
+    ObservedSingleProcess := LifecycleHandleCount = 1;
+    SingleProcessReady := False;
     try
-      if LifecycleHandleCount = 1 then begin
+      if ObservedSingleProcess then begin
         WaitResult := LifecycleWait(LifecycleHandles[0], 1000);
         if WaitResult = $FFFFFFFF then
           Log(LifecycleWaitError('[lifecycle] Cannot inspect the installed process', WaitResult));
-        Result := WaitResult = LifecycleWaitTimeout;
+        SingleProcessReady := WaitResult = LifecycleWaitTimeout;
         Log('[lifecycle] Restart: installed-process stability wait complete');
-        Exit;
       end;
     finally
       LifecycleReleaseHandles;
     end;
+    if ObservedSingleProcess then begin
+      Result := SingleProcessReady;
+      Exit;
+    end;
     Sleep(50);
   end;
+  Result := False;
   Log('[lifecycle] Restart: readiness deadline exhausted');
 end;
 
@@ -577,6 +586,59 @@ begin
     ((LifecycleFileAttributes(Link) and $400) <> 0) and LifecycleSamePath(Link, Target);
 end;
 
+function LifecycleOwnedDirectory(const Directory: String): Boolean;
+begin
+  Result := (Directory <> '') and not LifecyclePathIsRelative(Directory) and
+    (CompareText(LifecycleNormalizedPath(Directory),
+      ExtractFileDir(LifecycleNormalizedPath(LifecycleTarget))) = 0);
+end;
+
+function LifecycleOwnLocationMatches: Boolean;
+var
+  Directory: String;
+begin
+  Result := RegQueryStringValue(HKCU64, LifecycleOwnKey, 'InstallLocation', Directory) and
+    LifecycleOwnedDirectory(Directory);
+end;
+
+procedure LifecycleSnapshotRegistration;
+var
+  Value: String;
+begin
+  LifecycleOldInnoLink := '';
+  LifecycleOldInnoPath := '';
+  LifecycleOldInnoTypeExists := False;
+  LifecycleOldInnoExists := RegQueryStringValue(HKCU64, LifecycleOwnKey,
+    'DisplayVersion', LifecycleOldInnoVersion);
+  if not LifecycleOldInnoExists then Exit;
+  if not LifecycleOwnLocationMatches then
+    RaiseException('The existing Inno registration does not own this installation path.');
+  LifecycleOldInnoTypeExists := RegQueryStringValue(HKCU64, LifecycleOwnKey,
+    'WinGetInstallerType', LifecycleOldInnoType);
+  if RegQueryStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetSymlink', Value) and
+    LifecycleOwnedLink(Value, LifecycleTarget) then LifecycleOldInnoLink := Value;
+  if RegQueryStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetPath', Value) and
+    LifecycleOwnedDirectory(Value) then LifecycleOldInnoPath := Value;
+end;
+
+procedure LifecycleSetRegistrationValue(const Name, Value: String; Present: Boolean);
+begin
+  if Present then begin
+    if not RegWriteStringValue(HKCU64, LifecycleOwnKey, Name, Value) then
+      RaiseException('The installation metadata could not be recorded: ' + Name);
+  end else if RegValueExists(HKCU64, LifecycleOwnKey, Name) then
+    if not RegDeleteValue(HKCU64, LifecycleOwnKey, Name) then
+      RaiseException('The obsolete installation metadata could not be removed: ' + Name);
+end;
+
+procedure LifecycleWriteAdoptedMetadata(const Link, Directory: String);
+begin
+  LifecycleSetRegistrationValue('AdoptedWinGetSymlink', Link,
+    LifecycleOwnedLink(Link, LifecycleTarget));
+  LifecycleSetRegistrationValue('AdoptedWinGetPath', Directory,
+    LifecycleOwnedDirectory(Directory));
+end;
+
 function InitializeSetup: Boolean;
 begin
   Log('[lifecycle] InitializeSetup: begin');
@@ -596,8 +658,9 @@ begin
        (CompareText(LifecycleNormalizedPath(LifecycleTarget), LifecycleLegacyTarget) <> 0) then
       RaiseException('The portable installation must be upgraded in its existing directory.');
     if not LifecyclePrepared then begin
-      LifecycleOldInnoExists := RegQueryStringValue(HKCU64, LifecycleOwnKey,
-        'DisplayVersion', LifecycleOldInnoVersion);
+      { Inno recreates its uninstall key after [Registry] entries. Preserve
+        validated ownership metadata before that transaction starts. }
+      LifecycleSnapshotRegistration;
       if FileExists(LifecycleTarget) then begin
         Log('[lifecycle] PrepareToInstall: hashing existing application');
         LifecycleOldHash := GetSHA256OfFile(LifecycleTarget);
@@ -640,9 +703,25 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  InstallerType, Link, Directory: String;
 begin
   Log('[lifecycle] CurStepChanged: step=' + IntToStr(Ord(CurStep)));
   if CurStep = ssDone then begin
+    { ARP now exists. Earlier [Registry] writes are lost when Inno recreates it. }
+    Log('[lifecycle] Installation complete: recording installer ownership');
+    if not LifecycleOwnLocationMatches then
+      RaiseException('The new Inno registration does not own this installation path.');
+    LifecycleSetRegistrationValue('WinGetInstallerType', 'inno', True);
+    if not RegQueryStringValue(HKCU64, LifecycleOwnKey, 'WinGetInstallerType', InstallerType) or
+      (InstallerType <> 'inno') then
+      RaiseException('The installer ownership marker could not be verified.');
+    Link := LifecycleOldInnoLink;
+    Directory := LifecycleOldInnoPath;
+    if LifecycleOwnedLink(LifecycleLegacyLink, LifecycleTarget) then Link := LifecycleLegacyLink;
+    if LifecycleLegacyPathAdded then Directory := LifecycleLegacyDirectory;
+    Log('[lifecycle] Installation complete: recording owned alias and PATH');
+    LifecycleWriteAdoptedMetadata(Link, Directory);
     if LifecycleWasRunning then begin
       Log('[lifecycle] Installation complete: restarting previously running application');
       LifecycleRestarted := LifecycleStart(LifecycleTarget);
@@ -651,13 +730,6 @@ begin
     end;
     { Keep the old ARP entry until the complete installation and requested
       relaunch succeed. The old WinGet alias still resolves to the same path. }
-    Log('[lifecycle] Installation complete: recording migrated alias and PATH');
-    if LifecycleOwnedLink(LifecycleLegacyLink, LifecycleTarget) then
-      if not RegWriteStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetSymlink', LifecycleLegacyLink) then
-        RaiseException('The migrated command alias could not be recorded.');
-    if LifecycleLegacyPathAdded then
-      if not RegWriteStringValue(HKCU64, LifecycleOwnKey, 'AdoptedWinGetPath', LifecycleLegacyDirectory) then
-        RaiseException('The migrated PATH entry could not be recorded.');
     Log('[lifecycle] Installation complete: retiring legacy registration');
     if LifecycleLegacyKey <> '' then
       if not RegDeleteKeyIncludingSubkeys(HKCU64, LifecycleLegacyKey) then
@@ -700,8 +772,19 @@ begin
       end;
     end;
     Log('[lifecycle] Rollback: restoring registration');
-    if LifecycleOldInnoExists then
-      RegWriteStringValue(HKCU64, LifecycleOwnKey, 'DisplayVersion', LifecycleOldInnoVersion)
+    if LifecycleOldInnoExists then begin
+      try
+        if not LifecycleOwnLocationMatches then
+          RaiseException('The previous registration no longer owns this installation path.');
+        LifecycleSetRegistrationValue('DisplayVersion', LifecycleOldInnoVersion, True);
+        LifecycleSetRegistrationValue('WinGetInstallerType', LifecycleOldInnoType,
+          LifecycleOldInnoTypeExists);
+        LifecycleWriteAdoptedMetadata(LifecycleOldInnoLink, LifecycleOldInnoPath);
+      except
+        { The update already fails. Still attempt payload and process recovery. }
+        Log('[lifecycle] Rollback: registration restore failed; ' + GetExceptionMessage);
+      end;
+    end
     else if RegQueryStringValue(HKCU64, LifecycleOwnKey, 'InstallLocation', ExistingLocation) and
       (CompareText(LifecycleNormalizedPath(ExistingLocation), ExtractFileDir(LifecycleTarget)) = 0) then
       RegDeleteKeyIncludingSubkeys(HKCU64, LifecycleOwnKey);

@@ -7,6 +7,7 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::{
         Input::KeyboardAndMouse::GetDoubleClickTime,
+        Shell::NIN_BALLOONUSERCLICK,
         WindowsAndMessaging::{
             IsWindowVisible, KillTimer, SetTimer, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
             WM_MOUSEMOVE, WM_RBUTTONUP,
@@ -21,6 +22,7 @@ enum TrayEvent {
     LeftClick,
     RightClick,
     DoubleClick,
+    BalloonClick,
     Unknown,
 }
 
@@ -35,6 +37,7 @@ fn tray_event_from_lparam(raw: u32) -> TrayEvent {
         WM_LBUTTONUP => TrayEvent::LeftClick,
         WM_LBUTTONDBLCLK => TrayEvent::DoubleClick,
         WM_RBUTTONUP | WM_CONTEXTMENU => TrayEvent::RightClick,
+        NIN_BALLOONUSERCLICK => TrayEvent::BalloonClick,
         _ => TrayEvent::Unknown,
     }
 }
@@ -147,6 +150,11 @@ pub fn handle_tray_message(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESUL
     let raw = lparam.0 as u32;
     let lo = raw & 0xFFFF;
 
+    // NOTIFYICON_VERSION_4 packs the icon ID in HIWORD(lParam).
+    if raw >> 16 != super::tray::TRAY_UID {
+        return LRESULT(0);
+    }
+
     if lo == WM_MOUSEMOVE {
         return LRESULT(0);
     }
@@ -163,6 +171,16 @@ pub fn handle_tray_message(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESUL
     );
 
     match event {
+        TrayEvent::BalloonClick => {
+            // Keep the latest action across HIDE/TIMEOUT: on Windows 10 the
+            // notification can still be clicked in Notification Center. The
+            // legacy callback has no per-balloon token, so a replacement notice
+            // invalidates it and the persistent menu remains the fallback.
+            if super::tray::take_balloon_action() == super::tray::BalloonAction::OpenUpdateLog {
+                super::updater::open_log(hwnd);
+            }
+            LRESULT(0)
+        }
         TrayEvent::LeftClick => {
             // После WM_LBUTTONDBLCLK Windows часто присылает WM_LBUTTONUP.
             // Этот up не должен запускать логику одиночного клика.
@@ -218,14 +236,15 @@ pub fn handle_tray_message(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESUL
                     Ok(action) => match action {
                         super::tray::TrayMenuAction::None => {}
                         super::tray::TrayMenuAction::Update => super::updater::start(hwnd),
+                        super::tray::TrayMenuAction::OpenUpdateLog => {
+                            super::updater::open_log(hwnd)
+                        }
                         super::tray::TrayMenuAction::ToggleAutoConvert => {
                             if let Some(next) = next_autoconvert_state(
                                 state.autoconvert_feature_enabled,
                                 state.autoconvert_enabled,
                             ) {
-                                super::set_autoconvert_enabled_from_tray(
-                                    hwnd, state, next, false,
-                                );
+                                super::set_autoconvert_enabled_from_tray(hwnd, state, next, false);
                             }
                         }
                     },

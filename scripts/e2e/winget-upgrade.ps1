@@ -104,6 +104,7 @@ $tokenTest = $null
 $trustedSource = $null
 $trustedSourceEvidence = [Collections.Generic.List[object]]::new()
 $activeDiagnosticManifest = $null
+$legacyOwnership = $null
 
 Add-Type -TypeDefinition @'
 using System;
@@ -787,9 +788,20 @@ function Assert-Autostart([bool]$Enabled) {
         throw 'Package update changed the persisted Rust Switcher configuration.'
     }
 }
-function Assert-Installed([string]$ExpectedVersion, [bool]$Autostart) {
+function Assert-Installed([string]$ExpectedVersion, [bool]$Autostart, [switch]$FreshInstall) {
     $arp = Read-Arp $productCode
     if ($null -eq $arp -or $arp.DisplayVersion -cne $ExpectedVersion) { throw "Wrong Inno ARP version; expected $ExpectedVersion" }
+    if ([string]$arp['WinGetInstallerType'] -cne 'inno') { throw 'The managed Inno registration lost its installer-type marker.' }
+    if (-not $FreshInstall -and $null -eq $legacyOwnership) { throw 'The validated legacy ownership snapshot is missing.' }
+    foreach ($name in @('AdoptedWinGetSymlink', 'AdoptedWinGetPath')) {
+        $expected = if ($FreshInstall) { $null } else { $legacyOwnership[$name] }
+        if ($null -eq $expected) {
+            if ($arp.ContainsKey($name)) { throw "The installer claimed unexpected ownership in $name." }
+        } elseif (-not $arp.ContainsKey($name) -or
+            -not [string]::Equals([string]$arp[$name], [string]$expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The installer lost or changed its validated $name ownership."
+        }
+    }
     if ($null -ne (Read-Arp $legacyProductCode)) { throw 'Portable ARP entry survived migration; WinGet would see two installations.' }
     if (-not [string]::Equals(([string]$arp.InstallLocation).TrimEnd('\'), $installDirectory,
             [StringComparison]::OrdinalIgnoreCase)) { throw 'Migration changed the existing install directory.' }
@@ -1178,8 +1190,23 @@ try {
     $legacyHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
     if ($legacyHash -cne ([string]$legacy.SHA256).ToUpperInvariant()) { throw 'Installed baseline hash does not match WinGet catalog registration.' }
     if ($legacyHash -ceq $expectedHash) { throw 'Candidate payload equals the published baseline; this would not prove executable replacement.' }
-    $legacyAlias = [string]$legacy.SymlinkFullPath
+    $legacyAlias = [string]$legacy['SymlinkFullPath']
     if (-not $legacyAlias -or -not (Test-Path -LiteralPath $legacyAlias)) { throw 'Baseline has no working WinGet command alias.' }
+    $aliasItem = Get-Item -LiteralPath $legacyAlias -Force
+    $targetProperty = $aliasItem.PSObject.Properties['Target']
+    if (($aliasItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or $null -eq $targetProperty) {
+        throw 'Baseline command alias is not a verifiable link to the owned executable.'
+    }
+    $aliasTargets = @($targetProperty.Value)
+    if ($aliasTargets.Count -ne 1 -or -not [IO.Path]::IsPathRooted([string]$aliasTargets[0]) -or
+        -not [string]::Equals([IO.Path]::GetFullPath([string]$aliasTargets[0]), $installedExe,
+            [StringComparison]::OrdinalIgnoreCase)) { throw 'Baseline command alias points outside the owned executable.' }
+    $legacyOwnership = @{ AdoptedWinGetSymlink = $legacyAlias; AdoptedWinGetPath = $null }
+    if ($legacy.ContainsKey('InstallDirectoryAddedToPath') -and [uint32]$legacy['InstallDirectoryAddedToPath'] -ne 0) {
+        if (-not [string]::Equals(([string]$legacy['InstallLocation']).TrimEnd('\'), $installDirectory,
+            [StringComparison]::OrdinalIgnoreCase)) { throw 'Baseline PATH ownership does not name the owned install directory.' }
+        $legacyOwnership.AdoptedWinGetPath = $installDirectory
+    }
     $sentinel = Join-Path (Split-Path $legacyAlias) ('qqrm-unrelated-' + [guid]::NewGuid().ToString('N') + '.exe')
     [IO.File]::WriteAllText($sentinel, $sentinelText)
     if ($Application -eq 'brightwheel') {
@@ -1303,7 +1330,7 @@ try {
     }
     Assert-TrustedInstallTrace $manifest $freshLogs 'fresh-silent-install'
     Assert-Stopped
-    Assert-Installed $next.Version $false
+    Assert-Installed $next.Version $false -FreshInstall
     $fresh = Start-Installed
     $null = Invoke-WinGet @('uninstall', '--product-code', $productCode, '--exact', '--silent',
         '--accept-source-agreements', '--disable-interactivity') 'uninstall-running-fresh'
@@ -1368,6 +1395,7 @@ try {
     if (Test-Path -LiteralPath $work) {
         $report = @{ Application = $Application; LegacyVersion = $LegacyVersion; CandidateVersion = $PackageVersion;
             CandidateHash = $expectedHash; Checks = $checks.ToArray(); Commands = $commands.ToArray();
+            LegacyOwnership = $legacyOwnership;
             TokenComparisons = $tokenComparisons.ToArray();
             TokenTest = $tokenTest;
             TrustedSourceEvidence = $trustedSourceEvidence.ToArray();

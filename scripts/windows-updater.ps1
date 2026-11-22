@@ -21,6 +21,7 @@ $startedNew = $false
 $originalProcess = $null
 $launchGate = $null
 $launchGateHeld = $false
+$preserveInstallerStaging = $false
 
 function Write-UpdateLog([string]$message) {
     try {
@@ -217,8 +218,15 @@ try {
         $directory = Split-Path -Parent $TargetPath
         $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
             ('/DIR="' + $directory + '"'), ('/LOG="' + $LogPath + '.installer.log"'))
-        $installation = Start-Process -FilePath $staged -ArgumentList $arguments -PassThru -Wait -ErrorAction Stop
+        $installation = Start-Process -FilePath $staged -ArgumentList $arguments -PassThru -ErrorAction Stop
+        $preserveInstallerStaging = $true
         try {
+            # Waiting for the process tree would also wait for the restarted tray app.
+            $null = $installation.Handle
+            if (-not $installation.WaitForExit(180000)) {
+                throw 'Package installer is still running after 180 seconds; it was left running to finish or roll back'
+            }
+            $preserveInstallerStaging = $false
             if ($installation.ExitCode -ne 0) { throw "Package installer failed with exit code $($installation.ExitCode)" }
         } finally { $installation.Dispose() }
         if ((Get-Item -LiteralPath $TargetPath).Length -ne $installedAsset.Size) {
@@ -305,10 +313,16 @@ try {
     if ($launchGateHeld) { $launchGate.ReleaseMutex() }
     if ($null -ne $launchGate) { $launchGate.Dispose() }
     if ($null -ne $originalProcess) { $originalProcess.Dispose() }
-    Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    if (-not $preserveInstallerStaging) {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
     if ($null -ne $candidate) {
         Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
     }
-    # The script may remain briefly open; failure to remove it is harmless.
-    Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($preserveInstallerStaging) {
+        Write-UpdateLog "Installer state is still active or unknown; retained staging directory: $workDir"
+    } else {
+        # The script may remain briefly open; failure to remove it is harmless.
+        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
