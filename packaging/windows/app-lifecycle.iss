@@ -23,6 +23,11 @@ const
   LifecycleTerminate = $0001;
   LifecycleWaitTimeout = 258;
   LifecycleOfficialSource = 'Microsoft.Winget.Source_8wekyb3d8bbwe';
+  { ASSIGN_PRIMARY | DUPLICATE | QUERY | ADJUST_DEFAULT | ADJUST_SESSIONID.
+    Matches the explicit duplicate-handle access used before token launch in
+    Chromium 140.0.7339.50: base/win/elevation_util.cc. The native probe compares
+    this mask with the documented 0xB launch mask. }
+  LifecycleLaunchTokenAccess = $18B;
 
 type
   TLifecycleProcessIds = array[0..8191] of Cardinal;
@@ -413,7 +418,7 @@ begin
       if not Allowed then
         RaiseException('The installer cannot restart the application with its original privileges.');
       Log('[lifecycle] Token retention: duplicating primary token');
-      if not LifecycleDuplicateToken(ApplicationToken, $B, 0, 2, 1, LifecycleLaunchToken) then
+      if not LifecycleDuplicateToken(ApplicationToken, LifecycleLaunchTokenAccess, 0, 2, 1, LifecycleLaunchToken) then
         RaiseException(LifecycleApiError('The running application primary token could not be duplicated [DuplicateTokenEx]'));
       Log('[lifecycle] Token retention: primary token duplicated');
     finally

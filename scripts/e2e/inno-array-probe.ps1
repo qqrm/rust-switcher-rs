@@ -1,8 +1,9 @@
 #requires -Version 7.0
 <#
 Compile and run a read-only Inno 6 array/native-boundary diagnostic. A successful
-exit means the native/static controls passed, not that dynamic-array handoffs
-passed. Every observation and mismatch is retained in result.json and setup.log.
+exit means the native/static and selected token-access controls passed, not
+that dynamic-array handoffs or legacy token masks passed. Every observation
+and mismatch is retained in result.json and setup.log.
 #>
 [CmdletBinding()]
 param(
@@ -24,6 +25,7 @@ $SourcePath = (Resolve-Path -LiteralPath $SourcePath).Path
 $setupLog = Join-Path $work 'setup.log'
 $commands = [Collections.Generic.List[object]]::new()
 $observations = [Collections.Generic.List[object]]::new()
+$tokenRecords = [Collections.Generic.List[string]]::new()
 $failure = $null
 $completed = $false
 
@@ -95,6 +97,7 @@ try {
     $completion = $null
     if (Test-Path -LiteralPath $setupLog) {
         foreach ($line in Get-Content -LiteralPath $setupLog) {
+            if ($line -match '\[token-probe\] (?<record>.*)') { $tokenRecords.Add($Matches.record) }
             if ($line -match '\[array-probe\] name=(?<name>[^;]+);actual=(?<actual>-?\d+);expected=(?<expected>-?\d+);required=(?<required>[01])') {
                 $observations.Add([ordered]@{
                     name = $Matches.name; actual = [int]$Matches.actual
@@ -112,17 +115,25 @@ try {
     if ($completed -and ($null -eq $completion -or -not $completion.complete -or
         $completion.requiredFailures -ne 0 -or $completion.observations -ne $observations.Count)) {
         $completed = $false
-        $failure = 'The probe did not record a complete, passing set of native/static controls.'
+        $failure = 'The probe did not record a complete, passing set of native/static and token controls.'
     }
-    $dynamicMismatches = @($observations | Where-Object { -not $_.required -and -not $_.matched })
+    $dynamicMismatches = @($observations | Where-Object {
+        -not $_.required -and -not $_.matched -and -not $_.name.StartsWith('token-')
+    })
+    $tokenMismatches = @($observations | Where-Object {
+        -not $_.required -and -not $_.matched -and $_.name.StartsWith('token-')
+    })
     [ordered]@{
         controlsPassed = $completed; failure = $failure; completion = $completion
         dynamicMismatchCount = $dynamicMismatches.Count; dynamicMismatches = $dynamicMismatches
+        tokenMismatchCount = $tokenMismatches.Count; tokenMismatches = $tokenMismatches
+        tokenRecords = @($tokenRecords)
         observations = @($observations); commands = @($commands)
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $work 'result.json') -Encoding utf8
-    Write-Output "Inno probe: controlsPassed=$completed; dynamicMismatchCount=$($dynamicMismatches.Count); report=$work"
+    Write-Output "Inno probe: controlsPassed=$completed; dynamicMismatchCount=$($dynamicMismatches.Count); tokenMismatchCount=$($tokenMismatches.Count); report=$work"
     foreach ($mismatch in $dynamicMismatches) {
         Write-Output "Observed dynamic mismatch: $($mismatch.name) actual=$($mismatch.actual) expected=$($mismatch.expected)"
     }
+    foreach ($record in $tokenRecords) { Write-Output "Token probe: $record" }
 }
 if (-not $completed) { throw $failure }

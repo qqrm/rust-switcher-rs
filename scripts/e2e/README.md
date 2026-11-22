@@ -89,11 +89,16 @@ setup. Required controls verify that a global fixed process-handle buffer and
 its count survive native enumeration and image-path calls, retain the expected
 process identity, and release the handle. Separate dynamic-array parameter and
 return-value cases record their actual results, including mismatches; they do
-not determine whether the static controls pass. The bounded probe installs no
-application files and stops no application. Its observations, compiler output
-and setup log are retained with the package-manager diagnostics. This gate runs
-in both CI and release preparation; the log for the tested commit establishes
-the actual runtime result.
+not determine whether the static controls pass. The included token probe also
+compares duplicate-handle access masks `0xB`, `0x8B`, `0x10B` and `0x18B` using
+only its own primary token. The `0x18B` case must launch an owned `cmd.exe`,
+preserve its logon identity, elevation and session, and exit successfully; the
+other masks remain observations. Every handle and environment release is a
+required control. The probe enables no privileges, installs no application
+files, and bounds cleanup of its own short-lived children. Its observations,
+compiler output and setup log are retained with the package-manager diagnostics.
+This gate runs in both CI and release preparation; the log for the tested commit
+establishes the actual runtime result.
 
 `installer-updater.ps1` tests the production built-in updater against a locally
 built installer. Only GitHub transport is replaced in a separate PowerShell 5.1

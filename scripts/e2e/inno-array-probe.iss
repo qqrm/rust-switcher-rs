@@ -23,10 +23,11 @@ DisableReadyPage=yes
 DisableFinishedPage=yes
 
 [Code]
-{ No files, registration, process shutdown, or application changes. Dynamic
-  array handoffs are observations, including failures. The global fixed owner
-  and read-only native operations are required controls. Only the current
-  process is opened, and every real handle is closed in the same scope. }
+{ No application files, registration, or unrelated application changes.
+  Dynamic array handoffs are observations, including failures. The global
+  fixed owner and native operations are required controls. Token cases create
+  only short-lived owned cmd.exe children, with bounded cleanup; no unrelated
+  process is stopped. Every real handle is released in its owning scope. }
 type
   TProbeValues = array of THandle;
   TProbeIds = array[0..8191] of Cardinal;
@@ -70,6 +71,8 @@ begin
   if Required and (Actual <> Expected) then
     ProbeRequiredFailures := ProbeRequiredFailures + 1;
 end;
+
+#include "inno-token-probe.iss"
 
 procedure ProbePureVar(var Values: TProbeValues);
 begin
@@ -274,6 +277,7 @@ begin
   end;
   ProbeObserve('static-released-count', ProbeFixedCount, 0, True);
   ProbeObserve('static-released-value', ProbeFixed[0], 0, True);
+  ProbeRunTokenCases;
   ProbeCompleted := True;
 end;
 

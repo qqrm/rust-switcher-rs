@@ -268,7 +268,10 @@ public static class PackageAcceptanceNative {
                     return IntPtr.Zero;
                 }
                 IntPtr duplicate;
-                if (!DuplicateTokenEx(linked, 0x000B, IntPtr.Zero, 2, 1, out duplicate))
+                // ASSIGN_PRIMARY | DUPLICATE | QUERY | ADJUST_DEFAULT | ADJUST_SESSIONID.
+                // These are handle access rights; the token's identity and privileges are unchanged.
+                const uint retainedPrimaryTokenAccess = 0x0000018B;
+                if (!DuplicateTokenEx(linked, retainedPrimaryTokenAccess, IntPtr.Zero, 2, 1, out duplicate))
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 reason = "Using the runner user's linked unelevated token";
                 return duplicate;
