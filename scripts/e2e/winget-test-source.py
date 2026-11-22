@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-package HTTPS REST source for the real WinGet acceptance test.
+"""HTTPS REST source for the real WinGet acceptance test.
 
 Requires PyYAML==6.0.3. Read validated, production-generated multifile YAML
 manifests; this adapter does not generate installer identities or payload hashes.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,8 @@ import yaml
 
 CONTRACT = "1.28.0"
 MAX_BODY = 65536
+MAX_DEPENDENCIES = 8
+MAX_DEPENDENCY_BYTES = 256 * 1024 * 1024
 DOCUMENT_KEYS = {"PackageIdentifier", "PackageVersion", "ManifestType", "ManifestVersion"}
 
 
@@ -164,6 +167,151 @@ def product_codes(version: dict) -> list[str]:
     return sorted(codes)
 
 
+def declared_dependencies(catalog: dict) -> list[dict]:
+    """Derive the allowlist from the unchanged selected production installers."""
+    dependencies = {}
+    for version in catalog["Versions"]:
+        for installer in version["Installers"]:
+            fields = installer.get("Dependencies", {})
+            if not isinstance(fields, dict):
+                raise FixtureError("Invalid dependency declaration")
+            packages = fields.get("PackageDependencies", [])
+            if not isinstance(packages, list):
+                raise FixtureError("Invalid package dependency declaration")
+            for item in packages:
+                if not isinstance(item, dict) or set(item) - {"PackageIdentifier", "MinimumVersion"}:
+                    raise FixtureError("Invalid package dependency fields")
+                package = required_string(item, "PackageIdentifier")
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]{1,127}", package):
+                    raise FixtureError("Invalid dependency identifier")
+                key = package.casefold()
+                if key == catalog["PackageIdentifier"].casefold():
+                    raise FixtureError("A package cannot depend on itself")
+                value = dependencies.setdefault(key, {"PackageIdentifier": package, "MinimumVersions": []})
+                minimum = item.get("MinimumVersion")
+                if minimum is not None:
+                    if not isinstance(minimum, str) or not minimum or len(minimum) > 128:
+                        raise FixtureError("Invalid dependency minimum version")
+                    if minimum not in value["MinimumVersions"]:
+                        value["MinimumVersions"].append(minimum)
+                if len(dependencies) > MAX_DEPENDENCIES:
+                    raise FixtureError("Too many fixture dependencies")
+    return [dependencies[key] for key in sorted(dependencies)]
+
+
+def load_dependency_catalogs(root: Path | None, primary: dict, *, verify_downloads: bool = False) -> tuple[dict, list[dict]]:
+    """Adapt only official `winget download` merged exports, without rewriting fields.
+
+    WinGet 1.29.380 exports one selected installer plus root default-locale
+    fields and optional Localization. Its original URL, hash, scope, product
+    codes, upgrade codes, switches, and dependencies all survive this mapping.
+    """
+    declared = declared_dependencies(primary)
+    files = sorted(root.rglob("*.yaml")) if root is not None else []
+    if len(files) > MAX_DEPENDENCIES:
+        raise FixtureError("Too many exported dependency manifests")
+    catalogs, evidence = {}, []
+    total_bytes = 0
+    for path in files:
+        if not path.resolve().is_relative_to(root.resolve()) or path.stat().st_size > 1048576:
+            raise FixtureError("Exported dependency path or size is invalid")
+        try:
+            doc = yaml.load(path.read_text(encoding="utf-8-sig"), Loader=ManifestLoader)
+        except (yaml.YAMLError, UnicodeError) as error:
+            raise FixtureError("Cannot parse an exported dependency") from error
+        if not isinstance(doc, dict) or doc.get("ManifestType") != "merged":
+            raise FixtureError("Expected a WinGet merged dependency export")
+        package = required_string(doc, "PackageIdentifier")
+        version = required_string(doc, "PackageVersion")
+        required_string(doc, "ManifestVersion")
+        if package.casefold() in catalogs or package.casefold() == primary["PackageIdentifier"].casefold():
+            raise FixtureError("Duplicate or primary-package dependency export")
+        installers = doc.get("Installers")
+        if not isinstance(installers, list) or len(installers) != 1 or not isinstance(installers[0], dict):
+            raise FixtureError("Expected one exported selected dependency installer")
+        installer = installers[0]
+        for key in ("Architecture", "InstallerType", "InstallerUrl", "InstallerSha256"):
+            required_string(installer, key)
+        digest = installer["InstallerSha256"]
+        url = urlsplit(installer["InstallerUrl"])
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", digest) or url.scheme != "https" or not url.hostname or url.username or url.password:
+            raise FixtureError("Invalid exported dependency URL or digest")
+        locale = object_without(doc, DOCUMENT_KEYS | {"Channel", "Installers", "Localization"})
+        for key in ("PackageLocale", "PackageName", "Publisher", "ShortDescription"):
+            required_string(locale, key)
+        current = {"PackageVersion": version, "Channel": doc.get("Channel", ""),
+                   "DefaultLocale": locale, "Installers": copy.deepcopy(installers)}
+        if not isinstance(current["Channel"], str):
+            raise FixtureError("Invalid exported dependency channel")
+        if "Localization" in doc:
+            if not isinstance(doc["Localization"], list) or not all(isinstance(item, dict) for item in doc["Localization"]):
+                raise FixtureError("Invalid exported dependency localizations")
+            current["Locales"] = copy.deepcopy(doc["Localization"])
+        catalog = {"PackageIdentifier": package, "Versions": [current]}
+        catalogs[package.casefold()] = catalog
+        record = {"PackageIdentifier": package, "PackageVersion": version,
+                  "InstallerUrl": installer["InstallerUrl"], "InstallerSha256": digest,
+                  "Architecture": installer["Architecture"], "Scope": installer.get("Scope", ""),
+                  "ProductCodes": product_codes(current), "Manifest": str(path)}
+        if verify_downloads:
+            payloads = [candidate for candidate in path.parent.iterdir()
+                        if candidate.is_file() and candidate.stem == path.stem and candidate.suffix != ".yaml"]
+            if len(payloads) != 1 or not payloads[0].resolve().is_relative_to(root.resolve()):
+                raise FixtureError("Expected the matching WinGet-downloaded dependency payload")
+            payload = payloads[0]
+            size = payload.stat().st_size
+            total_bytes += size
+            if size <= 0 or size > 128 * 1024 * 1024 or total_bytes > MAX_DEPENDENCY_BYTES:
+                raise FixtureError("Dependency payload exceeds the fixture size limit")
+            hasher = hashlib.sha256()
+            with payload.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            if hasher.hexdigest().casefold() != digest.casefold():
+                raise FixtureError("Official downloaded dependency hash does not match its exported manifest")
+            record.update({"DownloadedBytes": size, "DownloadedSha256": hasher.hexdigest(), "Payload": str(payload)})
+        evidence.append(record)
+
+    # Only declared IDs, including an explicitly declared transitive dependency,
+    # can enter this fixture. WinGet itself remains the minimum-version arbiter.
+    allowed = {item["PackageIdentifier"].casefold() for item in declared}
+    visited = set()
+    while allowed - visited:
+        if len(allowed) > MAX_DEPENDENCIES:
+            raise FixtureError("Too many transitive fixture dependencies")
+        package = next(iter(allowed - visited))
+        if package not in catalogs:
+            raise FixtureError("A declared dependency has no official exported manifest")
+        visited.add(package)
+        allowed.update(item["PackageIdentifier"].casefold() for item in declared_dependencies(catalogs[package]))
+    if set(catalogs) != allowed:
+        raise FixtureError("An exported dependency was not declared by the production manifests")
+    try:
+        json.dumps(catalogs, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise FixtureError("Dependency manifest has a value unsupported by JSON") from error
+    return catalogs, evidence
+
+
+def inspect_dependencies(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Inspect production dependencies and verified WinGet exports")
+    parser.add_argument("--manifest-root", type=Path, required=True)
+    parser.add_argument("--dependency-root", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        primary = load_catalog(args.manifest_root)
+        result = {"PackageIdentifier": primary["PackageIdentifier"], "Dependencies": declared_dependencies(primary)}
+        if args.dependency_root is not None:
+            _, result["Exports"] = load_dependency_catalogs(args.dependency_root, primary, verify_downloads=True)
+        with args.output.open("x", encoding="utf-8") as stream:
+            json.dump(result, stream, allow_nan=False)
+        return 0
+    except (FixtureError, OSError, ValueError) as error:
+        print(f"Dependency fixture validation failed: {error}", file=sys.stderr)
+        return 1
+
+
 def field_values(catalog: dict, field: str) -> list[str]:
     versions = catalog["Versions"]
     if field == "PackageIdentifier":
@@ -249,6 +397,12 @@ def search_catalog(catalog: dict, request: dict) -> dict:
     }]}
 
 
+def search_catalogs(catalogs: dict, request: dict) -> dict:
+    matches = [match for catalog in catalogs.values() for match in search_catalog(catalog, request)["Data"]]
+    maximum = request.get("MaximumResults", 0)
+    return {"Data": matches[:maximum] if maximum else matches}
+
+
 class FixtureServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
@@ -315,6 +469,9 @@ class Handler(BaseHTTPRequestHandler):
                 catalog = load_catalog(self.server.manifest_root)
                 if catalog["PackageIdentifier"] != self.server.package_id:
                     raise FixtureError("Source package identity changed")
+                if declared_dependencies(catalog) != self.server.dependency_plan:
+                    raise FixtureError("Production dependencies changed after source hydration")
+                catalogs = {catalog["PackageIdentifier"].casefold(): catalog, **self.server.dependency_catalogs}
             except (FixtureError, OSError):
                 return self.respond(503, {"code": "InvalidFixture", "message": "Manifest snapshot is unavailable"}, route)
             if self.command == "GET" and url.path.startswith("/packageManifests/"):
@@ -323,12 +480,13 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
                 if set(query) - {"Version", "Channel"} or any(len(value) != 1 for value in query.values()):
                     raise FixtureError("Invalid manifest query")
-                versions = [version for version in catalog["Versions"] if all(
+                selected = catalogs.get(package_id.casefold())
+                versions = [version for version in selected["Versions"] if all(
                     version["PackageVersion" if key == "Version" else "Channel"] == value[0]
-                    for key, value in query.items())]
-                if package_id.casefold() != catalog["PackageIdentifier"].casefold() or not versions:
+                    for key, value in query.items())] if selected else []
+                if not versions:
                     return self.respond(404, {"code": "NotFound", "message": "No matching package version"}, route)
-                return self.respond(200, {"Data": {"PackageIdentifier": catalog["PackageIdentifier"], "Versions": versions}}, route)
+                return self.respond(200, {"Data": {"PackageIdentifier": selected["PackageIdentifier"], "Versions": versions}}, route)
             if self.command == "POST" and url.path == "/manifestSearch" and not url.query:
                 route = "search"
                 if self.headers.get("Transfer-Encoding") or self.headers.get_content_type() != "application/json":
@@ -339,7 +497,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.rfile.read(size)
                 if len(data) != size:
                     raise FixtureError("Incomplete body")
-                return self.respond(200, search_catalog(catalog, json.loads(data)), route)
+                return self.respond(200, search_catalogs(catalogs, json.loads(data)), route)
             return self.respond(404, {"code": "NotFound", "message": "Unknown endpoint"}, route)
         except (FixtureError, ValueError, UnicodeError):
             self.respond(400, {"code": "InvalidRequest", "message": "Unsupported fixture request"}, route)
@@ -348,6 +506,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest-root", type=Path, required=True)
+    parser.add_argument("--dependency-root", type=Path)
     parser.add_argument("--bind", choices=["127.0.0.1"], default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--cert-file", type=Path, required=True)
@@ -366,6 +525,7 @@ def main() -> int:
         with args.log_file.open("x", encoding="utf-8") as log:
             try:
                 catalog = load_catalog(args.manifest_root)
+                dependencies, _ = load_dependency_catalogs(args.dependency_root, catalog)
                 tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 tls.minimum_version = ssl.TLSVersion.TLSv1_2
                 tls.load_cert_chain(args.cert_file, args.key_file)
@@ -377,14 +537,18 @@ def main() -> int:
                     server.log, server.log_lock = log, threading.Lock()
                     server.source_id, server.manifest_root = args.source_id, args.manifest_root
                     server.package_id = catalog["PackageIdentifier"]
+                    server.dependency_plan = declared_dependencies(catalog)
+                    server.dependency_catalogs = dependencies
                     ready = {"baseUrl": f"https://localhost:{server.server_port}", "port": server.server_port,
                              "pid": os.getpid(), "sourceIdentifier": args.source_id, "contractVersion": CONTRACT,
-                             "packageIdentifier": server.package_id}
+                             "packageIdentifier": server.package_id,
+                             "dependencyIdentifiers": sorted(value["PackageIdentifier"] for value in dependencies.values())}
                     temporary = args.ready_file.with_name(args.ready_file.name + ".tmp")
                     temporary.write_text(json.dumps(ready), encoding="utf-8")
                     temporary.replace(args.ready_file)
                     ready_written = True
-                    server.event("ready", port=server.server_port, package=server.package_id, versions=len(catalog["Versions"]))
+                    server.event("ready", port=server.server_port, package=server.package_id, versions=len(catalog["Versions"]),
+                                 dependencies=ready["dependencyIdentifiers"])
                     while not stopping.is_set() and not args.stop_file.exists():
                         server.handle_request()
                     server.event("stopped")
@@ -405,4 +569,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "inspect-dependencies":
+        raise SystemExit(inspect_dependencies(sys.argv[2:]))
     raise SystemExit(main())

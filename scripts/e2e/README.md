@@ -69,12 +69,31 @@ including both migration product codes. Metadata uses loopback HTTPS and the
 installer payload uses the local HTTP fixture. WinGet performs its normal
 package selection, hash verification and trusted-source handling. The installer
 fixture versions do not change Cargo versions or publish a release.
-Assertions cover a running portable
-migration, later Inno updates, enabled and disabled autostart, stopped-app updates,
-locked-file failure recovery, fresh silent install and uninstall. They check
+
+The declared Visual C++ runtime dependency is resolved from an official
+`winget export` of the installed version. The harness uses `winget download`
+against the official source for that exact version and serves its exported
+manifest metadata alongside the application. It preserves the original product
+codes and verifies them against the installed version and registration. Normal
+dependency selection and payload hash verification remain active.
+
+Assertions cover a running portable migration, later Inno updates, enabled and
+disabled autostart, stopped-app updates, locked-file failure recovery, fresh
+silent install and uninstall. They check
 the exact executable hash, installed version, process identity and actual tray
 readiness, not merely the installer's exit code. These scenarios also run before
 release publication files are bundled.
+
+Before WinGet acceptance, `inno-array-probe.ps1` compiles and runs an inert Inno 6
+setup. Required controls verify that a global fixed process-handle buffer and
+its count survive native enumeration and image-path calls, retain the expected
+process identity, and release the handle. Separate dynamic-array parameter and
+return-value cases record their actual results, including mismatches; they do
+not determine whether the static controls pass. The bounded probe installs no
+application files and stops no application. Its observations, compiler output
+and setup log are retained with the package-manager diagnostics. This gate runs
+in both CI and release preparation; the log for the tested commit establishes
+the actual runtime result.
 
 `installer-updater.ps1` tests the production built-in updater against a locally
 built installer. Only GitHub transport is replaced in a separate PowerShell 5.1

@@ -1361,6 +1361,7 @@ try {
             TrustedSourceEvidence = $trustedSourceEvidence.ToArray();
             SourceFixture = $(if ($null -ne $trustedSource) { @{ Name = $trustedSource.Name; Identifier = $trustedSource.Identifier;
                 Url = $trustedSource.Url; Registration = $trustedSource.Registration;
+                Dependencies = $trustedSource.DependencyEvidence;
                 CertificateStore = 'LocalMachine/Root';
                 CertificateThumbprint = $(if ($trustedSource.Certificate) { $trustedSource.Certificate.Thumbprint }) } });
             Failure = $(if ($failure) { $failure.ToString() } else { $null }); CleanupErrors = $cleanupErrors.ToArray();

@@ -148,6 +148,136 @@ function Add-TestSourceVersion($State, [string]$Manifest, [string]$Version) {
     } finally { if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force } }
     $State.Versions[$Version] = $Manifest
 }
+function Invoke-TestSourcePython($State, [string]$ServerScript, [string]$Python, [string[]]$Arguments, [string]$Label) {
+    # Match the server's optional private PyYAML directory without changing the
+    # parent process environment or the machine Python installation.
+    $bootstrap = 'import runpy,sys; extra=sys.argv.pop(1); sys.path.insert(0,extra) if extra else None; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name="__main__")'
+    $result = Invoke-Logged $Python (@('-c', $bootstrap, [string]$State.PythonDependencyDirectory, $ServerScript) + $Arguments) $Label 30
+    if ($result.ExitCode -ne 0) { throw "Dependency metadata inspection failed: $($result.Text)" }
+}
+function Get-TestDependencyRegistration($Dependency) {
+    $matches = [Collections.Generic.List[object]]::new()
+    foreach ($code in @($Dependency.ProductCodes)) {
+        if ($code -notmatch '^[A-Za-z0-9_.{}+\-]{1,200}$') { throw 'An exported dependency product code is not a single registry key name.' }
+        foreach ($hive in @([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryHive]::CurrentUser)) {
+            foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
+                try {
+                    $key = $base.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\Uninstall\$code")
+                    if ($null -eq $key) { continue }
+                    try {
+                        $installedVersion = [string]$key.GetValue('DisplayVersion')
+                        if ($installedVersion -ceq $Dependency.PackageVersion) {
+                            $matches.Add(@{ Hive = $hive.ToString(); View = $view.ToString(); ProductCode = $code;
+                                DisplayVersion = $installedVersion; DisplayName = [string]$key.GetValue('DisplayName') })
+                        }
+                    } finally { $key.Dispose() }
+                } finally { $base.Dispose() }
+            }
+        }
+    }
+    if ($matches.Count -eq 0) {
+        throw "Dependency prerequisite is not correlated: $($Dependency.PackageIdentifier) $($Dependency.PackageVersion) has no exact exported product-code/version match in the runner's ARP entries."
+    }
+    return ,$matches.ToArray()
+}
+function Initialize-TestSourceDependencies($State, [string]$ServerScript, [string]$Python) {
+    $planPath = Join-Path $State.Directory 'dependency-plan.json'
+    Invoke-TestSourcePython $State $ServerScript $Python @('inspect-dependencies', '--manifest-root', $State.ManifestRoot,
+        '--output', $planPath) 'source-dependency-plan'
+    $plan = [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -AsHashtable
+    if ($plan.PackageIdentifier -cne $packageId -or @($plan.Dependencies).Count -gt 8) { throw 'Invalid production dependency plan.' }
+    $State.DependencyPlan = @($plan.Dependencies)
+    $null = New-Item -ItemType Directory -Path $State.DependencyRoot
+    if ($State.DependencyPlan.Count -eq 0) { return }
+
+    # Use the actual installed version, not today's latest release, so a newer
+    # catalog entry does not turn hosted-runner image lag into a fixture failure.
+    # The full inventory is private and deleted; retain only declared packages.
+    $exportPath = Join-Path $State.Directory 'installed-packages.json'
+    try {
+        $result = Invoke-Logged $winget @('export', '--output', $exportPath, '--include-versions', '--source', 'winget',
+            '--accept-source-agreements', '--disable-interactivity') 'source-dependency-installed-versions'
+        if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $exportPath)) { throw 'Could not export installed dependency versions from the official WinGet source.' }
+        if ((Get-Item -LiteralPath $exportPath).Length -gt 4MB) { throw 'Installed package export exceeded the fixture limit.' }
+        $inventory = [IO.File]::ReadAllText($exportPath) | ConvertFrom-Json -AsHashtable
+        $sources = @($inventory.Sources | Where-Object {
+            $_.SourceDetails.Name -ceq 'winget' -and $_.SourceDetails.Identifier -ceq 'Microsoft.Winget.Source_8wekyb3d8bbwe'
+        })
+        if ($sources.Count -ne 1) { throw 'Installed dependency export did not identify the official WinGet source.' }
+        $installedDependencies = @{}
+        foreach ($dependency in $State.DependencyPlan) {
+            $id = [string]$dependency.PackageIdentifier
+            if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9_.+\-]{1,127}$') { throw 'Invalid production dependency identifier.' }
+            $versions = @($sources[0].Packages | Where-Object { $_.PackageIdentifier -ceq $id } |
+                ForEach-Object { [string]$_.Version } | Sort-Object -Unique)
+            if ($versions.Count -ne 1 -or [string]$versions[0] -notmatch '^\d+(?:\.\d+){1,3}$') {
+                throw "The runner must have one catalog-correlated installed version of declared dependency $id."
+            }
+            $installedDependencies[$id] = [string]$versions[0]
+        }
+    } finally {
+        if (Test-Path -LiteralPath $exportPath) { Remove-Item -LiteralPath $exportPath -Force }
+    }
+
+    $index = 0
+    foreach ($dependency in $State.DependencyPlan) {
+        $index++
+        $id = [string]$dependency.PackageIdentifier
+        $startedUtc = [DateTime]::UtcNow
+        try {
+            # Download exports the selected original merged manifest only after
+            # the official payload has passed WinGet's SHA256 verification.
+            $result = Invoke-Logged $winget @('download', '--source', 'winget', '--id', $id, '--exact',
+                '--version', $installedDependencies[$id], '--architecture', 'x64', '--download-directory', $State.DependencyRoot,
+                '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity', '--verbose-logs') "source-dependency-download-$index"
+        } finally {
+            $traceDirectory = Join-Path $logDirectory "source-dependency-download-$index-winget"
+            $null = New-Item -ItemType Directory -Path $traceDirectory
+            foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File | Where-Object LastWriteTimeUtc -ge $startedUtc)) {
+                Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $traceDirectory $file.Name)
+            }
+        }
+        if ($result.ExitCode -ne 0) { throw "Official dependency download failed for $id`: $($result.Text)" }
+    }
+    $evidencePath = Join-Path $State.Directory 'dependency-verified.json'
+    Invoke-TestSourcePython $State $ServerScript $Python @('inspect-dependencies', '--manifest-root', $State.ManifestRoot,
+        '--dependency-root', $State.DependencyRoot, '--output', $evidencePath) 'source-dependency-verify'
+    $verified = [IO.File]::ReadAllText($evidencePath) | ConvertFrom-Json -AsHashtable
+    if ($verified.PackageIdentifier -cne $packageId -or @($verified.Exports).Count -gt 8) { throw 'Invalid verified dependency evidence.' }
+    $retained = [Collections.Generic.List[object]]::new()
+    $artifactDirectory = Join-Path $logDirectory 'dependency-manifests'
+    $null = New-Item -ItemType Directory -Path $artifactDirectory
+    foreach ($dependency in @($verified.Exports)) {
+        $id = [string]$dependency.PackageIdentifier
+        if ($installedDependencies.ContainsKey($id) -and $dependency.PackageVersion -cne $installedDependencies[$id]) {
+            throw 'The official dependency export does not match the requested installed version.'
+        }
+        $registration = Get-TestDependencyRegistration $dependency
+        $traces = @(Get-ChildItem -LiteralPath $logDirectory -Directory -Filter 'source-dependency-download-*-winget' |
+            ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter '*.log' -File } | ForEach-Object {
+                $text = Read-SharedTextFile $_.FullName
+                $selected = $text.IndexOf('Selected installer URL: ' + $dependency.InstallerUrl, [StringComparison]::Ordinal)
+                $exported = @([regex]::Matches($text, 'Successfully generated manifest yaml\. Path: ([^\r\n]+)') |
+                    Where-Object { $_.Groups[1].Value.Trim().Trim('"').Replace('\\', '\') -ceq $dependency.Manifest })
+                if ($text.Contains('Named source requested, found: winget') -and $selected -ge 0 -and
+                    $text.IndexOf('Installer hash verified', $selected, [StringComparison]::Ordinal) -gt $selected -and
+                    $text -match [regex]::Escape($dependency.InstallerSha256.ToLowerInvariant()) -and
+                    $exported.Count -eq 1) { $_.FullName }
+            })
+        if ($traces.Count -ne 1) { throw "No unique official source/hash/export trace proves dependency $id." }
+        $savedManifest = Join-Path $artifactDirectory ($id + '.yaml')
+        Copy-Item -LiteralPath $dependency.Manifest -Destination $savedManifest
+        $retained.Add(@{ PackageIdentifier = $id; PackageVersion = $dependency.PackageVersion; Source = 'winget';
+            InstallerUrl = $dependency.InstallerUrl; InstallerSha256 = $dependency.InstallerSha256;
+            DownloadedSha256 = $dependency.DownloadedSha256; DownloadedBytes = $dependency.DownloadedBytes;
+            Architecture = $dependency.Architecture; Scope = $dependency.Scope; ProductCodes = $dependency.ProductCodes;
+            InstalledRegistration = $registration; Manifest = $savedManifest; Trace = $traces[0] })
+    }
+    $State.DependencyEvidence = $retained.ToArray()
+    @{ Dependencies = $State.DependencyPlan; OfficialExports = $State.DependencyEvidence } |
+        ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $logDirectory 'dependency-evidence.json') -Encoding utf8
+}
 function New-TestSourceState([string]$RootDirectory, [string]$Application) {
     Assert-TestSourceEnvironment
     $identifier = [guid]::NewGuid().ToString('N')
@@ -175,6 +305,7 @@ function New-TestSourceState([string]$RootDirectory, [string]$Application) {
     } finally { $identity.Dispose() }
     return @{ Identifier = "qqrm-e2e-$identifier"; Name = "qqrm-e2e-$Application-$identifier";
         Directory = $directory; ManifestRoot = $manifestRoot; Versions = @{}; Certificate = $null; CertificateAdded = $false; CertificateAddAttempted = $false;
+        DependencyRoot = (Join-Path $directory 'dependencies'); DependencyPlan = @(); DependencyEvidence = @(); PythonDependencyDirectory = $null;
         Process = $null; ProcessStartTime = $null; SourceAddAttempted = $false; Url = $null; Registration = $null;
         ReadyPath = (Join-Path $directory 'ready.json'); StopPath = (Join-Path $directory 'stop');
         StdoutPath = (Join-Path $logDirectory 'trusted-source.stdout.log'); StderrPath = (Join-Path $logDirectory 'trusted-source.stderr.log');
@@ -186,8 +317,6 @@ function Start-TestSource($State, [string]$ServerScript, [string]$Python) {
     if ($null -ne (Read-TestSourceRegistration $State.Name 'source-name-before' -AllowAbsent)) {
         throw 'Refusing to replace a pre-existing WinGet source.'
     }
-    $State.Certificate = New-TestSourceCertificate $State.Directory $State.Identifier
-    Invoke-TestSourceCertificateOperation $State 'Add'
     $moduleProbe = Invoke-Logged $Python @('-c', 'import yaml; print(yaml.__version__)') 'source-python-yaml' 15
     $dependencyDirectory = $null
     if ($moduleProbe.ExitCode -ne 0 -or $moduleProbe.Text.Trim() -cne '6.0.3') {
@@ -196,11 +325,16 @@ function Start-TestSource($State, [string]$ServerScript, [string]$Python) {
             $dependencyDirectory, 'PyYAML==6.0.3') 'source-python-dependency' 90
         if ($result.ExitCode -ne 0) { throw "Could not install the pinned fixture parser: $($result.Text)" }
     }
+    $State.PythonDependencyDirectory = $dependencyDirectory
+    Initialize-TestSourceDependencies $State $ServerScript $Python
+    $State.Certificate = New-TestSourceCertificate $State.Directory $State.Identifier
+    Invoke-TestSourceCertificateOperation $State 'Add'
     $info = [Diagnostics.ProcessStartInfo]::new($Python)
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     if ($dependencyDirectory) { $info.Environment['PYTHONPATH'] = $dependencyDirectory }
-    foreach ($argument in @('-u', $ServerScript, '--manifest-root', $State.ManifestRoot, '--bind', '127.0.0.1', '--port', '0',
+    foreach ($argument in @('-u', $ServerScript, '--manifest-root', $State.ManifestRoot, '--dependency-root', $State.DependencyRoot,
+        '--bind', '127.0.0.1', '--port', '0',
         '--cert-file', $State.Certificate.CertificatePath, '--key-file', $State.Certificate.KeyPath, '--source-id', $State.Identifier,
         '--ready-file', $State.ReadyPath, '--log-file', (Join-Path $logDirectory 'trusted-source.log'), '--stop-file', $State.StopPath)) {
         $info.ArgumentList.Add($argument)
@@ -223,6 +357,10 @@ function Start-TestSource($State, [string]$ServerScript, [string]$Python) {
     if ($ready.pid -ne $State.Process.Id -or $ready.sourceIdentifier -cne $State.Identifier -or
         $ready.packageIdentifier -cne $packageId -or $url.Scheme -ne 'https' -or $url.Host -cne 'localhost' -or
         $url.Port -lt 1 -or $url.AbsolutePath -ne '/' -or $url.Query -or $url.UserInfo) { throw 'REST fixture readiness identity did not match the owned process.' }
+    $expectedDependencies = @($State.DependencyEvidence | ForEach-Object { $_.PackageIdentifier } | Sort-Object)
+    if (($expectedDependencies -join "`n") -cne (@($ready.dependencyIdentifiers | Sort-Object) -join "`n")) {
+        throw 'REST fixture readiness dependencies differ from the verified official exports.'
+    }
     $State.Url = $url.AbsoluteUri.TrimEnd('/')
     # This probe uses normal TLS chain/hostname validation and the temporary CA.
     $information = Invoke-RestMethod -Uri ($State.Url + '/information') -NoProxy -TimeoutSec 5

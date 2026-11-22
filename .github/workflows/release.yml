@@ -199,6 +199,9 @@ jobs:
           cargo +nightly package --workspace --locked
           if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
           ./scripts/build-installer.ps1
+      - name: Verify native Inno process snapshot controls
+        shell: pwsh
+        run: ./scripts/e2e/inno-array-probe.ps1 -ReportDirectory "$env:RUNNER_TEMP/winget-upgrade-rust-switcher/inno-array-probe"
       - name: Verify the trusted WinGet source fixture
         shell: pwsh
         run: |

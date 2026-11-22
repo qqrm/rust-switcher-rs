@@ -1,7 +1,8 @@
-"""Focused protocol and verified-TLS tests for the one-package WinGet source."""
+"""Focused protocol, dependency provenance, and verified-TLS fixture tests."""
 from __future__ import annotations
 
 import http.client
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -23,6 +24,8 @@ SPEC.loader.exec_module(SOURCE)
 PACKAGE = "QQRM.SourceFixture"
 LEGACY = PACKAGE + "_Microsoft.Winget.Source_8wekyb3d8bbwe"
 CURRENT = PACKAGE + "_is1"
+DEPENDENCY = "Microsoft.VCRedist.2015+.x64"
+DEPENDENCY_CODE = "{be2c4202-8de2-4274-95c7-ef71b2bfdcad}"
 
 
 def write_manifests(root: Path, version: str = "999.0.1", *, package: str = PACKAGE, channel: str = "") -> Path:
@@ -53,6 +56,28 @@ def write_manifests(root: Path, version: str = "999.0.1", *, package: str = PACK
 
 def filter_request(field: str, value: str, *, kind: str = "Exact", collection: str = "Filters") -> dict:
     return {collection: [{"PackageMatchField": field, "RequestMatch": {"KeyWord": value, "MatchType": kind}}]}
+
+
+def write_dependency_export(root: Path, *, package: str = DEPENDENCY) -> tuple[Path, dict]:
+    """The merged shape emitted by pinned WinGet's Manifest/YamlWriter.cpp."""
+    directory = root / package
+    directory.mkdir(parents=True)
+    payload = b"Public dependency fixture payload; never executed."
+    manifest = {"PackageIdentifier": package, "PackageVersion": "14.52.37029.0", "PackageLocale": "en-US",
+        "Publisher": "Microsoft Corporation", "PackageName": "Microsoft Visual C++ Runtime",
+        "ShortDescription": "Runtime dependency fixture", "License": "Proprietary",
+        "Localization": [{"PackageLocale": "de-DE", "ShortDescription": "Runtime"}],
+        "Installers": [{"Architecture": "x64", "InstallerType": "burn", "Scope": "machine",
+            "InstallerUrl": "https://download.visualstudio.microsoft.com/VC_redist.x64.exe",
+            "InstallerSha256": hashlib.sha256(payload).hexdigest().upper(),
+            "ProductCode": DEPENDENCY_CODE, "AppsAndFeaturesEntries": [{"UpgradeCode": "{C146EF48-4D31-3C3D-A2C5-1E91AF8A0A9B}"}],
+            "UpgradeBehavior": "install", "InstallerSuccessCodes": [3010], "InstallerAbortsTerminal": False,
+            "InstallerSwitches": {"Silent": "/quiet /norestart", "SilentWithProgress": "/passive /norestart"}}],
+        "ManifestVersion": "1.28.0", "ManifestType": "merged"}
+    path = directory / "Runtime_14.52.37029.0_x64.yaml"
+    path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+    path.with_suffix(".exe").write_bytes(payload)
+    return path, manifest
 
 
 class CatalogTests(unittest.TestCase):
@@ -167,6 +192,76 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn(str(missing_key), diagnostics)
         self.assertNotIn(str(missing_certificate), diagnostics)
 
+    def test_exported_dependency_fields_and_download_digest_are_preserved(self):
+        dependency_root = Path(self.temporary.name) / "dependencies"
+        path, original = write_dependency_export(dependency_root)
+        primary = SOURCE.load_catalog(self.root)
+        catalogs, evidence = SOURCE.load_dependency_catalogs(dependency_root, primary, verify_downloads=True)
+        version = catalogs[DEPENDENCY.casefold()]["Versions"][0]
+        self.assertEqual(version["Installers"], original["Installers"])
+        self.assertEqual(version["Locales"], original["Localization"])
+        self.assertEqual(version["DefaultLocale"], {key: value for key, value in original.items()
+            if key not in SOURCE.DOCUMENT_KEYS | {"Installers", "Localization"}})
+        self.assertEqual(evidence[0]["ProductCodes"], [DEPENDENCY_CODE])
+        self.assertEqual(evidence[0]["DownloadedSha256"], original["Installers"][0]["InstallerSha256"].lower())
+        self.assertEqual(evidence[0]["DownloadedBytes"], path.with_suffix(".exe").stat().st_size)
+        self.assertEqual(SOURCE.declared_dependencies(primary), [{"PackageIdentifier": DEPENDENCY, "MinimumVersions": []}])
+
+    def test_dependency_export_cannot_be_missing_undeclared_or_wrong_kind(self):
+        primary = SOURCE.load_catalog(self.root)
+        dependency_root = Path(self.temporary.name) / "dependencies"
+        with self.assertRaises(SOURCE.FixtureError):
+            SOURCE.load_dependency_catalogs(dependency_root, primary)
+        path, original = write_dependency_export(dependency_root)
+        original["ManifestType"] = "singleton"
+        path.write_text(yaml.safe_dump(original))
+        with self.assertRaises(SOURCE.FixtureError):
+            SOURCE.load_dependency_catalogs(dependency_root, primary)
+        original["ManifestType"] = "merged"
+        path.write_text(yaml.safe_dump(original))
+        write_dependency_export(dependency_root, package="Unrelated.Runtime")
+        with self.assertRaises(SOURCE.FixtureError):
+            SOURCE.load_dependency_catalogs(dependency_root, primary)
+
+    def test_dependency_digest_failure_and_payload_size_limit_fail_closed(self):
+        dependency_root = Path(self.temporary.name) / "dependencies"
+        path, _ = write_dependency_export(dependency_root)
+        primary = SOURCE.load_catalog(self.root)
+        path.with_suffix(".exe").write_bytes(b"tampered")
+        with self.assertRaisesRegex(SOURCE.FixtureError, "hash does not match"):
+            SOURCE.load_dependency_catalogs(dependency_root, primary, verify_downloads=True)
+        with path.with_suffix(".exe").open("wb") as stream:
+            stream.truncate(128 * 1024 * 1024 + 1)
+        with self.assertRaisesRegex(SOURCE.FixtureError, "size limit"):
+            SOURCE.load_dependency_catalogs(dependency_root, primary, verify_downloads=True)
+
+    def test_dependency_search_correlates_exact_official_product_code(self):
+        dependency_root = Path(self.temporary.name) / "dependencies"
+        write_dependency_export(dependency_root)
+        primary = SOURCE.load_catalog(self.root)
+        dependencies, _ = SOURCE.load_dependency_catalogs(dependency_root, primary)
+        catalogs = {PACKAGE.casefold(): primary, **dependencies}
+        for field, value in (("ProductCode", DEPENDENCY_CODE), ("PackageIdentifier", DEPENDENCY)):
+            result = SOURCE.search_catalogs(catalogs, filter_request(field, value))
+            self.assertEqual([item["PackageIdentifier"] for item in result["Data"]], [DEPENDENCY])
+        self.assertEqual(SOURCE.search_catalogs(catalogs, filter_request("ProductCode", LEGACY))["Data"][0]["PackageIdentifier"], PACKAGE)
+        self.assertEqual(len(SOURCE.search_catalogs(catalogs, {"FetchAllManifests": True, "MaximumResults": 1})["Data"]), 1)
+
+    def test_dependency_inspection_cli_preserves_minimum_version_and_verifies_exports(self):
+        installer = self.directory / "installer.yaml"
+        doc = yaml.safe_load(installer.read_text())
+        doc["Dependencies"]["PackageDependencies"][0]["MinimumVersion"] = "14.40.0.0"
+        installer.write_text(yaml.safe_dump(doc))
+        dependency_root = Path(self.temporary.name) / "dependencies"
+        write_dependency_export(dependency_root)
+        output = Path(self.temporary.name) / "dependency-evidence.json"
+        result = subprocess.run([sys.executable, str(SCRIPT), "inspect-dependencies", "--manifest-root", str(self.root),
+            "--dependency-root", str(dependency_root), "--output", str(output)], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        evidence = json.loads(output.read_text())
+        self.assertEqual(evidence["Dependencies"][0]["MinimumVersions"], ["14.40.0.0"])
+        self.assertEqual(evidence["Exports"][0]["PackageIdentifier"], DEPENDENCY)
+
 
 @unittest.skipUnless(shutil.which("openssl"), "openssl is required to create temporary verified TLS certificates")
 class HttpsTests(unittest.TestCase):
@@ -176,6 +271,8 @@ class HttpsTests(unittest.TestCase):
         self.work = Path(self.temporary.name)
         self.root = self.work / "manifests"
         write_manifests(self.root)
+        self.dependency_root = self.work / "dependencies"
+        write_dependency_export(self.dependency_root)
         self.cert, self.key = self.work / "localhost.pem", self.work / "localhost-key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                         "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
@@ -183,6 +280,7 @@ class HttpsTests(unittest.TestCase):
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
         self.ready, self.stop, self.log = self.work / "ready.json", self.work / "stop", self.work / "source.log"
         self.process = subprocess.Popen([sys.executable, str(SCRIPT), "--manifest-root", str(self.root),
+            "--dependency-root", str(self.dependency_root),
             "--port", "0", "--cert-file", str(self.cert), "--key-file", str(self.key),
             "--source-id", "QQRM-CI-test", "--ready-file", str(self.ready), "--stop-file", str(self.stop),
             "--log-file", str(self.log)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -247,6 +345,12 @@ class HttpsTests(unittest.TestCase):
         self.assertEqual(body["Data"][0]["Versions"][0]["ProductCodes"], sorted([CURRENT, LEGACY]))
         self.assertEqual(self.request("POST", "/manifestSearch", filter_request("ProductCode", "unrelated")), (200, {"Data": []}))
         self.assertEqual(self.request("POST", "/manifestSearch", {"FetchAllManifests": True})[0], 200)
+        status, body = self.request("POST", "/manifestSearch", filter_request("ProductCode", DEPENDENCY_CODE))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["Data"][0]["PackageIdentifier"], DEPENDENCY)
+        status, body = self.request("GET", "/packageManifests/Microsoft.VCRedist.2015%2B.x64?Version=14.52.37029.0")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["Data"]["Versions"][0]["Installers"][0]["ProductCode"], DEPENDENCY_CODE)
         self.assertEqual(self.request("POST", "/manifestSearch", {"Filters": "wrong"})[0], 400)
         self.assertEqual(self.request("GET", "/unknown")[0], 404)
         incomplete = self.root / "incomplete"
