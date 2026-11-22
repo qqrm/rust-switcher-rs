@@ -37,7 +37,7 @@ Results are printed in the job log without adding stored workflow artifacts.
 | Unicode boundary | A 510-character selection containing emoji must remain complete, followed by a short conversion | Does not prove every UI Automation provider's truncation behavior |
 | Startup and single instance | Release launch and duplicate-instance rejection | Focus activation by a second launch and a published release download are not exercised |
 | Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
-| Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
+| Autostart | Release UI enables the exact Run command for a path containing spaces; Windows executes that stored command, the app remains responsive and hidden, and disabling survives a normal restart | Actual logon/reboot is not exercised on the disposable job VM |
 | Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |
 | Pause and CapsLock layout switching | Browser password cases verify runtime pause state changes and two layout switches while text conversion remains blocked | Tray menu actions are not exercised |
 | Focus and selection changes | Release conversion cancels after the external fixture changes focus or selection, then recovers | Does not make programmatic OS focus changes atomic with input delivery |
@@ -48,6 +48,38 @@ Results are printed in the job log without adding stored workflow artifacts.
 The manifest describes assertions implemented by the harness, not a permanent
 claim of success: use the `windows-full` log for the exact tested commit. All
 rows without a hosted assertion remain coverage gaps even when CI is green.
+
+### Autostart and package-manager updates
+
+`autostart-live.ps1` executes the exact registry command through `CreateProcessW`
+without reparsing it into a known executable and arguments. This catches quoting
+and startup-argument defects. It uses a copied release executable and isolated
+APPDATA directory, restores the original Run value and legacy startup shortcut,
+and never needs a real logoff or reboot.
+
+The required `updater-live` CI job also runs `winget-upgrade.ps1`. It installs
+the published 1.0.29 package from the official WinGet source into an owned path,
+then upgrades through the actual WinGet client using production-generated Inno
+manifests with local fixture URLs. The installer fixture versions do not change
+Cargo versions or publish a release. Assertions cover a running portable
+migration, later Inno updates, enabled and disabled autostart, stopped-app updates,
+locked-file failure recovery, fresh silent install and uninstall. They check
+the exact executable hash, installed version, process identity and actual tray
+readiness, not merely the installer's exit code. These scenarios also run before
+release publication files are bundled.
+
+`installer-updater.ps1` tests the production built-in updater against a locally
+built installer. Only GitHub transport is replaced in a separate PowerShell 5.1
+fixture process; normal URL and digest verification remain active. A bad digest
+must leave the original process and installation untouched. A verified update
+must use the installer, preserve preferences and update the installed version.
+The existing standalone updater tests continue to exercise the raw EXE path.
+
+The package-manager scenarios exercise catalog installation and the installed
+registration, but candidate upgrades use local manifests. Publication to the
+community catalog and subsequent catalog indexing are separate operations.
+The runner remains Windows Server 2025; these checks do not claim a Windows 11
+client reboot or a physical keyboard test.
 
 ### Windows native-input regression workflow
 

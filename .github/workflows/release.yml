@@ -198,6 +198,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
           cargo +nightly package --workspace --locked
           if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+          ./scripts/build-installer.ps1
+      - name: Verify real autostart and package-manager updates before publication
+        shell: pwsh
+        timeout-minutes: 18
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: |
+          ./scripts/e2e/autostart-live.ps1 -ReleaseExe ./target/release/rust-switcher.exe
+          ./scripts/build-installer.ps1 -Version 999.0.1 -OutputDirectory ./target/installer-fixture
+          ./scripts/e2e/winget-upgrade.ps1 -Application rust-switcher -InstallerPath ./target/installer-fixture/rust-switcher-setup.exe -ExecutablePath ./target/release/rust-switcher.exe -ManifestDirectory ./target/installer-fixture/winget -PackageVersion 999.0.1
       - name: Bind publication files to the checked source
         id: bundle
         shell: pwsh

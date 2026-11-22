@@ -40,16 +40,30 @@ cargo install rust-switcher
 
 ### From GitHub Releases
 
-Download `rust-switcher.exe` from Releases.
+Download `rust-switcher-setup.exe` from Releases for a per-user installation,
+or `rust-switcher.exe` for a standalone executable.
+
+### Via WinGet or UniGetUI
+
+```powershell
+winget install --id QQRM.RustSwitcher --exact --source winget --scope user
+```
+
+The installer updates a running instance automatically and restarts it only if
+it was running before the update. It preserves the existing autostart setting
+and configuration. Existing per-user WinGet portable installations are migrated
+in their current directory, keeping their command alias. A fresh silent install
+does not launch the app or enable autostart. UniGetUI uses the same WinGet package.
 
 ### Updating
 
 Right-click the tray icon and select **Check for updates**. When a newer stable
-GitHub Release is available, Rust Switcher downloads `rust-switcher.exe`,
-verifies its size and GitHub-published SHA-256 digest, then gracefully exits.
-A detached PowerShell helper replaces the executable and restarts the app.
-The previous executable is kept for rollback until the replacement launches.
-This also works for installations made through Cargo, without running Cargo.
+GitHub Release is available, Rust Switcher verifies the download's size and
+GitHub-published SHA-256 digest. An installer-managed installation uses
+`rust-switcher-setup.exe`, which also updates the installed version reported to
+WinGet. A standalone or Cargo installation uses `rust-switcher.exe`; a detached
+PowerShell helper replaces it and restarts the app, retaining the previous
+executable for rollback until the replacement launches.
 
 Updates require Windows PowerShell 5.1, HTTPS access to GitHub, and write access
 to the installation directory. The update log is saved to

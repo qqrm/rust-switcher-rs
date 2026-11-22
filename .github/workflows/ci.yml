@@ -102,7 +102,9 @@ jobs:
       - name: Validate PowerShell helpers and browser transport
         shell: pwsh
         run: |
-          foreach ($path in @('scripts/windows-updater.ps1', 'scripts/e2e/run-browser.ps1',
+          foreach ($path in @('scripts/windows-updater.ps1', 'scripts/build-installer.ps1',
+              'scripts/e2e/autostart-live.ps1', 'scripts/e2e/winget-upgrade.ps1',
+              'scripts/e2e/installer-updater.ps1', 'scripts/e2e/run-browser.ps1',
               'scripts/e2e/browser-security-cases.ps1', 'scripts/e2e/run-security-mutation.ps1',
               'scripts/e2e/test-browser-cdp.ps1', 'scripts/e2e/test-browser-outcomes.ps1')) {
             $tokens = $null
@@ -178,6 +180,14 @@ jobs:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: ./scripts/e2e/run-hosted.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
 
+      - name: Execute the stored Windows autostart command
+        if: ${{ !cancelled() && steps.desktop_build.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: pwsh
+        env:
+          RUST_SWITCHER_HOSTED_E2E: '1'
+        run: ./scripts/e2e/autostart-live.ps1 -ReleaseExe ./target/release/rust-switcher.exe
+
       - name: Verify Double Alt in real browser fields
         if: ${{ !cancelled() && steps.desktop_build.outcome == 'success' }}
         timeout-minutes: 8
@@ -201,6 +211,7 @@ jobs:
         run: |
           cargo +nightly package --workspace --locked
           if ($LASTEXITCODE -ne 0) { throw 'Verified workspace packaging failed' }
+          ./scripts/build-installer.ps1
           $version = python -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])"
           if ($LASTEXITCODE -ne 0) { throw 'Could not read package version' }
           python .github/scripts/release_stages.py bundle --source "$env:SOURCE_SHA" --commit "$env:SOURCE_SHA" --version "$version" --directory "$env:RUNNER_TEMP/ci-publication"
@@ -221,7 +232,7 @@ jobs:
   updater-live:
     name: updater-live
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -238,6 +249,15 @@ jobs:
       - name: Live upgrade from running binary and no-op behavior
         shell: pwsh
         run: ./scripts/e2e/updater-live.ps1 -Application rust-switcher
+      - name: Build a newer installer fixture from the actual release executable
+        shell: pwsh
+        run: ./scripts/build-installer.ps1 -Version 999.0.1 -OutputDirectory ./target/installer-fixture
+      - name: Exercise real WinGet migration, upgrades, failure recovery and uninstall
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/e2e/winget-upgrade.ps1 -Application rust-switcher -InstallerPath ./target/installer-fixture/rust-switcher-setup.exe -ExecutablePath ./target/release/rust-switcher.exe -ManifestDirectory ./target/installer-fixture/winget -PackageVersion 999.0.1
 
   dependency-security:
     name: dependency-security

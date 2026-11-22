@@ -43,9 +43,11 @@ def semver(value: str) -> tuple[int, int, int]:
     return tuple(map(int, match.groups()))
 
 
-def download_asset(url: str, destination: Path, expected_size: int) -> str:
+def download_asset(url: str, destination: Path, expected_size: int, asset_name: str = "rust-switcher.exe") -> str:
     parsed = urllib.parse.urlparse(url)
-    expected_path = f"/{OWNER}/{REPO}/releases/download/{os.environ['RELEASE_TAG']}/rust-switcher.exe"
+    if asset_name not in {"rust-switcher.exe", "rust-switcher-setup.exe"}:
+        raise ValueError("Unexpected release asset name")
+    expected_path = f"/{OWNER}/{REPO}/releases/download/{os.environ['RELEASE_TAG']}/{asset_name}"
     if parsed.scheme != "https" or parsed.hostname != "github.com" or parsed.path != expected_path:
         raise ValueError("Unexpected executable asset URL")
     request = urllib.request.Request(url, headers={"User-Agent": "QQRM-RustSwitcher-WinGet"})
@@ -66,7 +68,7 @@ def download_asset(url: str, destination: Path, expected_size: int) -> str:
     return digest.hexdigest().upper()
 
 
-def verify_pe_x64(path: Path) -> None:
+def verify_pe(path: Path, machines: set[int]) -> None:
     with path.open("rb") as stream:
         header = stream.read(64)
         if len(header) < 64 or header[:2] != b"MZ":
@@ -76,8 +78,19 @@ def verify_pe_x64(path: Path) -> None:
             raise ValueError("Invalid PE header offset")
         stream.seek(pe_offset)
         pe = stream.read(6)
-        if len(pe) != 6 or pe[:4] != b"PE\0\0" or int.from_bytes(pe[4:6], "little") != 0x8664:
-            raise ValueError("Release asset is not an x64 Windows PE executable")
+        if len(pe) != 6 or pe[:4] != b"PE\0\0" or int.from_bytes(pe[4:6], "little") not in machines:
+            raise ValueError("Release asset is not a supported Windows PE executable")
+
+
+def verify_pe_x64(path: Path) -> None:
+    verify_pe(path, {0x8664})
+
+
+def installer_type_for_release(release: dict) -> str:
+    # Historical releases remain valid for backfill/validation. New release
+    # bundles require a setup asset, so publication cannot silently omit it.
+    return "inno" if any(asset.get("name") == "rust-switcher-setup.exe"
+                         for asset in release.get("assets", [])) else "portable"
 
 
 def release_for_event() -> tuple[dict, str, str]:
@@ -102,10 +115,11 @@ def release_for_event() -> tuple[dict, str, str]:
 
 
 def verify_executable(release: dict, tag: str) -> str:
-    asset_name = "rust-switcher.exe"
+    installer_type = installer_type_for_release(release)
+    asset_name = "rust-switcher-setup.exe" if installer_type == "inno" else "rust-switcher.exe"
     matches = [asset for asset in release.get("assets", []) if asset.get("name") == asset_name]
     if len(matches) != 1:
-        raise ValueError("Release must contain exactly one rust-switcher.exe")
+        raise ValueError(f"Release must contain exactly one {asset_name}")
     asset = matches[0]
     if asset.get("state") != "uploaded" or asset.get("content_type") != "application/x-msdownload":
         raise ValueError("Windows executable is not a completed EXE release asset")
@@ -113,9 +127,10 @@ def verify_executable(release: dict, tag: str) -> str:
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", advertised):
         raise ValueError("GitHub did not publish a SHA-256 digest for the executable")
     os.environ["RELEASE_TAG"] = tag
-    path = Path("rust-switcher.exe")
-    actual = download_asset(asset["browser_download_url"], path, int(asset["size"]))
-    verify_pe_x64(path)
+    path = Path(asset_name)
+    actual = download_asset(asset["browser_download_url"], path, int(asset["size"]), asset_name)
+    # Inno 6 has a 32-bit setup bootstrap even for an exclusively x64 payload.
+    verify_pe(path, {0x14C, 0x8664} if installer_type == "inno" else {0x8664})
     if actual.lower() != advertised.removeprefix("sha256:").lower():
         raise ValueError("Downloaded executable SHA-256 differs from GitHub release metadata")
     return actual
@@ -140,12 +155,30 @@ def run_gh(*args: str) -> str:
     return result.stdout.strip()
 
 
-def manifests(version: str, published_at: str, sha256: str) -> dict[str, str]:
+def manifests(version: str, published_at: str, sha256: str, installer_type: str = "portable") -> dict[str, str]:
     semver("v" + version)
     if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
         raise ValueError("Installer SHA-256 must contain exactly 64 hexadecimal characters")
     sha256 = sha256.upper()
     date = dt.datetime.fromisoformat(published_at.replace("Z", "+00:00")).date().isoformat()
+    if installer_type not in {"portable", "inno"}:
+        raise ValueError("Unsupported installer type")
+    if installer_type == "inno":
+        installer_fields = f"""InstallerType: inno
+Scope: user
+UpgradeBehavior: install
+AppsAndFeaturesEntries:
+- DisplayName: Rust Switcher
+  Publisher: QQRM
+  ProductCode: {PACKAGE_ID}_is1
+  InstallerType: inno
+- ProductCode: {PACKAGE_ID}_Microsoft.Winget.Source_8wekyb3d8bbwe
+  InstallerType: portable
+"""
+        asset_name = "rust-switcher-setup.exe"
+    else:
+        installer_fields = "InstallerType: portable\nCommands:\n- rust-switcher\n"
+        asset_name = "rust-switcher.exe"
     return {
         f"{MANIFEST_ROOT}/{version}/{PACKAGE_ID}.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.{MANIFEST_VERSION}.schema.json
 PackageIdentifier: {PACKAGE_ID}
@@ -158,16 +191,14 @@ ManifestVersion: {MANIFEST_VERSION}
 PackageIdentifier: {PACKAGE_ID}
 PackageVersion: {version}
 MinimumOSVersion: 10.0.22000.0
-InstallerType: portable
-Commands:
-- rust-switcher
+{installer_fields.rstrip()}
 Dependencies:
   PackageDependencies:
   - PackageIdentifier: Microsoft.VCRedist.2015+.x64
 ReleaseDate: {date}
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/{OWNER}/{REPO}/releases/download/v{version}/rust-switcher.exe
+  InstallerUrl: https://github.com/{OWNER}/{REPO}/releases/download/v{version}/{asset_name}
   InstallerSha256: {sha256}
 ManifestType: installer
 ManifestVersion: {MANIFEST_VERSION}
@@ -261,7 +292,7 @@ def submit(version: str, release: dict, sha256: str) -> None:
         return
 
     branch = f"manifest/qqrm-rustswitcher-{version}"
-    files = manifests(version, release["published_at"], sha256)
+    files = manifests(version, release["published_at"], sha256, installer_type_for_release(release))
     validate_manifests(files, version)
     # Reject releases that became stale while their files were being validated.
     latest = api(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest")
@@ -287,7 +318,7 @@ def submit(version: str, release: dict, sha256: str) -> None:
     if not publication_needed(version):
         return
     body = (f"## 📖 Description\n\nUpdates `{PACKAGE_ID}` to version `{version}` using the published Windows x64 release executable.\n\n"
-            f"The executable was downloaded from the version-specific release URL, checked as an x64 Windows PE, and its SHA-256 was verified against GitHub release asset metadata: `{sha256}`.\n\n"
+            f"The executable was downloaded from the version-specific release URL, its Windows PE header was checked, and its SHA-256 was verified against GitHub release asset metadata: `{sha256}`.\n\n"
             "## 📦 Manifest Checklist\n\n- [x] One manifest set for this package/version\n"
             "- [x] Installer URL and SHA-256 verified from the published release asset\n"
             f"- [x] Manifest schema version `{MANIFEST_VERSION}`\n- [x] Validated on Windows with `winget validate --manifest`\n"
@@ -312,7 +343,7 @@ def main(argv: list[str] | None = None) -> None:
     release, tag, version = release_for_event()
     sha256 = verify_executable(release, tag)
     if args.validate_only:
-        validate_manifests(manifests(version, release["published_at"], sha256), version)
+        validate_manifests(manifests(version, release["published_at"], sha256, installer_type_for_release(release)), version)
         print(f"Validated {PACKAGE_ID} {version}; no GitHub writes requested")
         return
     submit(version, release, sha256)

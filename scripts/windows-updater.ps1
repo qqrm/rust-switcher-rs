@@ -46,6 +46,22 @@ function Assert-Hash([string]$file, [string]$expected) {
     }
 }
 
+function Test-InstallerManaged([string]$executable) {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $key = $base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Uninstall\QQRM.RustSwitcher_is1')
+        if ($null -eq $key) { return $false }
+        try {
+            $location = [string]$key.GetValue('InstallLocation', '')
+            $kind = [string]$key.GetValue('WinGetInstallerType', '')
+            if ($kind -cne 'inno' -or -not [IO.Path]::IsPathRooted($location)) { return $false }
+            $registered = [IO.Path]::GetFullPath((Join-Path $location 'rust-switcher.exe'))
+            return [string]::Equals($registered, [IO.Path]::GetFullPath($executable), [StringComparison]::OrdinalIgnoreCase)
+        } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+}
+
 try {
     if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
         throw "Installed Rust Switcher executable was not found"
@@ -68,9 +84,11 @@ try {
         return
     }
 
-    $assets = @($release.assets | Where-Object { $_.name -ceq 'rust-switcher.exe' })
+    $managed = Test-InstallerManaged $TargetPath
+    $assetName = if ($managed) { 'rust-switcher-setup.exe' } else { 'rust-switcher.exe' }
+    $assets = @($release.assets | Where-Object { $_.name -ceq $assetName })
     if ($assets.Count -ne 1) {
-        throw "Expected exactly one rust-switcher.exe release asset"
+        throw "Expected exactly one $assetName release asset"
     }
     $asset = $assets[0]
     $digest = [string]$asset.digest
@@ -83,7 +101,7 @@ try {
     }
 
     # Never follow a release-provided arbitrary URL; construct the pinned repository URL.
-    $downloadUrl = "https://github.com/qqrm/rust-switcher-rs/releases/download/$tag/rust-switcher.exe"
+    $downloadUrl = "https://github.com/qqrm/rust-switcher-rs/releases/download/$tag/$assetName"
     if ([string]$asset.browser_download_url -cne $downloadUrl) {
         throw "Unexpected release asset URL"
     }
@@ -94,6 +112,16 @@ try {
         throw "Downloaded executable size mismatch"
     }
     Assert-Hash $staged $expectedHash
+
+    if ($managed) {
+        # Let the installer own shutdown, rollback, restart and ARP version updates.
+        # Falling back to a raw replacement would leave WinGet's version stale.
+        Write-UpdateLog "Installing verified package $tag"
+        $installation = Start-Process -FilePath $staged -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -PassThru -Wait -ErrorAction Stop
+        if ($installation.ExitCode -ne 0) { throw "Package installer failed with exit code $($installation.ExitCode)" }
+        Write-UpdateLog "Updated package to $tag"
+        return
+    }
 
     # Preflight write access and make the replacement a same-directory rename.
     $directory = Split-Path -Parent $TargetPath
