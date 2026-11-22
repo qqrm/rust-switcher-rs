@@ -156,7 +156,7 @@ function Invoke-TestSourcePython($State, [string]$ServerScript, [string]$Python,
     if ($result.ExitCode -ne 0) { throw "Dependency metadata inspection failed: $($result.Text)" }
 }
 function Get-TestDependencyRegistration($Dependency) {
-    $matches = [Collections.Generic.List[object]]::new()
+    $registrations = [Collections.Generic.List[object]]::new()
     foreach ($code in @($Dependency.ProductCodes)) {
         if ($code -notmatch '^[A-Za-z0-9_.{}+\-]{1,200}$') { throw 'An exported dependency product code is not a single registry key name.' }
         foreach ($hive in @([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryHive]::CurrentUser)) {
@@ -168,7 +168,7 @@ function Get-TestDependencyRegistration($Dependency) {
                     try {
                         $installedVersion = [string]$key.GetValue('DisplayVersion')
                         if ($installedVersion -ceq $Dependency.PackageVersion) {
-                            $matches.Add(@{ Hive = $hive.ToString(); View = $view.ToString(); ProductCode = $code;
+                            $registrations.Add(@{ Hive = $hive.ToString(); View = $view.ToString(); ProductCode = $code;
                                 DisplayVersion = $installedVersion; DisplayName = [string]$key.GetValue('DisplayName') })
                         }
                     } finally { $key.Dispose() }
@@ -176,10 +176,10 @@ function Get-TestDependencyRegistration($Dependency) {
             }
         }
     }
-    if ($matches.Count -eq 0) {
+    if ($registrations.Count -eq 0) {
         throw "Dependency prerequisite is not correlated: $($Dependency.PackageIdentifier) $($Dependency.PackageVersion) has no exact exported product-code/version match in the runner's ARP entries."
     }
-    return ,$matches.ToArray()
+    return ,$registrations.ToArray()
 }
 function Initialize-TestSourceDependencies($State, [string]$ServerScript, [string]$Python) {
     $planPath = Join-Path $State.Directory 'dependency-plan.json'

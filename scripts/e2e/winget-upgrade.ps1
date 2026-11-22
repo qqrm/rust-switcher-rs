@@ -1232,21 +1232,30 @@ try {
 
     $next = Build-Fixture 4
     $manifest = Prepare-Manifest $next.Manifests $next.Setup $next.Version 'locked'
-    $beforeToken = [PackageAcceptanceNative]::SnapshotToken($current.Id)
-    $fileLock = [IO.File]::Open($installedExe, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $lockedPrevious = Wait-Ready
     try {
+        # Hold the original process identity across the failed upgrade. An
+        # installer that never stops it must not pass as successful recovery.
+        $null = $lockedPrevious.Handle
+        $lockedPreviousId = $lockedPrevious.Id
+        $beforeToken = [PackageAcceptanceNative]::SnapshotToken($lockedPreviousId)
+        $fileLock = [IO.File]::Open($installedExe, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         $result = Upgrade-Package $manifest 'inno-locked-update' -AllowFailure
         if ($result.ExitCode -eq 0) { throw 'WinGet reported success although the executable could not be replaced.' }
+        if (-not $lockedPrevious.WaitForExit(10000)) { throw 'Locked-update failure did not stop the captured original process; recovery was not exercised.' }
         $installerLog = Join-Path $logDirectory 'inno-locked-update-installer.log'
         if (-not (Test-Path -LiteralPath $installerLog) -or
             [IO.File]::ReadAllText($installerLog) -notmatch [regex]::Escape("$Application.exe")) {
             throw 'Failure occurred before the candidate installer reached the locked application; this is not a rollback test.'
         }
-        $current = Wait-Ready
+        $current = Wait-Ready $lockedPreviousId
         Assert-TokenPreserved $beforeToken $current.Id 'failed-update-recovery'
         Assert-Installed $managed.Version $true
-    } finally { $fileLock.Dispose(); $fileLock = $null }
-    Record-Pass 'A locked payload produces a failed update while preserving the previous payload, ARP version, preferences, and working tray'
+    } finally {
+        if ($null -ne $fileLock) { $fileLock.Dispose(); $fileLock = $null }
+        $lockedPrevious.Dispose()
+    }
+    Record-Pass "A locked payload stops captured process $lockedPreviousId and restores replacement $($current.Id) with the previous payload, ARP version, preferences, and working tray"
 
     Stop-Installed
     $null = Invoke-WinGet @('uninstall', '--product-code', $productCode, '--exact', '--silent',
