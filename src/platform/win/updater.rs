@@ -166,6 +166,8 @@ fn spawn_updater(log_path: &Path) -> io::Result<Child> {
     )?;
 
     let child = Command::new("powershell.exe")
+        // Windows PowerShell must not inherit incompatible PowerShell 7 module paths.
+        .env_remove("PSModulePath")
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")

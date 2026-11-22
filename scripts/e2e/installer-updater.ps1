@@ -103,6 +103,10 @@ function Invoke-FixtureProcess(
     $info.RedirectStandardError = $true
     $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
     $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    # Direct Process.Start bypasses PowerShell 7's native-command compatibility
+    # handling. Let only this Windows PowerShell child construct its own module
+    # paths instead of inheriting incompatible PowerShell 7 Utility modules.
+    $null = $info.Environment.Remove('PSModulePath')
     foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
     $resultPath = "$OutputPrefix.result.json"
     $record = [ordered]@{
@@ -110,6 +114,7 @@ function Invoke-FixtureProcess(
         Executable = $FilePath
         Arguments = $Arguments
         TimeoutSeconds = $TimeoutSeconds
+        ModulePathPolicy = 'Windows PowerShell startup defaults; parent environment unchanged'
         HelperPid = $null
         ExitCode = $null
         TimedOut = $false
@@ -217,6 +222,33 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $fixture = Get-Content -LiteralPath $FixturePath -Raw -Encoding UTF8 | ConvertFrom-Json
+$preflight = [ordered]@{
+    PSEdition = $PSVersionTable.PSEdition
+    PSVersion = $PSVersionTable.PSVersion.ToString()
+    HashCommandModule = $null
+    HashCommandType = $null
+    ActualInstallerHash = $null
+    ExpectedInstallerHash = $fixture.InstallerHash
+    HashMatches = $false
+    Error = $null
+}
+try {
+    if ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or
+        $PSVersionTable.PSVersion.Minor -ne 1) { throw 'The managed helper fixture requires Windows PowerShell Desktop 5.1.' }
+    $hashCommand = Get-Command Get-FileHash -CommandType Cmdlet, Function -ErrorAction Stop
+    $preflight.HashCommandModule = $hashCommand.Source
+    $preflight.HashCommandType = [string]$hashCommand.CommandType
+    if ($hashCommand.Source -cne 'Microsoft.PowerShell.Utility') { throw 'Get-FileHash did not resolve to the Windows PowerShell Utility module.' }
+    $preflight.ActualInstallerHash = (& $hashCommand -LiteralPath $fixture.InstallerPath -Algorithm SHA256).Hash
+    $preflight.HashMatches = $preflight.ActualInstallerHash -ieq $fixture.InstallerHash
+    if (-not $preflight.HashMatches) { throw 'The real Windows PowerShell SHA-256 preflight did not match the fixture installer.' }
+} catch {
+    $preflight.Error = $_.Exception.ToString()
+    throw
+} finally {
+    $preflight | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fixture.PreflightLog -Encoding UTF8
+}
+Write-Host "Managed helper preflight: Desktop $($preflight.PSVersion); $($preflight.HashCommandModule); SHA-256 matched."
 function Invoke-RestMethod {
     param([string]$Uri, $Headers, [int]$TimeoutSec)
     if ($Uri -cne $fixture.ApiUrl) { throw "Unexpected API request: $Uri" }
@@ -260,6 +292,7 @@ function Invoke-HelperFixture([string]$caseName, [bool]$badDigest) {
         ApiUrl = $apiUrl
         SetupUrl = "$downloadRoot/$setupName"
         InstallerPath = $InstallerPath
+        InstallerHash = $setupHash
         TargetPath = $InstalledExecutable
         CurrentVersion = $originalVersion
         ParentParameter = $parentParameter
@@ -267,6 +300,7 @@ function Invoke-HelperFixture([string]$caseName, [bool]$badDigest) {
         HelperPath = $helperPath
         LogPath = (Join-Path $testRoot "$caseName.log")
         RequestLog = (Join-Path $testRoot "$caseName.requests.log")
+        PreflightLog = (Join-Path $testRoot "$caseName.preflight.json")
         Release = @{
             tag_name = "v$Version"
             draft = $false
@@ -298,8 +332,21 @@ function Invoke-HelperFixture([string]$caseName, [bool]$badDigest) {
     return $code
 }
 
+function Assert-DigestRejection([string]$LogPath) {
+    $expectedMessage = if ($Application -eq 'brightwheel') {
+        'Update failed: Executable SHA-256 mismatch: brightwheel-setup.exe'
+    } else { 'Update failed: Downloaded executable SHA-256 mismatch' }
+    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf) -or
+        @([IO.File]::ReadAllLines($LogPath) | Where-Object {
+            $_.EndsWith(' ' + $expectedMessage, [StringComparison]::Ordinal)
+        }).Count -ne 1) {
+        throw "The negative case did not record the expected installer checksum rejection; inspect $LogPath."
+    }
+}
+
 $badCode = Invoke-HelperFixture 'bad-digest' $true
 if ($badCode -eq 0) { throw 'The updater accepted an installer with a mismatching digest.' }
+Assert-DigestRejection (Join-Path $testRoot 'bad-digest.log')
 if ($original.HasExited -or (Get-FileHash -LiteralPath $InstalledExecutable -Algorithm SHA256).Hash -cne $originalHash -or
     (Get-InstalledVersion) -cne $originalVersion -or (Get-PreferenceSnapshot) -cne $originalPreferences) {
     throw 'An unverified installer changed the running application, installed version, or preferences.'
