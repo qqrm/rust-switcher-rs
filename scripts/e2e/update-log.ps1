@@ -65,6 +65,10 @@ public static class UpdateLogShell {
         var value = new StringBuilder(32768); uint size = (uint)value.Capacity;
         return AssocQueryString(0x400, 2, ".log", null, value, ref size) == 0 ? value.ToString() : null;
     }
+    public static string ProgId() {
+        var value = new StringBuilder(32768); uint size = (uint)value.Capacity;
+        return AssocQueryString(0x400, 20, ".log", null, value, ref size) == 0 ? value.ToString() : null;
+    }
     public static uint AssociationResult() {
         var value = new StringBuilder(32768); uint size = (uint)value.Capacity;
         return unchecked((uint)AssocQueryString(0x400, 20, ".log", null, value, ref size));
@@ -137,13 +141,12 @@ function Assert-Receipts([int]$Count) {
 
 $classes = [Microsoft.Win32.Registry]::CurrentUser
 $extensionPath = 'Software\Classes\.log'
-$openWithPath = $extensionPath + '\OpenWithProgids'
-$openWith = $classes.OpenSubKey($openWithPath, $true)
-$openWithExisted = $null -ne $openWith
-if ($null -ne $openWith) { $openWith.Dispose() }
-$progId = 'RSLog.' + [guid]::NewGuid().ToString('N')
-if ($progId.Length -gt 39) { throw 'Owned ProgID exceeds the documented 39-character limit' }
-$progIdPath = 'Software\Classes\' + $progId
+$baselineProgId = 'txtfile'
+$systemNotepad = Join-Path ([Environment]::GetFolderPath('System')) 'notepad.exe'
+$missingProgId = 'RSLog.' + [guid]::NewGuid().ToString('N')
+$missingClass = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($missingProgId)
+if ($null -ne $missingClass) { $missingClass.Dispose(); throw 'Missing-association fixture class unexpectedly exists' }
+# Read snapshots without creating an empty per-user extension shadow key.
 $extension = $classes.OpenSubKey($extensionPath, $true)
 $extensionExisted = $null -ne $extension
 $hadDefault = $false
@@ -156,6 +159,27 @@ if ($null -ne $extension) {
         $originalKind = $extension.GetValueKind('')
     }
     $extension.Dispose()
+}
+$handlerRoot = 'Software\Classes\' + $baselineProgId
+$handlerPaths = @('Software\Classes', $handlerRoot, ($handlerRoot + '\shell'), ($handlerRoot + '\shell\open'), ($handlerRoot + '\shell\open\command'))
+$handlerParents = foreach ($path in $handlerPaths) {
+    $key = $classes.OpenSubKey($path)
+    @{ Path = $path; Existed = $null -ne $key }
+    if ($null -ne $key) { $key.Dispose() }
+}
+$handlerCommandPath = $handlerPaths[-1]
+$handlerCommand = $classes.OpenSubKey($handlerCommandPath)
+$hadCommandDefault = $false
+$originalCommand = $null
+$originalCommandKind = [Microsoft.Win32.RegistryValueKind]::String
+if ($null -ne $handlerCommand) {
+    try {
+        $hadCommandDefault = $handlerCommand.GetValueNames() -contains ''
+        if ($hadCommandDefault) {
+            $originalCommand = $handlerCommand.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $originalCommandKind = $handlerCommand.GetValueKind('')
+        }
+    } finally { $handlerCommand.Dispose() }
 }
 $process = $null
 $notepad = $null
@@ -171,26 +195,26 @@ function Write-LogAssociationDiagnostics([string]$Stage) {
     if ($null -ne $choice) {
         try { $choiceValue = [string]$choice.GetValue('ProgId', '<absent>') } finally { $choice.Dispose() }
     }
-    Write-Output "Association $Stage : ProgID=$([UpdateLogShell]::Describe('.log', 0x400, 20)); reader=$([UpdateLogShell]::Describe('.log', 0x400, 2)); owned=$([UpdateLogShell]::Describe($progId, 0x800, 2)); UserChoice=$choiceValue"
+    Write-Output "Association $Stage : ProgID=$([UpdateLogShell]::Describe('.log', 0x400, 20)); reader=$([UpdateLogShell]::Describe('.log', 0x400, 2)); baseline=$([UpdateLogShell]::Describe($baselineProgId, 0x800, 2)); UserChoice=$choiceValue"
     $merged = [Microsoft.Win32.Registry]::ClassesRoot
     $machine = [Microsoft.Win32.Registry]::LocalMachine
-    Write-Output "Association registry $Stage : HKCU .log=$(Read-LogAssociationValue $classes $extensionPath); HKLM .log=$(Read-LogAssociationValue $machine $extensionPath); HKCR .log=$(Read-LogAssociationValue $merged '.log'); HKCR owned command=$(Read-LogAssociationValue $merged ($progId + '\shell\open\command'))"
+    Write-Output "Association registry $Stage : HKCU .log=$(Read-LogAssociationValue $classes $extensionPath); HKLM .log=$(Read-LogAssociationValue $machine $extensionPath); HKCR .log=$(Read-LogAssociationValue $merged '.log'); HKCR baseline command=$(Read-LogAssociationValue $merged ($baselineProgId + '\shell\open\command'))"
 }
 try {
     Write-LogAssociationDiagnostics 'before setup'
-    $type = $classes.CreateSubKey($progIdPath)
-    try { $type.SetValue('', 'Rust Switcher owned update log test') } finally { $type.Dispose() }
-    $shell = $classes.CreateSubKey($progIdPath + '\shell')
-    try { $shell.SetValue('', 'open') } finally { $shell.Dispose() }
-    $command = $classes.CreateSubKey($progIdPath + '\shell\open\command')
+    if ([UpdateLogShell]::ProgId() -ne $baselineProgId -or [UpdateLogShell]::Reader() -ne $systemNotepad) {
+        throw 'Fixture requires the verified txtfile/System32 Notepad baseline association'
+    }
+    $mergedCommand = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($baselineProgId + '\shell\open\command')
+    if ($null -eq $mergedCommand) { throw 'Fixture requires an existing static open-command key' }
+    try {
+        if ([string]::IsNullOrWhiteSpace([string]$mergedCommand.GetValue(''))) { throw 'Fixture requires an existing static open command' }
+        if ($mergedCommand.GetValueNames() -contains 'DelegateExecute') { throw 'Fixture requires a plain command; delegated handlers are never modified' }
+    } finally { $mergedCommand.Dispose() }
+    # Keep the selected ProgID and extension mapping intact. Configure only
+    # the disposable user's existing plain-command reader for this test.
+    $command = $classes.CreateSubKey($handlerCommandPath)
     try { $command.SetValue('', '"' + $recorder + '" "' + $capture + '" "%1"') } finally { $command.Dispose() }
-    # Register the candidate as documented for changing an extension default.
-    # Own only this unique value; never replace another application's entry.
-    $openWith = $classes.CreateSubKey($openWithPath)
-    try { $openWith.SetValue($progId, [byte[]]::new(0), [Microsoft.Win32.RegistryValueKind]::None) }
-    finally { $openWith.Dispose() }
-    $extension = $classes.CreateSubKey($extensionPath)
-    try { $extension.SetValue('', $progId) } finally { $extension.Dispose() }
     [UpdateLogShell]::Refresh()
     try { Wait-Condition { [UpdateLogShell]::Reader() -eq $recorder } 'effective .log default reader; UserChoice is never changed' }
     finally { Write-LogAssociationDiagnostics 'after setup' }
@@ -249,15 +273,15 @@ try {
     Wait-Condition { (Failure-NotificationCount) -eq 3 } 'held helper completion'
     Record-Pass 'release ordinary notification clears the update log action while the UI stays responsive'
 
-    # Remove only our entire class, leaving .log pointing to the missing owned
-    # ProgID. Ignore the generic Unknown/Open With fallback in the diagnostic.
-    $classes.DeleteSubKeyTree($progIdPath, $false)
+    # A nonexistent unique class supplies the separate no-association case.
+    # This is the first extension-mapping write; no user-choice data is touched.
+    $extension = $classes.CreateSubKey($extensionPath)
+    try { $extension.SetValue('', $missingProgId) } finally { $extension.Dispose() }
     [UpdateLogShell]::Refresh()
     try {
         Wait-Condition { [UpdateLogShell]::AssociationResult() -eq [uint32]2147943555 } 'exact ERROR_NO_ASSOCIATION for .log'
-    } finally { Write-LogAssociationDiagnostics 'after removing owned ProgID' }
+    } finally { Write-LogAssociationDiagnostics 'after selecting nonexistent fixture ProgID' }
     Invoke-LogTrayItem $process $handle 'Open update log'
-    $systemNotepad = Join-Path ([Environment]::GetFolderPath('System')) 'notepad.exe'
     Wait-Condition {
         @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)" | Where-Object {
             $_.ExecutablePath -eq $systemNotepad -and $_.CommandLine
@@ -297,25 +321,36 @@ try {
         } catch { $cleanupFailures.Add($_.Exception.Message) }
     }
     try {
-        $openWith = $classes.OpenSubKey($openWithPath, $true)
-        if ($null -ne $openWith) {
+        $handlerCommand = $classes.OpenSubKey($handlerCommandPath, $true)
+        if ($null -ne $handlerCommand) {
             try {
-                $openWith.DeleteValue($progId, $false)
-                $openWithEmpty = $openWith.SubKeyCount -eq 0 -and $openWith.ValueCount -eq 0
-            } finally { $openWith.Dispose() }
-            if (-not $openWithExisted -and $openWithEmpty) { $classes.DeleteSubKey($openWithPath, $false) }
+                if ($hadCommandDefault) { $handlerCommand.SetValue('', $originalCommand, $originalCommandKind) }
+                else { $handlerCommand.DeleteValue('', $false) }
+            } finally { $handlerCommand.Dispose() }
         }
     } catch { $cleanupFailures.Add($_.Exception.Message) }
-    $extension = $classes.OpenSubKey($extensionPath, $true)
-    if ($null -ne $extension) {
+    try {
+        $extension = $classes.OpenSubKey($extensionPath, $true)
+        if ($null -ne $extension) {
+            try {
+                if ($hadDefault) { $extension.SetValue('', $originalDefault, $originalKind) }
+                else { $extension.DeleteValue('', $false) }
+                $empty = $extension.SubKeyCount -eq 0 -and $extension.ValueCount -eq 0
+            } finally { $extension.Dispose() }
+            if (-not $extensionExisted -and $empty) { $classes.DeleteSubKey($extensionPath, $false) }
+        }
+    } catch { $cleanupFailures.Add($_.Exception.Message) }
+    for ($index = $handlerParents.Count - 1; $index -ge 0; $index--) {
+        $parent = $handlerParents[$index]
+        if ($parent.Existed) { continue }
         try {
-            if ($hadDefault) { $extension.SetValue('', $originalDefault, $originalKind) }
-            else { $extension.DeleteValue('', $false) }
-            $empty = $extension.SubKeyCount -eq 0 -and $extension.ValueCount -eq 0
-        } finally { $extension.Dispose() }
-        if (-not $extensionExisted -and $empty) { $classes.DeleteSubKey($extensionPath, $false) }
+            $key = $classes.OpenSubKey($parent.Path)
+            if ($null -ne $key) {
+                try { $empty = $key.SubKeyCount -eq 0 -and $key.ValueCount -eq 0 } finally { $key.Dispose() }
+                if ($empty) { $classes.DeleteSubKey($parent.Path, $false) }
+            }
+        } catch { $cleanupFailures.Add($_.Exception.Message) }
     }
-    $classes.DeleteSubKeyTree($progIdPath, $false)
     [UpdateLogShell]::Refresh()
     if ($cleanupFailures.Count -gt 0) { throw ($cleanupFailures -join '; ') }
 }
