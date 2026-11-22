@@ -96,6 +96,7 @@ public static class HostedInput {
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint thread);
@@ -244,6 +245,8 @@ public static class HostedInput {
         UIntPtr result;
         if (SendMessageTimeout(window, 0x8011, new UIntPtr(mode), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture trap setup failed");
+        if (result.ToUInt64() != 1)
+            throw new InvalidOperationException("Fixture trap did not acknowledge setup");
     }
     public static int ResetJournalFixture(IntPtr window) {
         UIntPtr result;

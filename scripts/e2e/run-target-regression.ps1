@@ -1,4 +1,7 @@
-param([Parameter(Mandatory = $true)][string]$Exe)
+param(
+    [Parameter(Mandatory = $true)][string]$Exe,
+    [ValidateSet('SourceRead', 'Delivery')][string]$Race = 'SourceRead'
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -92,17 +95,29 @@ try {
     Start-Sleep -Milliseconds 1200
     [HostedInput]::SetFixtureText($source, 'ghbdtn ')
     [HostedInput]::SetFixtureText($destination, 'untouched')
+    [HostedInput]::SelectFixtureText($destination, 3)
     Set-OwnedControlFocus $editorWindow $sourceElement | Out-Null
     [HostedInput]::SelectFixtureText($source, 7)
+    if (([HostedInput]::GetAsyncKeyState(0x10) -band 0x8000) -ne 0) {
+        throw 'Target-test setup has Shift held down'
+    }
     $clipboard = [HostedInput]::GetClipboardSequenceNumber()
     if ($clipboard -eq 0) { throw 'Target-test clipboard sequence is unavailable' }
     Set-Content -LiteralPath $signalPath -Value 'ready' -NoNewline
-    # The first real WM_GETTEXT starts the fixture's 40 ms timer. Production
-    # conversion has already acquired its source before that focus transition.
-    [HostedInput]::ArmFixture($source, 2)
+    if ($Race -eq 'Delivery') {
+        # A fixture-owned hook runs immediately before Switcher's hook and moves
+        # focus on the first actual replacement event, after SendInput begins.
+        [HostedInput]::ArmFixture($source, 4)
+        $expectedSignal = 'delivery-4'
+    } else {
+        # The first real WM_GETTEXT starts the fixture's 40 ms timer. Production
+        # conversion has acquired its source before that focus transition.
+        [HostedInput]::ArmFixture($source, 2)
+        $expectedSignal = 'changed-2'
+    }
     Tap-Shift 2
-    Wait-Condition { (Get-Content -LiteralPath $signalPath -Raw) -ceq 'changed-2' -and
-        [HostedInput]::WindowFocus($editorHandle) -eq $destination } 'verified focus change after source read'
+    Wait-Condition { (Get-Content -LiteralPath $signalPath -Raw) -ceq $expectedSignal -and
+        [HostedInput]::WindowFocus($editorHandle) -eq $destination } "verified focus change at $Race boundary"
     Start-Sleep -Milliseconds 1600
     if ($switcher.HasExited) { throw 'Switcher exited during the target race' }
     $actualSource = [HostedInput]::FixtureText($source)
@@ -111,8 +126,24 @@ try {
         throw 'WRONG_TARGET_WRITE: delayed conversion wrote source text into the independently focused destination'
     }
     if ($actualSource -cne 'ghbdtn ') { throw 'Cancelled target race changed its source text' }
+    if (-not [HostedInput]::HasSelectionRange($source, 0, 7) -or
+        -not [HostedInput]::HasSelectionRange($destination, 0, 3)) {
+        throw 'Cancelled replacement changed the source or neighboring selection'
+    }
+    if (([HostedInput]::GetAsyncKeyState(0x10) -band 0x8000) -ne 0) {
+        throw 'Cancelled replacement left Shift held down'
+    }
     if ([HostedInput]::GetClipboardSequenceNumber() -ne $clipboard) { throw 'Target race changed clipboard' }
-    Write-Output 'PASS: verified source-read/focus race left both native fields unchanged'
+    Write-Output "PASS: verified $Race race left both native fields unchanged"
+    Set-OwnedControlFocus $editorWindow $sourceElement | Out-Null
+    Tap-Shift 2
+    Wait-Condition { [HostedInput]::FixtureText($source) -ceq 'привет ' -and
+        [HostedInput]::HasSelectionRange($source, 0, 7) } 'conversion recovery after cancelled delivery'
+    if ([HostedInput]::FixtureText($destination) -cne 'untouched' -or
+        [HostedInput]::GetClipboardSequenceNumber() -ne $clipboard) {
+        throw 'Recovery conversion changed its neighbor or clipboard'
+    }
+    Write-Output "PASS: conversion recovered after cancelled $Race race"
     [HostedInput]::PostMessage($switcherHandle, 0x111, [UIntPtr]1103, [IntPtr]::Zero) | Out-Null
     if (-not $switcher.WaitForExit(8000) -or $switcher.ExitCode -ne 0) { throw 'Target-test Switcher did not exit cleanly' }
 } finally {

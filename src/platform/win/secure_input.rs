@@ -219,6 +219,49 @@ fn active_command_is_current() -> bool {
     ACTIVE_COMMAND.get().is_none_or(CommandContext::is_current)
 }
 
+/// Immutable ownership carried from command recognition through input delivery.
+/// Checking this value only reads epochs and native handles, never UI Automation.
+#[derive(Clone, Copy)]
+pub(crate) struct DeliveryContext {
+    command: CommandContext,
+    generation: u64,
+}
+
+impl DeliveryContext {
+    pub(crate) fn capture() -> Option<Self> {
+        let generation = generation();
+        let command = ACTIVE_COMMAND.get().or_else(CommandContext::capture)?;
+        Some(Self { command, generation })
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn is_current(self) -> bool {
+        self.is_current_with(|| self.command.target.is_current())
+    }
+
+    fn is_current_with(self, target_is_current: impl FnOnce() -> bool) -> bool {
+        validate_generation(self.generation)
+            && self.command.is_current_with(target_is_current)
+            && validate_generation(self.generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            command: CommandContext::for_test(capture_generation(), 1, 2),
+            generation: generation(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epochs_are_current(self) -> bool {
+        self.is_current_with(|| true)
+    }
+}
+
 /// Only native target metadata and monotonic revisions cross into the hook.
 /// COM interfaces remain owned by the provider worker.
 struct IdentityPublications {
@@ -1343,6 +1386,9 @@ pub(crate) fn protect_current_context() -> Status {
 
 /// The FIFO barrier drains earlier captures before a fresh bounded probe.
 fn protect_context(mode: ProtectionMode) -> Status {
+    // The hook cannot take journal locks. Apply its cancelled-delivery notice
+    // here, before a later command can read an uncommitted replacement journal.
+    crate::conversion::input_delivery::flush_rejected_context();
     if !active_command_is_current() {
         return Status::Unknown;
     }

@@ -44,6 +44,16 @@ For captured selections, the exact range and text are revalidated. Input batches
 keep deletion, insertion and reselection together. These checks do not require
 the target to claim that it is a non-password field.
 
+Submitting an input batch does not prove that Windows has delivered it. Each
+replacement carries a unique batch marker whose bounded record retains only
+the original native target, input generations and delivery bookkeeping. The
+keyboard hook checks that record before passing each replacement event. A Tab
+already ahead of the replacement can therefore invalidate it even if the
+pre-submission checks passed. Cancellation is permanent for that batch; returning
+to the original field does not revive queued text. Matching releases of synthetic
+keys already admitted are still passed so cancellation cannot strand Shift.
+This check uses native metadata and generation counters without calling UIA.
+
 ## Background capture and custom controls
 
 Keyboard hooks do not call foreign UI Automation providers. They take bounded

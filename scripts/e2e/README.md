@@ -283,11 +283,22 @@ observed destination HWND before checking that both strings and the clipboard
 are unchanged. This makes source acquisition followed by a focus change a
 repeatable test condition; no command is retried or repaired.
 
+The separate `-Race Delivery` scenario installs a fixture-owned low-level
+keyboard hook after Switcher's hook. When the first injected Delete with a
+production replacement-batch marker arrives, it changes focus to the neighboring
+Edit before passing that event down the hook chain. This forces the transition
+after the application's pre-submission checks, at actual input delivery. The
+runner requires both the specific hook signal and the observed destination HWND,
+then checks the source, destination and clipboard exactly. This test does not
+change production code to schedule the race. It complements the immediate-Tab
+scenarios and deterministic delivery-queue unit tests; it does not claim atomic
+focus ownership after an event leaves the hook.
+
 `run-security-mutation.ps1` first requires that test to pass on the unmodified
-executable. It temporarily bypasses the overlapping selection-target,
-command-origin, and final-context guards, compiles one separate debug executable,
+executable for both race modes. It temporarily bypasses the overlapping selection-target,
+command-origin, final-context and delivery guards, compiles one separate debug executable,
 and restores both source bytes and the original debug executable. The same
-native test must then complete its conversion positive control and fail with
+native test in each mode must then complete its conversion positive control and fail with
 `WRONG_TARGET_WRITE` because the actual destination text changed. Compile errors,
 setup failures, process crashes, timeouts, and a generic nonzero exit do not count
 as detecting the mutation. This deliberately combined fault tests the observed

@@ -9,7 +9,7 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, SyncSender},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -87,6 +87,29 @@ struct PreparationRequest {
     reply: Option<SyncSender<bool>>,
 }
 
+struct PreparationWait {
+    receiver: Receiver<bool>,
+    deadline: Instant,
+}
+
+impl PreparationWait {
+    fn within_startup_budget(self) -> bool {
+        let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        self.receiver.recv_timeout(remaining).unwrap_or(false) && Instant::now() < self.deadline
+    }
+
+    #[cfg(test)]
+    fn fixture_ready(self) -> Result<bool, mpsc::RecvTimeoutError> {
+        // Await this request's real trust/table result, without retrying it or
+        // priming Windows' catalog cache. The startup wait is a responsiveness
+        // bound, not a guarantee that cold OS signature verification is done.
+        // This separate watchdog still makes a hung native fixture fail clearly.
+        self.receiver.recv_timeout(Duration::from_secs(30))
+    }
+}
+
 struct Decoder {
     sender: SyncSender<Request>,
     prepare_sender: SyncSender<PreparationRequest>,
@@ -111,6 +134,14 @@ pub(crate) fn warm() -> bool {
 /// handles returned by LoadKeyboardLayout but absent from a worker's catalog.
 pub(crate) fn prepare_layout(layout: usize) -> bool {
     decoder().is_some_and(|decoder| decoder.prepare_many(vec![layout]))
+}
+
+#[cfg(test)]
+pub(super) fn prepare_fixture_layout(layout: usize) {
+    let Some(decoder) = decoder() else {
+        panic!("the native fixture decoder must start");
+    };
+    decoder.prepare_fixture(layout);
 }
 
 /// Discard pending composition after edits that invalidate the input journal.
@@ -153,9 +184,7 @@ pub(super) fn decode_probe(
             return DecodeResult::Unavailable;
         };
         decoder.invalidate();
-        if !decoder.prepare_many(vec![hkl]) {
-            return DecodeResult::Unavailable;
-        }
+        decoder.prepare_fixture(hkl);
         decoder.decode(vk, scan, state, hkl, focus_key)
     })
 }
@@ -290,22 +319,44 @@ impl Decoder {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn prepare_many(&self, mut layouts: Vec<usize>) -> bool {
+    fn prepare_many(&self, layouts: Vec<usize>) -> bool {
+        self.request_preparation(layouts)
+            .is_some_and(PreparationWait::within_startup_budget)
+    }
+
+    fn request_preparation(&self, mut layouts: Vec<usize>) -> Option<PreparationWait> {
         let mut seen = HashSet::new();
         layouts.retain(|layout| *layout != 0 && seen.insert(*layout));
         if layouts.is_empty() || layouts.len() > MAX_INSTALLED_LAYOUTS {
-            return false;
+            return None;
         }
         let (reply, receiver) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + PREPARATION_TIMEOUT;
         let request = PreparationRequest {
             layouts,
-            deadline: Instant::now() + PREPARATION_TIMEOUT,
+            deadline,
             reply: Some(reply),
         };
         if self.prepare_sender.try_send(request).is_err() {
-            return false;
+            return None;
         }
-        receiver.recv_timeout(PREPARATION_TIMEOUT).unwrap_or(false)
+        Some(PreparationWait { receiver, deadline })
+    }
+
+    #[cfg(test)]
+    fn prepare_fixture(&self, layout: usize) {
+        let Some(preparation) = self.request_preparation(vec![layout]) else {
+            panic!("the native fixture preparation request must be queued");
+        };
+        let ready = preparation.fixture_ready().unwrap_or_else(|error| {
+            panic!(
+                "native trust/table setup did not complete within its 30-second watchdog: {error}"
+            )
+        });
+        assert!(
+            ready,
+            "native trust/table setup completed but rejected the requested layout"
+        );
     }
 
     fn decode(
@@ -419,7 +470,11 @@ fn prepare_tables(
             .get(&layout)
             .is_some_and(|entry| entry.table.is_some());
     }
-    all_ready && Instant::now() < deadline
+    // Report cache readiness independently of the caller's responsiveness
+    // deadline. A native trust call already in progress cannot be cancelled;
+    // its table remains useful after a startup wait expires. The synchronous
+    // production caller still enforces that original deadline.
+    all_ready
 }
 
 fn current_layouts() -> Vec<usize> {
@@ -513,9 +568,49 @@ mod tests {
     }
 
     fn prepare(decoder: &Decoder, layout: usize) {
+        decoder.prepare_fixture(layout);
+    }
+
+    #[test]
+    fn native_decoder_late_readiness_does_not_satisfy_expired_startup_deadline() {
+        let _guard = crate::input::ring_buffer::test_guard();
+        let decoder = Decoder::start().unwrap();
+        let german = german_layout();
+        prepare(&decoder, german);
+        let expired_request = |layout| {
+            let deadline = Instant::now();
+            let (reply, receiver) = mpsc::sync_channel(1);
+            decoder
+                .prepare_sender
+                .try_send(PreparationRequest {
+                    layouts: vec![layout],
+                    deadline,
+                    reply: Some(reply),
+                })
+                .unwrap();
+            PreparationWait { receiver, deadline }
+        };
         assert!(
-            decoder.prepare_many(vec![layout]),
-            "trust and table readiness must finish before the first captured key"
+            !expired_request(german).within_startup_budget(),
+            "a completed table must not turn an expired startup wait into success"
+        );
+        assert!(
+            expired_request(german).fixture_ready().unwrap(),
+            "the same completed table must remain observable to the native fixture"
+        );
+        assert!(
+            !expired_request(0).fixture_ready().unwrap(),
+            "waiting for completion must not accept a rejected keyboard table"
+        );
+        assert_eq!(
+            decode_scan(&decoder, 0x12, german, (1, 2)),
+            DecodeResult::Text("e".to_owned()),
+            "an expired waiter must not discard a ready table or replay missing input"
+        );
+        assert_eq!(
+            decoder.decode(u32::from(b'E'), 0x12, [0; 256], 0, (1, 2)),
+            DecodeResult::Unavailable,
+            "completion acknowledgements must not authorize an unavailable layout"
         );
     }
 

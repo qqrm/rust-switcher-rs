@@ -1,5 +1,5 @@
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
     VIRTUAL_KEY,
 };
 
@@ -53,10 +53,6 @@ fn unicode_events(text: &str) -> Vec<INPUT> {
         .collect()
 }
 
-fn input_struct_size_i32() -> Option<i32> {
-    i32::try_from(std::mem::size_of::<INPUT>()).ok()
-}
-
 /// Constructs one virtual key event for a later input batch.
 fn key_event(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
     INPUT {
@@ -75,17 +71,6 @@ fn key_event(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
             },
         },
     }
-}
-
-fn send_key(vk: VIRTUAL_KEY, key_up: bool) -> bool {
-    let input = key_event(vk, key_up);
-
-    let Some(input_size) = input_struct_size_i32() else {
-        return false;
-    };
-
-    let sent = unsafe { SendInput(&[input], input_size) };
-    usize::try_from(sent).is_ok_and(|n| n != 0)
 }
 
 /// Partial insertion can already change the editor. Its previous journal must
@@ -110,7 +95,6 @@ pub fn replace_selection_unicode(text: &str, target_is_current: impl Fn() -> boo
     for _ in 0..units {
         inputs.extend([key_event(VK_LEFT_KEY, false), key_event(VK_LEFT_KEY, true)]);
     }
-    let shift_index = inputs.len();
     inputs.push(key_event(VK_SHIFT_KEY, false));
     for _ in 0..units {
         inputs.extend([
@@ -119,10 +103,10 @@ pub fn replace_selection_unicode(text: &str, target_is_current: impl Fn() -> boo
         ]);
     }
     inputs.push(key_event(VK_SHIFT_KEY, true));
-    let Some(size) = input_struct_size_i32() else {
+    let Some(delivery) = crate::platform::win::secure_input::DeliveryContext::capture() else {
         return false;
     };
-    let generation = crate::platform::win::secure_input::generation();
+    let generation = delivery.generation();
     // The provider check can outlive a focus change; validate the target after it.
     if !target_is_current()
         || !crate::platform::win::secure_input::protect_current_context().is_allowed()
@@ -131,12 +115,9 @@ pub fn replace_selection_unicode(text: &str, target_is_current: impl Fn() -> boo
     {
         return false;
     }
-    let sent = unsafe { SendInput(&inputs, size) } as usize;
+    let (sent, accepted) = super::input_delivery::submit(&mut inputs, delivery);
     let complete = complete_input_submission(sent, inputs.len(), generation);
-    if sent > shift_index && sent < inputs.len() {
-        let _ = send_key(VK_SHIFT_KEY, true);
-    }
-    complete
+    complete && accepted
 }
 
 /// Replace the journal's suffix in one input batch. Physical input cannot be
@@ -176,10 +157,10 @@ pub fn replace_before_caret(
         inputs.extend(unicode_events(converted));
         inputs.extend(unicode_events(suffix_text));
     }
-    let Some(size) = input_struct_size_i32() else {
+    let Some(delivery) = crate::platform::win::secure_input::DeliveryContext::capture() else {
         return false;
     };
-    let generation = crate::platform::win::secure_input::generation();
+    let generation = delivery.generation();
     if !target_is_current()
         || !crate::platform::win::secure_input::protect_current_context().is_allowed()
         || !target_is_current()
@@ -187,8 +168,8 @@ pub fn replace_before_caret(
     {
         return false;
     }
-    let sent = unsafe { SendInput(&inputs, size) } as usize;
-    complete_input_submission(sent, inputs.len(), generation)
+    let (sent, accepted) = super::input_delivery::submit(&mut inputs, delivery);
+    complete_input_submission(sent, inputs.len(), generation) && accepted
 }
 
 #[cfg(test)]

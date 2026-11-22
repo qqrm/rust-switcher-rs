@@ -24,12 +24,26 @@ public sealed class ProbeTrap : NativeWindow {
     private readonly IntPtr other;
     private readonly string signal;
     private readonly Timer timer = new Timer();
+    private delegate IntPtr KeyboardHook(int code, IntPtr w, IntPtr l);
+    private readonly KeyboardHook deliveryCallback;
+    private IntPtr deliveryHook;
+    [StructLayout(LayoutKind.Sequential)] private struct KeyboardEvent {
+        public uint key, scan, flags, time;
+        public UIntPtr extra;
+    }
+    [DllImport("user32.dll", EntryPoint="SetWindowsHookExW", SetLastError=true)]
+    private static extern IntPtr SetWindowsHookEx(int kind, KeyboardHook callback, IntPtr module, uint thread);
+    [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] private static extern IntPtr GetFocus();
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr GetModuleHandle(string name);
     [DllImport("user32.dll", EntryPoint="SendMessageW")] private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr w, IntPtr l);
     [DllImport("user32.dll", EntryPoint="GetWindowTextW", ExactSpelling=true, CharSet=CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
     [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr window);
     public ProbeTrap(IntPtr editor, IntPtr otherEditor, string signalPath) {
         AssignHandle(editor); other = otherEditor; signal = signalPath;
+        deliveryCallback = BeforeReplacementDelivery;
         timer.Interval = 40;
         timer.Tick += delegate {
             timer.Stop();
@@ -39,6 +53,37 @@ public sealed class ProbeTrap : NativeWindow {
             if (triggeredMode == 2) SetFocus(other);
             System.IO.File.WriteAllText(signal, "changed-" + triggeredMode);
         };
+    }
+    public void ReleaseDeliveryHook() {
+        if (deliveryHook != IntPtr.Zero) {
+            UnhookWindowsHookEx(deliveryHook);
+            deliveryHook = IntPtr.Zero;
+        }
+    }
+    private IntPtr BeforeReplacementDelivery(int code, IntPtr w, IntPtr l) {
+        if (code == 0 && mode == 4 && w.ToInt64() == 0x100) {
+            var key = (KeyboardEvent)Marshal.PtrToStructure(l, typeof(KeyboardEvent));
+            ulong marker = key.extra.ToUInt64();
+            // Match the production replacement-batch namespace, not unrelated
+            // injected Delete keys or Switcher's modifier-cleanup marker.
+            if (key.key == 0x2E && (key.flags & 0x10) != 0 &&
+                marker > 0xD5000000UL && marker <= 0xD5FFFFFFUL && GetFocus() == Handle) {
+                // This hook is installed after Switcher's. The replacement has
+                // already passed its final checks and reached SendInput, but
+                // Switcher's delivery filter has not seen the first Delete.
+                mode = 0;
+                SetFocus(other);
+                try {
+                    System.IO.File.WriteAllText(signal,
+                        GetFocus() == other ? "delivery-4" : "delivery-focus-failed");
+                } catch (System.IO.IOException) {
+                    // The runner requires the exact signal, so failed fixture
+                    // reporting is a setup failure, never a passing regression.
+                }
+                ReleaseDeliveryHook();
+            }
+        }
+        return CallNextHookEx(deliveryHook, code, w, l);
     }
     protected override void WndProc(ref Message message) {
         // Password setup and the oracle run inside the owning fixture process.
@@ -83,7 +128,16 @@ public sealed class ProbeTrap : NativeWindow {
         }
         if (message.Msg == 0x8011) {
             timer.Stop();
+            ReleaseDeliveryHook();
             mode = message.WParam.ToInt32();
+            if (mode == 4) {
+                deliveryHook = SetWindowsHookEx(13, deliveryCallback, GetModuleHandle(null), 0);
+                if (deliveryHook == IntPtr.Zero) {
+                    mode = 0;
+                    message.Result = IntPtr.Zero;
+                    return;
+                }
+            }
             if (mode == 3) {
                 System.IO.File.WriteAllText(signal, "blocked");
                 System.Threading.Thread.Sleep(3000);
@@ -108,4 +162,6 @@ $other = [EditorFixture]::CreateWindowEx(0x200, 'EDIT', 'untouched',
 if ($other -eq [IntPtr]::Zero) { throw 'Secondary Edit fixture creation failed' }
 $trap = [ProbeTrap]::new($editor, $other, $env:RUST_SWITCHER_E2E_SIGNAL_PATH)
 [System.Windows.Forms.Clipboard]::SetText('switcher-clipboard-sentinel')
-try { [System.Windows.Forms.Application]::Run($form) } finally { $trap.ReleaseHandle(); $form.Dispose() }
+try { [System.Windows.Forms.Application]::Run($form) } finally {
+    $trap.ReleaseDeliveryHook(); $trap.ReleaseHandle(); $form.Dispose()
+}

@@ -3156,12 +3156,10 @@ mod tests {
         // No activation flag: decoding uses this explicit layout without requiring foreground focus.
         let layout = unsafe { LoadKeyboardLayoutW(name, Default::default()) }
             .expect("the native test keyboard layout must load");
-        // Match startup preparation before the hook is installed. No keystroke
-        // is consumed here: the following assertion still checks the first one.
-        assert!(
-            layout_decode::prepare_layout(layout.0 as usize),
-            "the native test layout must be prepared before input capture"
-        );
+        // Await real fixture readiness before testing capture. The production
+        // startup deadline separately bounds responsiveness; cold OS signature
+        // verification can finish later. No keystroke is consumed here.
+        layout_decode::prepare_fixture_layout(layout.0 as usize);
         layout
     }
 

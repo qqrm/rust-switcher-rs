@@ -10,7 +10,8 @@ $DebugExe = (Resolve-Path -LiteralPath $DebugExe).Path
 $sourceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../src')).Path
 $paths = @(
     (Join-Path $sourceRoot 'domain/text/selection_probe.rs'),
-    (Join-Path $sourceRoot 'platform/win/secure_input.rs')
+    (Join-Path $sourceRoot 'platform/win/secure_input.rs'),
+    (Join-Path $sourceRoot 'conversion/input_delivery.rs')
 )
 $original = @{}
 foreach ($path in $paths) { $original[$path] = [System.IO.File]::ReadAllBytes($path) }
@@ -26,13 +27,13 @@ function Add-GuardMutation([string]$Text, [string]$Pattern, [string]$ReturnValue
         return $match.Value + "`n    if std::hint::black_box(true) { return $ReturnValue; }"
     }, 1)
 }
-function Invoke-TargetRunner([string]$Exe, [bool]$ExpectViolation) {
+function Invoke-TargetRunner([string]$Exe, [bool]$ExpectViolation, [string]$Race) {
     $info = [System.Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
-    foreach ($argument in @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'run-target-regression.ps1'), '-Exe', $Exe)) {
+    foreach ($argument in @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'run-target-regression.ps1'), '-Exe', $Exe, '-Race', $Race)) {
         $info.ArgumentList.Add($argument)
     }
     $process = [System.Diagnostics.Process]::Start($info)
@@ -59,18 +60,22 @@ function Invoke-TargetRunner([string]$Exe, [bool]$ExpectViolation) {
 }
 
 try {
-    Invoke-TargetRunner $DebugExe $false
+    Invoke-TargetRunner $DebugExe $false 'SourceRead'
+    Invoke-TargetRunner $DebugExe $false 'Delivery'
     try {
         $selection = [System.Text.Encoding]::UTF8.GetString($original[$paths[0]])
         $selection = Add-GuardMutation $selection '(?m)^\s*pub\(super\) fn is_current\(self\) -> bool \{' 'true'
         $context = [System.Text.Encoding]::UTF8.GetString($original[$paths[1]])
         $context = Add-GuardMutation $context '(?m)^fn active_command_is_current\(\) -> bool \{' 'true'
         $context = Add-GuardMutation $context '(?m)^pub\(crate\) fn protect_current_context\(\) -> Status \{' 'Status::Verified'
-        # Remove the overlapping source-target and command-origin checks together.
+        $delivery = [System.Text.Encoding]::UTF8.GetString($original[$paths[2]])
+        $delivery = Add-GuardMutation $delivery '(?m)^fn context_is_current\(context: DeliveryContext\) -> bool \{' 'true'
+        # Remove the overlapping source-target, command-origin and delivery checks together.
         # This deliberately broken build represents wrong-target delivery; it
         # does not claim each individual guard is independently necessary.
         [System.IO.File]::WriteAllText($paths[0], $selection, [System.Text.UTF8Encoding]::new($false))
         [System.IO.File]::WriteAllText($paths[1], $context, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText($paths[2], $delivery, [System.Text.UTF8Encoding]::new($false))
         cargo +nightly build --locked --bin rust-switcher-debug --features debug-tracing,debug-binary
         if ($LASTEXITCODE -ne 0) { throw 'The intentional target-ownership mutation did not compile' }
         Copy-Item -LiteralPath $DebugExe -Destination $mutantExe
@@ -79,8 +84,9 @@ try {
         cargo +nightly build --locked --bin rust-switcher-debug --features debug-tracing,debug-binary
         if ($LASTEXITCODE -ne 0) { throw 'Could not restore the original executable after target mutation' }
     }
-    Invoke-TargetRunner $mutantExe $true
-    Write-Output 'PASS: target-ownership mutation caused a real write into the wrong native field and was rejected'
+    Invoke-TargetRunner $mutantExe $true 'SourceRead'
+    Invoke-TargetRunner $mutantExe $true 'Delivery'
+    Write-Output 'PASS: target-ownership mutation caused wrong-field writes before submission and during delivery; both were rejected'
 } finally {
     foreach ($path in $paths) {
         if ([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($path)) -ne [Convert]::ToBase64String($original[$path])) {
