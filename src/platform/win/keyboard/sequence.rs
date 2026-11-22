@@ -1,16 +1,17 @@
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, WPARAM},
-    UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer, WM_HOTKEY},
+    Foundation::HWND,
+    UI::WindowsAndMessaging::{KillTimer, SetTimer},
 };
 
 use crate::{
-    app::{DeferredSequenceHotkey, HotkeySlot},
+    app::{DeferredSequenceHotkey, HotkeySlot, PendingRuntimeCommand, RuntimeCommand},
     config,
     input::hotkeys::{
         HK_CONVERT_LAST_SEQUENCE_ID, HK_CONVERT_LAST_WORD_ID, HK_CONVERT_SELECTION_ID,
         HK_PAUSE_TOGGLE_ID, HK_SMART_CONVERT_LAST_SEQUENCE_ID, HK_SMART_CONVERT_LAST_WORD_ID,
-        HK_SMART_CONVERT_SELECTION_ID, HK_SWITCH_LAYOUT_ID,
+        HK_SMART_CONVERT_SELECTION_ID, HK_SWITCH_LAYOUT_ID, action_from_id,
     },
+    platform::win::secure_input::CommandContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,10 +113,7 @@ fn sequence_chords(seq: config::HotkeySequence) -> [Option<config::HotkeyChord>;
     [Some(seq.first), seq.second, seq.third]
 }
 
-fn sequence_has_prefix(
-    longer: config::HotkeySequence,
-    prefix: config::HotkeySequence,
-) -> bool {
+fn sequence_has_prefix(longer: config::HotkeySequence, prefix: config::HotkeySequence) -> bool {
     let longer_chords = sequence_chords(longer);
     let prefix_chords = sequence_chords(prefix);
     let prefix_len = sequence_chord_count(prefix);
@@ -218,7 +216,7 @@ pub(crate) fn take_deferred_sequence_disambiguated_by_chord(
     state: &mut crate::app::AppState,
     chord: config::HotkeyChord,
     now_ms: u64,
-) -> Option<HotkeySlot> {
+) -> Option<DeferredSequenceHotkey> {
     let deferred = state.deferred_sequence_hotkey?;
     if !chord_can_match_any_sequence_now(state, chord, now_ms) {
         return None;
@@ -228,18 +226,24 @@ pub(crate) fn take_deferred_sequence_disambiguated_by_chord(
     }
 
     state.deferred_sequence_hotkey = None;
-    Some(deferred.slot)
+    Some(deferred)
 }
 
-pub(crate) fn post_hotkey(hwnd: HWND, id: i32) -> windows::core::Result<()> {
-    let id_usize = usize::try_from(id).map_err(|_| {
-        windows::core::Error::new(
-            windows::core::HRESULT(0x8007_0057_u32.cast_signed()),
-            "hotkey id must be non-negative",
-        )
-    })?;
-
-    unsafe { PostMessageW(Some(hwnd), WM_HOTKEY, WPARAM(id_usize), LPARAM(0)) }
+fn post_hotkey(
+    hwnd: HWND,
+    state: &mut crate::app::AppState,
+    id: i32,
+    context: Option<CommandContext>,
+) {
+    if let Some(action) = action_from_id(id) {
+        // The low-level hook already owns AppState. Queue the original target
+        // now; a bare WM_HOTKEY message would recapture focus after a later Tab.
+        super::super::enqueue_stamped_runtime_command(
+            hwnd,
+            state,
+            PendingRuntimeCommand::new(RuntimeCommand::Hotkey(action), context),
+        );
+    }
 }
 
 pub(crate) fn try_match_sequence(
@@ -352,7 +356,10 @@ pub(crate) fn try_match_any_sequence_slot(
 
         if has_longer_waiting_prefix {
             let delay_ms = deferred_sequence_delay_ms(triggered_seq);
-            state.deferred_sequence_hotkey = Some(DeferredSequenceHotkey { slot: triggered });
+            state.deferred_sequence_hotkey = Some(DeferredSequenceHotkey {
+                slot: triggered,
+                context: None,
+            });
             return SequenceMatch::Pending(triggered, delay_ms);
         }
 
@@ -374,17 +381,35 @@ pub(crate) fn try_match_any_sequence(
     chord: config::HotkeyChord,
     now_ms: u64,
 ) -> windows::core::Result<bool> {
-    if let Some(slot) = take_deferred_sequence_disambiguated_by_chord(state, chord, now_ms) {
+    try_match_any_sequence_with_context(hwnd, state, chord, now_ms, CommandContext::capture)
+}
+
+fn try_match_any_sequence_with_context(
+    hwnd: HWND,
+    state: &mut crate::app::AppState,
+    chord: config::HotkeyChord,
+    now_ms: u64,
+    capture_context: impl FnOnce() -> Option<CommandContext>,
+) -> windows::core::Result<bool> {
+    if let Some(deferred) = take_deferred_sequence_disambiguated_by_chord(state, chord, now_ms) {
         unsafe {
             let _ = KillTimer(Some(hwnd), DEFERRED_SEQUENCE_TIMER_ID);
         }
-        post_hotkey(hwnd, hotkey_id_for_slot(slot))?;
+        post_hotkey(
+            hwnd,
+            state,
+            hotkey_id_for_slot(deferred.slot),
+            deferred.context,
+        );
     }
 
     match try_match_any_sequence_slot(state, chord, now_ms) {
         SequenceMatch::NoMatch => Ok(false),
         SequenceMatch::Consumed => Ok(true),
         SequenceMatch::Pending(_, delay_ms) => {
+            if let Some(deferred) = &mut state.deferred_sequence_hotkey {
+                deferred.context = capture_context();
+            }
             unsafe {
                 let _ = KillTimer(Some(hwnd), DEFERRED_SEQUENCE_TIMER_ID);
                 let _ = SetTimer(Some(hwnd), DEFERRED_SEQUENCE_TIMER_ID, delay_ms, None);
@@ -393,7 +418,7 @@ pub(crate) fn try_match_any_sequence(
         }
         SequenceMatch::Triggered(slot) => {
             clear_deferred_sequence(hwnd, state);
-            post_hotkey(hwnd, hotkey_id_for_slot(slot))?;
+            post_hotkey(hwnd, state, hotkey_id_for_slot(slot), capture_context());
             Ok(true)
         }
     }
@@ -410,7 +435,13 @@ pub(crate) fn handle_deferred_sequence_timer(
         return Ok(());
     };
     clear_all_sequence_progress(state);
-    post_hotkey(hwnd, hotkey_id_for_slot(deferred.slot))
+    post_hotkey(
+        hwnd,
+        state,
+        hotkey_id_for_slot(deferred.slot),
+        deferred.context,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -461,6 +492,163 @@ mod tests {
         AppState {
             active_hotkey_sequences: sequences,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn double_shift_queue_preserves_recognition_target_across_navigation() {
+        let _guard = crate::input::ring_buffer::test_guard();
+        let chord = modifier_only_chord(MOD_SHIFT.0, MODVK_LSHIFT);
+        let mut state = state_with_sequences(HotkeySequenceValues {
+            last_word: Some(double_modifier_sequence(MOD_SHIFT.0, MODVK_LSHIFT)),
+            ..Default::default()
+        });
+        let origin = CommandContext::for_test(
+            crate::input::ring_buffer::secure_input_generation(),
+            101,
+            1_001,
+        );
+        assert!(
+            try_match_any_sequence_with_context(
+                HWND::default(),
+                &mut state,
+                chord,
+                100,
+                || panic!("first chord is not a command")
+            )
+            .unwrap()
+        );
+        assert!(
+            try_match_any_sequence_with_context(HWND::default(), &mut state, chord, 200, || Some(
+                origin
+            ))
+            .unwrap()
+        );
+        assert_eq!(state.pending_runtime_commands.len(), 1);
+        let pending = state.pending_runtime_commands[0];
+        assert_eq!(pending.context, Some(origin));
+        assert!(pending.has_current_context(|context| context.is_current_with(|| true)));
+
+        // Tab can move between browser descendants with the same native HWND.
+        crate::platform::win::secure_input::invalidate_context();
+        let pending = state.pending_runtime_commands.pop_front().unwrap();
+        assert!(!pending.has_current_context(|context| context.is_current_with(|| true)));
+
+        let next_origin = CommandContext::for_test(
+            crate::input::ring_buffer::secure_input_generation(),
+            101,
+            1_001,
+        );
+        assert!(
+            try_match_any_sequence_with_context(HWND::default(), &mut state, chord, 1_500, || None)
+                .unwrap()
+        );
+        assert!(
+            try_match_any_sequence_with_context(
+                HWND::default(),
+                &mut state,
+                chord,
+                1_600,
+                || Some(next_origin)
+            )
+            .unwrap()
+        );
+        let fresh = state.pending_runtime_commands.pop_front().unwrap();
+        assert_eq!(fresh.context, Some(next_origin));
+        assert!(fresh.has_current_context(|context| context.is_current_with(|| true)));
+    }
+
+    #[test]
+    fn deferred_double_shift_keeps_origin_until_timeout_after_tab() {
+        let _guard = crate::input::ring_buffer::test_guard();
+        let chord = modifier_only_chord(MOD_SHIFT.0, MODVK_LSHIFT);
+        let mut state = state_with_sequences(HotkeySequenceValues {
+            last_word: Some(double_modifier_sequence(MOD_SHIFT.0, MODVK_LSHIFT)),
+            smart_last_word: Some(triple_modifier_sequence(MOD_SHIFT.0, MODVK_LSHIFT)),
+            ..Default::default()
+        });
+        let origin = CommandContext::for_test(
+            crate::input::ring_buffer::secure_input_generation(),
+            101,
+            1_001,
+        );
+        try_match_any_sequence_with_context(HWND::default(), &mut state, chord, 100, || None)
+            .unwrap();
+        try_match_any_sequence_with_context(HWND::default(), &mut state, chord, 200, || {
+            Some(origin)
+        })
+        .unwrap();
+        assert!(state.pending_runtime_commands.is_empty());
+        assert_eq!(
+            state.deferred_sequence_hotkey.unwrap().context,
+            Some(origin)
+        );
+        crate::platform::win::secure_input::invalidate_context();
+        handle_deferred_sequence_timer(HWND::default(), &mut state).unwrap();
+        let pending = state.pending_runtime_commands.pop_front().unwrap();
+        assert_eq!(pending.context, Some(origin));
+        assert!(!pending.has_current_context(|context| context.is_current_with(|| true)));
+    }
+
+    #[test]
+    fn disambiguating_chord_does_not_rebind_deferred_double_shift() {
+        let _guard = crate::input::ring_buffer::test_guard();
+        let shift = modifier_only_chord(MOD_SHIFT.0, MODVK_LSHIFT);
+        let alt = modifier_only_chord(MOD_ALT.0, MODVK_LALT);
+        let mut state = state_with_sequences(HotkeySequenceValues {
+            last_word: Some(double_modifier_sequence(MOD_SHIFT.0, MODVK_LSHIFT)),
+            smart_last_word: Some(triple_modifier_sequence(MOD_SHIFT.0, MODVK_LSHIFT)),
+            last_sequence: Some(double_modifier_sequence(MOD_ALT.0, MODVK_LALT)),
+            ..Default::default()
+        });
+        let origin = CommandContext::for_test(
+            crate::input::ring_buffer::secure_input_generation(),
+            101,
+            1_001,
+        );
+        try_match_any_sequence_with_context(HWND::default(), &mut state, shift, 100, || None)
+            .unwrap();
+        try_match_any_sequence_with_context(HWND::default(), &mut state, shift, 200, || {
+            Some(origin)
+        })
+        .unwrap();
+        crate::platform::win::secure_input::invalidate_context();
+        try_match_any_sequence_with_context(HWND::default(), &mut state, alt, 300, || {
+            panic!("deferred origin must not be recaptured")
+        })
+        .unwrap();
+        let pending = state.pending_runtime_commands.pop_front().unwrap();
+        assert_eq!(pending.context, Some(origin));
+        assert!(!pending.has_current_context(|context| context.is_current_with(|| true)));
+    }
+
+    #[test]
+    fn pause_and_layout_sequences_are_queued_even_without_a_text_target() {
+        for (slot, expected_action) in [
+            (
+                HotkeySlot::Pause,
+                crate::input::hotkeys::HotkeyAction::PauseToggle,
+            ),
+            (
+                HotkeySlot::SwitchLayout,
+                crate::input::hotkeys::HotkeyAction::SwitchLayout,
+            ),
+        ] {
+            let mut state = state_with_sequences(HotkeySequenceValues {
+                pause: (slot == HotkeySlot::Pause)
+                    .then_some(double_modifier_sequence(MOD_CONTROL.0, MODVK_RCTRL)),
+                switch_layout: (slot == HotkeySlot::SwitchLayout)
+                    .then_some(double_modifier_sequence(MOD_CONTROL.0, MODVK_RCTRL)),
+                ..Default::default()
+            });
+            let chord = modifier_only_chord(MOD_CONTROL.0, MODVK_RCTRL);
+            try_match_any_sequence_with_context(HWND::default(), &mut state, chord, 100, || None)
+                .unwrap();
+            try_match_any_sequence_with_context(HWND::default(), &mut state, chord, 200, || None)
+                .unwrap();
+            let pending = state.pending_runtime_commands.pop_front().unwrap();
+            assert_eq!(pending.command, RuntimeCommand::Hotkey(expected_action));
+            assert!(pending.context.is_none());
         }
     }
 
@@ -807,7 +995,8 @@ mod tests {
             SequenceMatch::Pending(HotkeySlot::LastWord, DEFERRED_SEQUENCE_DISAMBIGUATION_MS)
         );
         assert_eq!(
-            take_deferred_sequence_disambiguated_by_chord(&mut state, left_alt, 300),
+            take_deferred_sequence_disambiguated_by_chord(&mut state, left_alt, 300)
+                .map(|deferred| deferred.slot),
             Some(HotkeySlot::LastWord)
         );
         assert_eq!(
@@ -834,7 +1023,8 @@ mod tests {
             SequenceMatch::Pending(HotkeySlot::LastWord, DEFERRED_SEQUENCE_DISAMBIGUATION_MS)
         );
         assert_eq!(
-            take_deferred_sequence_disambiguated_by_chord(&mut state, chord, 300),
+            take_deferred_sequence_disambiguated_by_chord(&mut state, chord, 300)
+                .map(|deferred| deferred.slot),
             None
         );
         assert_eq!(
@@ -869,7 +1059,8 @@ mod tests {
             SequenceMatch::Pending(HotkeySlot::LastWord, DEFERRED_SEQUENCE_DISAMBIGUATION_MS)
         );
         assert_eq!(
-            take_deferred_sequence_disambiguated_by_chord(&mut state, letter_a, 300),
+            take_deferred_sequence_disambiguated_by_chord(&mut state, letter_a, 300)
+                .map(|deferred| deferred.slot),
             None
         );
         assert_eq!(

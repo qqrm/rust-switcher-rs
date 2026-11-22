@@ -27,6 +27,14 @@ pub(super) fn read(hwnd: HWND, selector: usize) -> LRESULT {
             LRESULT(isize::from(unavailable))
         };
     }
+    if matches!(selector, 7 | 8) {
+        let Some((foreground, focus)) = super::secure_input::fixture_readiness::observed_handles()
+        else {
+            return LRESULT(0);
+        };
+        let handle = if selector == 7 { foreground } else { focus };
+        return LRESULT(handle as isize);
+    }
     // Observing a counter must not drain a worker, classify a field or clear a
     // journal: otherwise the test could hide transient password capture.
     let (active, cached, captured) = crate::input::ring_buffer::secure_input_test_metadata();

@@ -1,6 +1,6 @@
 # Rust Switcher privacy policy
 
-Last updated: November 14, 2026. This policy describes Rust Switcher,
+Last updated: November 21, 2026. This policy describes Rust Switcher,
 published by [QQRM](https://github.com/qqrm), including its portable Windows
 release. It covers the application itself; GitHub, package managers, Windows,
 and applications in which you type have their own data handling practices.
@@ -38,20 +38,19 @@ Converted text is sent back to the focused application using simulated
 keyboard input. That application may store or transmit it according to its
 own settings and policies.
 
-Rust Switcher excludes recognized password fields from its input journal and
-text conversion. Standard Windows Edit/RichEdit password styles and the focused
-control's UI Automation `IsPassword` property are checked without reading the
-password. Custom controls are supported when their accessibility provider
-correctly exposes that property. A missing property, unavailable provider,
-timeout, or obsolete focus result blocks capture and conversion; ordinary typing
-and layout switching remain available. Password detection clears the active
-journal, all cached journals, and pending decoder composition.
+Rust Switcher can retain and convert text typed in password fields. Password
+metadata is not a capture or conversion permission, and there is no setting
+that excludes passwords from the journal. Input stays local and is not written
+to diagnostic logs. Native password selections use the native text interface;
+browser password fields that withhold text or expose masks use captured typing
+for word/sequence conversion. Unobserved or autofilled passwords may have no
+usable journal. Ordinary typing and layout switching remain available.
 
 An immediate focus change can also prevent an ordinary input segment from being
 captured when its field cannot be identified in time. In that case last-word and
 sequence conversion leave the text unchanged; they do not reuse a partial
 history. Explicit selection conversion can read and validate the visible text
-once the ordinary field is identified. See [focus-change behavior](docs/security.md#immediate-focus-changes).
+once the field is identified. See [input-ownership behavior](docs/security.md#commands-belong-to-the-original-input-context).
 
 UI Automation runs on a separate worker. The keyboard hook can briefly queue
 bounded raw keyboard snapshots for validation before decoding and journal
@@ -60,9 +59,9 @@ metadata, and can therefore represent sensitive input. They are not written to
 disk or diagnostic logs, are discarded on rejection or expiry, and are not sent
 to the UI Automation provider. Clearing memory does not securely overwrite it.
 
-An application that incorrectly reports a password field as ordinary text,
-unreported focus changes, and focus changes between the final check and Windows
-input delivery remain limitations. This is a best-effort application safeguard,
+Unreported focus changes and changes between the final check and Windows input
+delivery remain limitations. Sequence shortcuts retain their original input
+context so navigation can cancel stale conversions. This is a best-effort safeguard,
 not a security boundary against other software running under the same account.
 See [security behavior and tests](docs/security.md).
 
