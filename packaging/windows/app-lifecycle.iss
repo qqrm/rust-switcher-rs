@@ -211,15 +211,18 @@ begin
   Log('[lifecycle] Default installation directory: ' + Result);
 end;
 
-procedure LifecycleReleaseHandles(var Handles: TLifecycleHandles);
+{ Transfer dynamic arrays through function results and explicit assignments.
+  Resizing a nested var-array parameter did not update its owner in Inno 6.7.1.
+  Release also returns an empty list so no owner retains closed handle values. }
+function LifecycleReleaseHandles(Handles: TLifecycleHandles): TLifecycleHandles;
 var
   Index: Integer;
 begin
   for Index := 0 to GetArrayLength(Handles) - 1 do LifecycleCloseHandle(Handles[Index]);
-  SetArrayLength(Handles, 0);
+  SetArrayLength(Result, 0);
 end;
 
-procedure LifecycleCapture(const Target: String; var Handles: TLifecycleHandles);
+function LifecycleCapture(const Target: String): TLifecycleHandles;
 var
   Ids: TLifecycleProcessIds;
   Needed, Session, CurrentSession, Size, WaitResult: Cardinal;
@@ -228,7 +231,7 @@ var
   Buffer, CanonicalTarget: String;
 begin
   Log('[lifecycle] Process capture: begin; target=' + Target);
-  SetArrayLength(Handles, 0);
+  SetArrayLength(Result, 0);
   CanonicalTarget := LifecycleCanonicalPath(Target);
   Log('[lifecycle] Process capture: canonical target=' + CanonicalTarget);
   if CanonicalTarget = '' then Exit;
@@ -256,9 +259,9 @@ begin
           end;
           if WaitResult = LifecycleWaitTimeout then begin
             Log('[lifecycle] Process capture: retained PID=' + IntToStr(Ids[Index]));
-            Count := GetArrayLength(Handles);
-            SetArrayLength(Handles, Count + 1);
-            Handles[Count] := Handle;
+            Count := GetArrayLength(Result);
+            SetArrayLength(Result, Count + 1);
+            Result[Count] := Handle;
             Handle := 0;
           end;
         end;
@@ -267,13 +270,13 @@ begin
     end;
   except
     Log('[lifecycle] Process capture: failed; ' + GetExceptionMessage);
-    LifecycleReleaseHandles(Handles);
+    Result := LifecycleReleaseHandles(Result);
     RaiseException(GetExceptionMessage);
   end;
-  Log('[lifecycle] Process capture: complete; handles=' + IntToStr(GetArrayLength(Handles)));
+  Log('[lifecycle] Process capture: complete; handles=' + IntToStr(GetArrayLength(Result)));
 end;
 
-procedure LifecycleStop(const Target: String; var Handles: TLifecycleHandles);
+procedure LifecycleStop(const Target: String; Handles: TLifecycleHandles);
 var
   Index, ResultCode: Integer;
   WaitResult, ProcessId: Cardinal;
@@ -448,7 +451,7 @@ begin
   Log('[lifecycle] Restart: launch returned; waiting for exactly one installed process');
   Result := False;
   for Attempt := 1 to 100 do begin
-    LifecycleCapture(Target, Handles);
+    Handles := LifecycleCapture(Target);
     try
       if GetArrayLength(Handles) = 1 then begin
         Result := LifecycleWait(Handles[0], 1000) = LifecycleWaitTimeout;
@@ -456,7 +459,7 @@ begin
         Exit;
       end;
     finally
-      LifecycleReleaseHandles(Handles);
+      Handles := LifecycleReleaseHandles(Handles);
     end;
     Sleep(50);
   end;
@@ -566,7 +569,8 @@ begin
         end;
       end;
       Log('[lifecycle] PrepareToInstall: capturing running application');
-      LifecycleCapture(LifecycleTarget, LifecycleHandles);
+      LifecycleHandles := LifecycleCapture(LifecycleTarget);
+      Log('[lifecycle] PrepareToInstall: received handles=' + IntToStr(GetArrayLength(LifecycleHandles)));
       LifecycleWasRunning := GetArrayLength(LifecycleHandles) > 0;
       if LifecycleWasRunning then LifecycleRetainLaunchToken(LifecycleHandles[0]);
       LifecyclePrepared := True;
@@ -574,11 +578,11 @@ begin
     end;
     Log('[lifecycle] PrepareToInstall: stopping captured application');
     LifecycleStop(LifecycleTarget, LifecycleHandles);
-    LifecycleReleaseHandles(LifecycleHandles);
+    LifecycleHandles := LifecycleReleaseHandles(LifecycleHandles);
     Log('[lifecycle] PrepareToInstall: complete');
   except
     Log('[lifecycle] PrepareToInstall: failed; ' + GetExceptionMessage);
-    if not LifecyclePrepared then LifecycleReleaseHandles(LifecycleHandles);
+    if not LifecyclePrepared then LifecycleHandles := LifecycleReleaseHandles(LifecycleHandles);
     Result := GetExceptionMessage;
   end;
 end;
@@ -624,7 +628,7 @@ var
 begin
   Log('[lifecycle] DeinitializeSetup: begin');
   try
-    LifecycleReleaseHandles(LifecycleHandles);
+    LifecycleHandles := LifecycleReleaseHandles(LifecycleHandles);
     if not LifecyclePrepared or LifecycleCompleted then Exit;
   Log('[lifecycle] Rollback: begin');
   { Inno rolls its transaction back on installation failure. The private copy
@@ -632,7 +636,7 @@ begin
   if (LifecycleBackup <> '') and FileExists(LifecycleBackup) then begin
     Log('[lifecycle] Rollback: checking application hash');
     if not FileExists(LifecycleTarget) or (GetSHA256OfFile(LifecycleTarget) <> LifecycleOldHash) then begin
-      LifecycleCapture(LifecycleTarget, Handles);
+      Handles := LifecycleCapture(LifecycleTarget);
       try
         LifecycleStop(LifecycleTarget, Handles);
         Log('[lifecycle] Rollback: restoring application backup');
@@ -640,7 +644,7 @@ begin
           RaiseException('The previous executable could not be restored after installation failure.');
         Log('[lifecycle] Rollback: application restored');
       finally
-        LifecycleReleaseHandles(Handles);
+        Handles := LifecycleReleaseHandles(Handles);
       end;
     end;
     Log('[lifecycle] Rollback: restoring registration');
@@ -663,13 +667,13 @@ begin
   end;
   Log('[lifecycle] Rollback: restoring previous running state if needed');
   if LifecycleWasRunning then begin
-    LifecycleCapture(LifecycleTarget, Handles);
+    Handles := LifecycleCapture(LifecycleTarget);
     try
       if GetArrayLength(Handles) = 0 then
         if not LifecycleStart(LifecycleTarget) then
           RaiseException('The previous application could not be restarted after installation failure.');
     finally
-      LifecycleReleaseHandles(Handles);
+      Handles := LifecycleReleaseHandles(Handles);
     end;
   end;
   Log('[lifecycle] Rollback: complete');
@@ -698,11 +702,11 @@ begin
   if CurUninstallStep <> usUninstall then Exit;
   Target := ExpandConstant('{app}\{#AppExeName}');
   Log('[lifecycle] Uninstall: capturing and stopping application; target=' + Target);
-  LifecycleCapture(Target, Handles);
+  Handles := LifecycleCapture(Target);
   try
     LifecycleStop(Target, Handles);
   finally
-    LifecycleReleaseHandles(Handles);
+    Handles := LifecycleReleaseHandles(Handles);
   end;
   Log('[lifecycle] Uninstall: removing owned autostart entry and alias');
   ExpectedCommand := '"' + Target + '"';

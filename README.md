@@ -159,6 +159,16 @@ tooltip and retries briefly if the shell is not ready yet.
 
 This project includes a ready-to-use `bacon.toml` for a fast development loop.
 
+### Windows acceptance checks
+
+CI and release preparation exercise the actual autostart command and WinGet
+upgrades on a disposable Windows runner. Candidate installers are served by an
+isolated trusted REST source generated from the production manifests; WinGet
+still performs package selection and hash verification. The source's HTTPS and
+protocol tests are required before package-manager acceptance. See the
+[E2E coverage and setup](scripts/e2e/README.md#autostart-and-package-manager-updates)
+for prerequisites, temporary certificate handling and the limits of these checks.
+
 ### Bacon hotkeys (from `bacon.toml`)
 
 * `d` dev-long

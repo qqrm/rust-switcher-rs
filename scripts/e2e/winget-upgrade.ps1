@@ -3,8 +3,9 @@
 Acceptance test for the actual package-manager path on a disposable Windows VM.
 The baseline comes from the public WinGet source. Candidate manifests are copied
 from the production packaging output; only their download URL and hash change.
-Local manifests exercise WinGet selection, the installer, and installed ARP state.
-They do not exercise publication or writing the source's tracking catalog.
+A temporary explicit trusted REST source exercises package selection, download,
+installer execution, source tracking and installed ARP state. Its metadata comes
+from the generated production manifests; it does not publish to the public index.
 #>
 [CmdletBinding()]
 param(
@@ -16,6 +17,7 @@ param(
     [string]$LegacyVersion,
     [string]$BuildScriptPath,
     [string]$ManagedUpdaterTestPath = (Join-Path $PSScriptRoot 'installer-updater.ps1'),
+    [string]$SourceServerScriptPath = (Join-Path $PSScriptRoot 'winget-test-source.py'),
     [string]$ReportDirectory
 )
 
@@ -46,7 +48,8 @@ $uninstallRoot = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
 $runRegistryPath = 'Software\Microsoft\Windows\CurrentVersion\Run'
 if (-not $LegacyVersion) { $LegacyVersion = $applicationInfo.Baseline }
 if (-not $BuildScriptPath) { $BuildScriptPath = Join-Path $PSScriptRoot ('../' + $applicationInfo.BuildScript) }
-foreach ($inputPath in @($InstallerPath, $ExecutablePath, $ManifestDirectory, $BuildScriptPath, $ManagedUpdaterTestPath)) {
+foreach ($inputPath in @($InstallerPath, $ExecutablePath, $ManifestDirectory, $BuildScriptPath, $ManagedUpdaterTestPath,
+    $SourceServerScriptPath, (Join-Path $PSScriptRoot 'winget-trusted-source.ps1'))) {
     if (-not (Test-Path -LiteralPath $inputPath)) { throw "Required input does not exist: $inputPath" }
 }
 $InstallerPath = (Resolve-Path -LiteralPath $InstallerPath).Path
@@ -54,6 +57,8 @@ $ExecutablePath = (Resolve-Path -LiteralPath $ExecutablePath).Path
 $ManifestDirectory = (Resolve-Path -LiteralPath $ManifestDirectory).Path
 $BuildScriptPath = (Resolve-Path -LiteralPath $BuildScriptPath).Path
 $ManagedUpdaterTestPath = (Resolve-Path -LiteralPath $ManagedUpdaterTestPath).Path
+$SourceServerScriptPath = (Resolve-Path -LiteralPath $SourceServerScriptPath).Path
+. (Join-Path $PSScriptRoot 'winget-trusted-source.ps1')
 $version = [Version]$PackageVersion
 if ($PackageVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
     $version -le [Version]$LegacyVersion) {
@@ -96,6 +101,9 @@ $processPathSnapshot = $env:PATH
 $failure = $null
 $fixtureToken = [IntPtr]::Zero
 $tokenTest = $null
+$trustedSource = $null
+$trustedSourceEvidence = [Collections.Generic.List[object]]::new()
+$activeDiagnosticManifest = $null
 
 Add-Type -TypeDefinition @'
 using System;
@@ -116,6 +124,10 @@ public static class PackageAcceptanceNative {
         public bool Visible { get; set; }
         public bool Enabled { get; set; }
         public bool TextResponsive { get; set; }
+        public string OwnerHandle { get; set; }
+        public string EnabledPopupHandle { get; set; }
+        public string LastActivePopupHandle { get; set; }
+        public string[] OwnerChain { get; set; }
     }
     public sealed class TokenSnapshot {
         public string UserSid { get; set; }
@@ -154,6 +166,18 @@ public static class PackageAcceptanceNative {
     private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")]
     private static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll")] private static extern IntPtr GetLastActivePopup(IntPtr window);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
+    [DllImport("kernel32.dll")] private static extern bool ProcessIdToSessionId(uint processId, out uint sessionId);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern IntPtr LoadLibraryEx(string file, IntPtr reserved, uint flags);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern uint SizeofResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")] private static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32.dll")] private static extern bool FreeLibrary(IntPtr module);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode, ExactSpelling=true)]
     private static extern IntPtr ReadWindowText(IntPtr window, uint message, UIntPtr capacity,
         StringBuilder text, uint flags, uint timeout, out UIntPtr result);
@@ -313,6 +337,67 @@ public static class PackageAcceptanceNative {
         }, IntPtr.Zero);
         return windows.ToArray();
     }
+    public static WindowSnapshot[] DescribeVisibleSessionWindows(int sessionId) {
+        var windows = new List<WindowSnapshot>();
+        var elapsed = Stopwatch.StartNew();
+        Func<IntPtr, IntPtr, bool> capture = delegate(IntPtr window, IntPtr topLevel) {
+            if (elapsed.ElapsedMilliseconds >= 3000 || windows.Count >= 100) return false;
+            if (!IsWindowVisible(window)) return true;
+            uint processId, windowSession;
+            GetWindowThreadProcessId(window, out processId);
+            if (!ProcessIdToSessionId(processId, out windowSession) || windowSession != (uint)sessionId) return true;
+            var className = new StringBuilder(256);
+            GetClassName(window, className, className.Capacity);
+            var text = new StringBuilder(2048);
+            UIntPtr result;
+            bool responsive = ReadWindowText(window, 0x000D, new UIntPtr((uint)text.Capacity),
+                text, 2, 100, out result) != IntPtr.Zero;
+            var chain = new List<string>();
+            var seen = new HashSet<IntPtr>();
+            var owner = GetWindow(window, 4); // GW_OWNER, which can cross process boundaries.
+            for (var current = owner; current != IntPtr.Zero && chain.Count < 12 && seen.Add(current); current = GetWindow(current, 4)) {
+                uint ownerProcess;
+                GetWindowThreadProcessId(current, out ownerProcess);
+                chain.Add("0x" + current.ToInt64().ToString("x") + " pid=" + ownerProcess);
+            }
+            windows.Add(new WindowSnapshot { ProcessId = checked((int)processId),
+                Handle = "0x" + window.ToInt64().ToString("x"),
+                TopLevelHandle = "0x" + topLevel.ToInt64().ToString("x"),
+                ClassName = className.ToString(), Text = text.ToString(),
+                Visible = true, Enabled = IsWindowEnabled(window), TextResponsive = responsive,
+                OwnerHandle = "0x" + owner.ToInt64().ToString("x"), OwnerChain = chain.ToArray(),
+                EnabledPopupHandle = "0x" + GetWindow(window, 6).ToInt64().ToString("x"),
+                LastActivePopupHandle = "0x" + GetLastActivePopup(window).ToInt64().ToString("x") });
+            return true;
+        };
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+            if (!capture(window, window)) return false;
+            if (IsWindowVisible(window))
+                EnumChildWindows(window, delegate(IntPtr child, IntPtr ignored) { return capture(child, window); }, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
+        return windows.ToArray();
+    }
+    public static int[] DesktopBounds() {
+        return new int[] { GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79) };
+    }
+    public static string ReadEmbeddedManifest(string path) {
+        // Map resource data only: do not execute the installer or resolve imports.
+        var module = LoadLibraryEx(path, IntPtr.Zero, 0x0040 | 0x0020);
+        if (module == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            var resource = FindResource(module, new IntPtr(1), new IntPtr(24)); // RT_MANIFEST / CREATEPROCESS_MANIFEST_RESOURCE_ID
+            if (resource == IntPtr.Zero) return null;
+            uint size = SizeofResource(module, resource);
+            if (size == 0 || size > 1024 * 1024) throw new InvalidOperationException("Unexpected PE manifest size.");
+            var address = LockResource(LoadResource(module, resource));
+            if (address == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var bytes = new byte[(int)size];
+            Marshal.Copy(address, bytes, 0, bytes.Length);
+            var encoding = bytes.Length >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe ? Encoding.Unicode : Encoding.UTF8;
+            return encoding.GetString(bytes).TrimStart('\uFEFF').TrimEnd('\0');
+        } finally { FreeLibrary(module); }
+    }
     public static Process StartStoredCommand(string command, string directory, IntPtr token) {
         var startup = new StartupInfo { size = (uint)Marshal.SizeOf<StartupInfo>() };
         ProcessInformation created;
@@ -380,9 +465,112 @@ function Read-Arp([string]$Code) {
         return $result
     } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
 }
-function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string]$Destination) {
+function Read-SharedTextFile([string]$Path) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader = [IO.StreamReader]::new($stream)
+    try { return $reader.ReadToEnd() }
+    finally { $reader.Dispose() }
+}
+function Read-InstallerSignature([string]$Path) {
+    # Certificate verification can consult providers. Bound this read-only probe
+    # in its own process so diagnostics cannot delay cleanup indefinitely.
+    $scriptText = @'
+$signature = Get-AuthenticodeSignature -LiteralPath '__INSTALLER_PATH__' -ErrorAction Stop
+[ordered]@{
+    Status = [string]$signature.Status
+    StatusMessage = $signature.StatusMessage
+    SignatureType = [string]$signature.SignatureType
+    SignerSubject = $(if ($null -ne $signature.SignerCertificate) { $signature.SignerCertificate.Subject })
+    SignerThumbprint = $(if ($null -ne $signature.SignerCertificate) { $signature.SignerCertificate.Thumbprint })
+} | ConvertTo-Json -Compress
+'@
+    $scriptText = $scriptText.Replace('__INSTALLER_PATH__', $Path.Replace("'", "''"))
+    $info = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText)))) { $info.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(5000)) {
+            $process.Kill($true); $null = $process.WaitForExit(2000)
+            throw 'Authenticode inspection exceeded five seconds.'
+        }
+        if ($process.ExitCode -ne 0) { throw $stderr.GetAwaiter().GetResult() }
+        return $stdout.GetAwaiter().GetResult() | ConvertFrom-Json
+    } finally { $process.Dispose() }
+}
+function Get-StagedInstallerEvidence([string]$ManifestPath, [DateTime]$StartedUtc, [string]$Destination) {
+    $evidence = [ordered]@{ Path = $null; ExpectedSha256 = $null; ActualSha256 = $null; Size = $null;
+        HashMatches = $false; ZoneIdentifier = $null; Authenticode = $null; EmbeddedManifest = $null;
+        PreservedInstaller = $null; Error = $null; ZoneError = $null; SignatureError = $null; ManifestError = $null }
+    try {
+        if (-not [IO.Path]::GetFullPath($ManifestPath).StartsWith($work + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The diagnostic manifest is outside the owned fixture directory.'
+        }
+        $files = @(Get-ChildItem -LiteralPath $ManifestPath -Filter '*.installer.yaml' -File)
+        if ($files.Count -ne 1) { throw 'Expected exactly one fixture installer manifest.' }
+        $yaml = [IO.File]::ReadAllText($files[0].FullName)
+        $fields = @{}
+        foreach ($name in @('PackageIdentifier', 'PackageVersion', 'InstallerUrl', 'InstallerSha256')) {
+            $values = [regex]::Matches($yaml, '(?m)^\s*' + $name + ':\s*([^\r\n]+)\s*$')
+            if ($values.Count -ne 1) { throw "Expected exactly one $name in the fixture manifest." }
+            $fields[$name] = $values[0].Groups[1].Value.Trim().Trim([char[]]@('"', "'"))
+        }
+        if ($fields.PackageIdentifier -cne $packageId -or $fields.PackageVersion -notmatch '^\d+\.\d+\.\d+$' -or
+            $fields.InstallerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Unexpected fixture manifest identity or hash.' }
+        $uri = [uri]$fields.InstallerUrl
+        if ($uri.Scheme -ne 'http' -or $uri.Host -ne '127.0.0.1') { throw 'Expected the owned loopback fixture URL.' }
+        $filename = [IO.Path]::GetFileNameWithoutExtension($uri.AbsolutePath) + '.exe'
+        if ($filename -notmatch '^[a-zA-Z0-9_.-]+\.exe$') { throw 'Unexpected fixture installer filename.' }
+        $directoryName = $fields.PackageIdentifier + '.' + $fields.PackageVersion
+        $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File |
+            Where-Object { $_.LastWriteTimeUtc -ge $StartedUtc -and $_.Length -le 4MB } |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8)) {
+            foreach ($match in [regex]::Matches((Read-SharedTextFile $file.FullName), "Starting: '([^']+)' with arguments")) {
+                $path = $match.Groups[1].Value
+                if ([IO.Path]::GetFileName($path) -ceq $filename -and
+                    [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($path)) -ceq $directoryName) { $null = $paths.Add($path) }
+            }
+        }
+        if ($paths.Count -ne 1) { throw 'Could not identify one exact staged fixture installer from the new WinGet trace.' }
+        $path = @($paths)[0]
+        $evidence.Path = $path
+        $evidence.ExpectedSha256 = $fields.InstallerSha256
+        $evidence.Size = (Get-Item -LiteralPath $path).Length
+        if ($evidence.Size -gt 128MB) { throw 'Staged installer exceeds the bounded diagnostic artifact size.' }
+        $evidence.ActualSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        $evidence.HashMatches = $evidence.ActualSha256 -ieq $evidence.ExpectedSha256
+        if (-not $evidence.HashMatches) { throw 'Refusing to preserve an installer whose hash differs from the fixture manifest.' }
+        $preserved = [IO.Path]::ChangeExtension($Destination, '.setup.exe')
+        Copy-Item -LiteralPath $path -Destination $preserved
+        $evidence.PreservedInstaller = $preserved
+        try {
+            if ($null -ne (Get-Item -LiteralPath $path -Stream Zone.Identifier -ErrorAction SilentlyContinue)) {
+                $evidence.ZoneIdentifier = Get-Content -LiteralPath $path -Stream Zone.Identifier -Raw
+            }
+        } catch { $evidence.ZoneError = $_.Exception.Message }
+        try { $evidence.Authenticode = Read-InstallerSignature $path }
+        catch { $evidence.SignatureError = $_.Exception.Message }
+        try {
+            $manifest = [PackageAcceptanceNative]::ReadEmbeddedManifest($path)
+            if ($null -ne $manifest) {
+                $manifestPath = [IO.Path]::ChangeExtension($Destination, '.manifest.xml')
+                [IO.File]::WriteAllText($manifestPath, $manifest)
+                $evidence.EmbeddedManifest = $manifestPath
+            }
+        } catch { $evidence.ManifestError = $_.Exception.Message }
+    } catch { $evidence.Error = $_.Exception.ToString() }
+    return $evidence
+}
+function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string]$Destination, [string]$InstallerManifestPath) {
     $diagnostic = [ordered]@{ RootProcessId = $RootProcess.Id; CapturedUtc = [DateTime]::UtcNow;
-        Processes = @(); Windows = @(); Error = $null }
+        Processes = @(); Windows = @(); Error = $null; SessionId = $null; VisibleSessionWindows = @();
+        ShellProcesses = @(); SessionError = $null; Screenshot = $null; ScreenshotError = $null; StagedInstaller = $null }
     try {
         # Inventory only parent/PID/creation metadata first. Command lines are
         # fetched only for the root we started and its verified descendants.
@@ -412,9 +600,46 @@ function Save-OwnedProcessDiagnostics([Diagnostics.Process]$RootProcess, [string
         $diagnostic.Processes = $details
         if ($details.Count) { $diagnostic.Windows = [PackageAcceptanceNative]::DescribeOwnedWindows([int[]]@($details.ProcessId)) }
     } catch { $diagnostic.Error = $_.Exception.ToString() }
+    try {
+        # Broker dialogs may live outside the process tree. Broader desktop
+        # evidence is permitted only on this explicitly disposable test VM.
+        if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
+            $env:RUNNER_OS -ne 'Windows' -or -not [Environment]::UserInteractive) {
+            throw 'Session diagnostics require the disposable interactive GitHub-hosted Windows runner.'
+        }
+        $sessionId = (Get-Process -Id $PID).SessionId
+        if ($sessionId -eq 0 -or $RootProcess.SessionId -ne $sessionId) { throw 'The WinGet process is not in the current interactive session.' }
+        $diagnostic.SessionId = $sessionId
+        $diagnostic.VisibleSessionWindows = [PackageAcceptanceNative]::DescribeVisibleSessionWindows($sessionId)
+        $names = @('smartscreen.exe', 'explorer.exe', 'consent.exe', 'dllhost.exe', 'RuntimeBroker.exe',
+            'ApplicationFrameHost.exe', 'OpenWith.exe', 'sihost.exe', 'SecurityHealthSystray.exe')
+        $filter = "SessionId=$sessionId AND (" + (($names | ForEach-Object { "Name='$_'" }) -join ' OR ') + ')'
+        $brokerProperties = @('ProcessId', 'ParentProcessId', 'Name', 'ExecutablePath', 'CreationDate', 'SessionId')
+        $diagnostic.ShellProcesses = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -Property $brokerProperties -OperationTimeoutSec 2 |
+            Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CreationDate, SessionId)
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $bounds = [PackageAcceptanceNative]::DesktopBounds()
+            if ($bounds[2] -le 0 -or $bounds[3] -le 0 -or [long]$bounds[2] * $bounds[3] -gt 16000000) {
+                throw 'The interactive desktop dimensions exceed the screenshot limit.'
+            }
+            $bitmap = [Drawing.Bitmap]::new($bounds[2], $bounds[3])
+            try {
+                $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                try { $graphics.CopyFromScreen($bounds[0], $bounds[1], 0, 0, $bitmap.Size) }
+                finally { $graphics.Dispose() }
+                $screenshotPath = [IO.Path]::ChangeExtension($Destination, '.desktop.png')
+                $bitmap.Save($screenshotPath, [Drawing.Imaging.ImageFormat]::Png)
+                $diagnostic.Screenshot = $screenshotPath
+            } finally { $bitmap.Dispose() }
+        } catch { $diagnostic.ScreenshotError = $_.Exception.ToString() }
+    } catch { $diagnostic.SessionError = $_.Exception.ToString() }
+    if ($InstallerManifestPath) {
+        $diagnostic.StagedInstaller = Get-StagedInstallerEvidence $InstallerManifestPath $RootProcess.StartTime.ToUniversalTime() $Destination
+    }
     $diagnostic | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Destination -Encoding utf8
 }
-function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int]$TimeoutSeconds = 180) {
+function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int]$TimeoutSeconds = 180, [switch]$CaptureDiagnostics) {
     $info = [Diagnostics.ProcessStartInfo]::new($File)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
@@ -440,9 +665,13 @@ function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Label, [int
         try {
             if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
                 $timedOut = $true
-                if ($winget -and [string]::Equals($File, $winget, [StringComparison]::OrdinalIgnoreCase)) {
+                if ($CaptureDiagnostics -or ($winget -and [string]::Equals($File, $winget, [StringComparison]::OrdinalIgnoreCase))) {
                     $diagnosticsPath = "$prefix-timeout.json"
-                    try { Save-OwnedProcessDiagnostics $process $diagnosticsPath }
+                    $manifestIndex = [Array]::IndexOf($Arguments, '--manifest')
+                    $diagnosticManifest = if ($manifestIndex -ge 0 -and $manifestIndex + 1 -lt $Arguments.Length) {
+                        $Arguments[$manifestIndex + 1]
+                    } else { $activeDiagnosticManifest }
+                    try { Save-OwnedProcessDiagnostics $process $diagnosticsPath $diagnosticManifest }
                     catch { $captureError = 'Timeout diagnostics failed: ' + $_.Exception.ToString() }
                 }
                 if (-not $process.HasExited) { $process.Kill($true) }
@@ -603,7 +832,47 @@ function Prepare-Manifest([string]$Source, [string]$Setup, [string]$Version, [st
         [IO.File]::WriteAllText((Join-Path $destination $file.Name), $content)
     }
     $null = Invoke-WinGet @('validate', '--manifest', $destination, '--disable-interactivity') "validate-$Stage"
+    if ($null -ne $trustedSource) { Add-TestSourceVersion $trustedSource $destination $Version }
     return $destination
+}
+function Read-FixtureManifest([string]$Manifest) {
+    $files = @(Get-ChildItem -LiteralPath $Manifest -Filter '*.installer.yaml' -File)
+    if ($files.Count -ne 1) { throw 'Expected one generated installer manifest.' }
+    $yaml = [IO.File]::ReadAllText($files[0].FullName)
+    $result = @{}
+    foreach ($name in @('PackageIdentifier', 'PackageVersion', 'InstallerUrl', 'InstallerSha256')) {
+        $matches = [regex]::Matches($yaml, '(?m)^\s*' + $name + ':\s*([^\r\n]+)\s*$')
+        if ($matches.Count -ne 1) { throw "Expected one $name in the generated installer manifest." }
+        $result[$name] = $matches[0].Groups[1].Value.Trim().Trim([char[]]@('"', "'"))
+    }
+    if ($result.PackageIdentifier -cne $packageId -or $result.PackageVersion -notmatch '^\d+\.\d+\.\d+$' -or
+        $result.InstallerSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'The fixture manifest identity/hash is invalid.' }
+    return $result
+}
+function Assert-TrustedInstallTrace([string]$Manifest, [string]$StageLogs, [string]$Stage) {
+    $fixture = Read-FixtureManifest $Manifest
+    $sourceMarker = 'Named source requested, found: ' + $trustedSource.Name
+    $traces = @(Get-ChildItem -LiteralPath $StageLogs -Filter '*.log' -File | ForEach-Object {
+        $text = Read-SharedTextFile $_.FullName
+        if ($text.Contains($sourceMarker)) { @{ Path = $_.FullName; Text = $text } }
+    })
+    if ($traces.Count -ne 1) { throw "$Stage did not yield one trace selecting the exact trusted fixture source." }
+    $trace = $traces[0].Text
+    $selectedIndex = $trace.IndexOf('Selected installer URL: ' + $fixture.InstallerUrl, [StringComparison]::Ordinal)
+    $hashIndex = $trace.IndexOf('Installer hash verified', [StringComparison]::Ordinal)
+    $zone = [regex]::Match($trace, 'Started applying motw to ([^\r\n]+) with zone: 2(?:\r?\n|$)')
+    $startIndex = $trace.IndexOf('Starting: ', [StringComparison]::Ordinal)
+    $expectedFilename = [IO.Path]::GetFileNameWithoutExtension(([uri]$fixture.InstallerUrl).AbsolutePath) + '.exe'
+    if ($selectedIndex -lt 0 -or $hashIndex -lt $selectedIndex -or -not $zone.Success -or
+        $zone.Index -lt $hashIndex -or $startIndex -lt $zone.Index -or
+        [IO.Path]::GetFileName($zone.Groups[1].Value.Trim('"')) -cne $expectedFilename -or
+        [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($zone.Groups[1].Value.Trim('"'))) -cne ($packageId + '.' + $fixture.PackageVersion) -or
+        $trace -notmatch [regex]::Escape($fixture.InstallerSha256.ToLowerInvariant())) {
+        throw "$Stage did not prove source selection, expected installer SHA verification, and Zone 2 before launch."
+    }
+    $trustedSourceEvidence.Add(@{ Stage = $Stage; Name = $trustedSource.Name; Identifier = $trustedSource.Identifier;
+        Version = $fixture.PackageVersion; InstallerUrl = $fixture.InstallerUrl; InstallerSha256 = $fixture.InstallerSha256;
+        Registration = $trustedSource.Registration; HashVerifiedBeforeTrustedZone = $true; Trace = $traces[0].Path })
 }
 function Build-Fixture([int]$Offset) {
     $fixtureVersion = '{0}.{1}.{2}' -f $version.Major, $version.Minor, ($version.Build + $Offset)
@@ -618,19 +887,22 @@ function Build-Fixture([int]$Offset) {
     return @{ Version = $fixtureVersion; Setup = $setup; Manifests = (Join-Path $output 'winget') }
 }
 function Upgrade-Package([string]$Manifest, [string]$Stage, [switch]$AllowFailure) {
-    # WinGet 1.29.380 rejects --log with upgrade --manifest: --log belongs
-    # to SingleInstallerBehavior, which UpgradeCommand requires a query for.
-    # Its Inno handler still adds /LOG automatically. Capture that default log
-    # without changing the production manifest or weakening the upgrade path.
+    # Use the same trusted-source path as published packages. WinGet itself
+    # verifies the installer hash and assigns Zone 2 before ShellExecute.
+    $fixture = Read-FixtureManifest $Manifest
+    $null = Assert-TestSourceRegistration $trustedSource ("source-before-$Stage")
     $priorLogs = @{}
     foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
         $priorLogs[$file.FullName] = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
     }
+    $script:activeDiagnosticManifest = $Manifest
     try {
-        $result = Invoke-WinGet @('upgrade', '--manifest', $Manifest, '--silent',
+        $result = Invoke-WinGet @('upgrade', '--source', $trustedSource.Name, '--id', $packageId, '--exact',
+            '--version', $fixture.PackageVersion, '--scope', 'user', '--silent',
             '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity',
             '--verbose-logs') $Stage -AllowFailure
     } finally {
+        $script:activeDiagnosticManifest = $null
         # Invoke-Logged may throw on timeout. Still retain the client's trace
         # and any partial Inno log after the owned process tree has been stopped.
         $stageLogs = Join-Path $logDirectory "$Stage-winget"
@@ -652,6 +924,7 @@ function Upgrade-Package([string]$Manifest, [string]$Stage, [switch]$AllowFailur
         }
         Write-Host "Captured default WinGet logs for ${Stage}: $stageLogs"
     }
+    Assert-TrustedInstallTrace $Manifest $stageLogs $Stage
     if ($result.ExitCode -ne 0 -and -not $AllowFailure) { throw "$Stage failed: $($result.Text)" }
     return $result
 }
@@ -736,11 +1009,6 @@ try {
         throw "The pinned client's default log directory was not found: $wingetLogDirectory"
     }
     $settingsSnapshot = $settings.Text | ConvertFrom-Json -AsHashtable
-    if (-not $settingsSnapshot.adminSettings.ContainsKey('LocalManifestFiles')) { throw 'WinGet did not export the LocalManifestFiles setting.' }
-    if (-not $settingsSnapshot.adminSettings.LocalManifestFiles) {
-        $changedLocalManifestSetting = $true
-        $null = Invoke-WinGet @('settings', '--enable', 'LocalManifestFiles', '--disable-interactivity') 'enable-local-manifests'
-    }
 
     # The listener binds to loopback and serves only the generated setup filenames.
     $reservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -890,6 +1158,10 @@ try {
     }
     Write-Host "Loopback download server ready: $script:serverUrl ($lastProbe)"
     $initialManifest = Prepare-Manifest $ManifestDirectory $InstallerPath $PackageVersion 'migration'
+    $trustedSource = New-TestSourceState ([IO.Path]::GetTempPath()) $Application
+    Add-TestSourceVersion $trustedSource $initialManifest $PackageVersion
+    $python = (Get-Command python.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    Start-TestSource $trustedSource $SourceServerScriptPath $python
 
     $installedByTest = $true
     $null = Invoke-WinGet @('install', '--id', $packageId, '--exact', '--version', $LegacyVersion,
@@ -996,9 +1268,28 @@ try {
     # Reuse the last compiled fixture to cover the target-absent installer path.
     $installDirectory = Join-Path $work 'Fresh installation with spaces'
     $installedExe = Join-Path $installDirectory "$Application.exe"
-    $null = Invoke-WinGet @('install', '--manifest', $manifest, '--scope', 'user', '--location', $installDirectory,
-        '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity',
-        '--log', (Join-Path $logDirectory 'fresh-installer.log')) 'fresh-silent-install'
+    $null = Assert-TestSourceRegistration $trustedSource 'source-before-fresh-install'
+    $priorLogs = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
+        $priorLogs[$file.FullName] = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
+    }
+    $script:activeDiagnosticManifest = $manifest
+    try {
+        $null = Invoke-WinGet @('install', '--source', $trustedSource.Name, '--id', $packageId, '--exact', '--version', $next.Version,
+            '--scope', 'user', '--location', $installDirectory, '--silent', '--accept-package-agreements',
+            '--accept-source-agreements', '--disable-interactivity', '--verbose-logs',
+            '--log', (Join-Path $logDirectory 'fresh-installer.log')) 'fresh-silent-install'
+    } finally {
+        $script:activeDiagnosticManifest = $null
+        $freshLogs = Join-Path $logDirectory 'fresh-silent-install-winget'
+        $null = New-Item -ItemType Directory -Path $freshLogs
+        foreach ($file in @(Get-ChildItem -LiteralPath $wingetLogDirectory -Filter '*.log' -File)) {
+            $stamp = "$($file.Length):$($file.LastWriteTimeUtc.Ticks)"
+            if ($priorLogs.ContainsKey($file.FullName) -and $priorLogs[$file.FullName] -ceq $stamp) { continue }
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $freshLogs $file.Name)
+        }
+    }
+    Assert-TrustedInstallTrace $manifest $freshLogs 'fresh-silent-install'
     Assert-Stopped
     Assert-Installed $next.Version $false
     $fresh = Start-Installed
@@ -1035,6 +1326,8 @@ try {
             } catch { $cleanupErrors.Add("Owned installation cleanup: $_") }
         }
     }
+    try { Stop-TestSource $trustedSource }
+    catch { $cleanupErrors.Add("Trusted source cleanup: $_") }
     if ($serverJob) { Stop-Job $serverJob -ErrorAction SilentlyContinue; Remove-Job $serverJob -Force -ErrorAction SilentlyContinue }
     if ($sentinel -and (Test-Path -LiteralPath $sentinel)) { Remove-Item -LiteralPath $sentinel -Force }
     if ($changedLocalManifestSetting -and $winget) {
@@ -1065,8 +1358,13 @@ try {
             CandidateHash = $expectedHash; Checks = $checks.ToArray(); Commands = $commands.ToArray();
             TokenComparisons = $tokenComparisons.ToArray();
             TokenTest = $tokenTest;
+            TrustedSourceEvidence = $trustedSourceEvidence.ToArray();
+            SourceFixture = $(if ($null -ne $trustedSource) { @{ Name = $trustedSource.Name; Identifier = $trustedSource.Identifier;
+                Url = $trustedSource.Url; Registration = $trustedSource.Registration;
+                CertificateStore = 'LocalMachine/Root';
+                CertificateThumbprint = $(if ($trustedSource.Certificate) { $trustedSource.Certificate.Thumbprint }) } });
             Failure = $(if ($failure) { $failure.ToString() } else { $null }); CleanupErrors = $cleanupErrors.ToArray();
-            Limitation = 'Local candidate manifests do not publish or write the source tracking catalog.' }
+            Limitation = 'Candidates use an isolated explicit trusted REST source built from production manifests; public winget publication/index propagation is not exercised.' }
         $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $work 'result.json') -Encoding utf8
         Write-Host "Package-manager acceptance report: $work"
     }

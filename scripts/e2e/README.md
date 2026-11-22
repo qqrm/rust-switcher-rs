@@ -62,9 +62,14 @@ and never needs a real logoff or reboot.
 
 The required `updater-live` CI job also runs `winget-upgrade.ps1`. It installs
 the published 1.0.29 package from the official WinGet source into an owned path,
-then upgrades through the actual WinGet client using production-generated Inno
-manifests with local fixture URLs. The installer fixture versions do not change
-Cargo versions or publish a release. Assertions cover a running portable
+then upgrades through the actual WinGet client using an explicit trusted REST
+source on the disposable runner. `winget-test-source.py` reads the validated,
+production-generated Inno manifests and preserves their installer fields,
+including both migration product codes. Metadata uses loopback HTTPS and the
+installer payload uses the local HTTP fixture. WinGet performs its normal
+package selection, hash verification and trusted-source handling. The installer
+fixture versions do not change Cargo versions or publish a release.
+Assertions cover a running portable
 migration, later Inno updates, enabled and disabled autostart, stopped-app updates,
 locked-file failure recovery, fresh silent install and uninstall. They check
 the exact executable hash, installed version, process identity and actual tray
@@ -78,9 +83,30 @@ must leave the original process and installation untouched. A verified update
 must use the installer, preserve preferences and update the installed version.
 The existing standalone updater tests continue to exercise the raw EXE path.
 
-The package-manager scenarios exercise catalog installation and the installed
-registration, but candidate upgrades use local manifests. Publication to the
-community catalog and subsequent catalog indexing are separate operations.
+The trusted source requires the already-elevated, disposable hosted runner.
+Its helper temporarily installs one generated CA certificate in
+`LocalMachine\Root`, with bounded import and exact certificate identity checks.
+Cleanup removes the owned source and certificate. The CA private key remains
+in memory; temporary server keys are kept outside diagnostic artifacts. This
+fixture exercises the same source-trust decision as a trusted catalog. It does
+not change Windows protection policies or modify installer verification.
+
+Both CI and release acceptance install the pinned PyYAML dependency and require
+OpenSSL before running the source's Python tests. These tests use real HTTPS,
+verify certificate trust, exercise manifest selection and product-code searches,
+and check bounded shutdown. They can also run locally without registering a
+WinGet source or launching the application:
+
+```powershell
+Get-Command python, openssl -ErrorAction Stop | Out-Null
+python -m pip install -r scripts/e2e/winget-test-source-requirements.txt
+python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+```
+
+The package-manager scenarios exercise official catalog installation and the
+installed registration, followed by candidate upgrades from the owned trusted
+REST source. Publication to the community catalog and subsequent catalog
+indexing are separate operations.
 CI retains package-manager result JSON and installer logs for seven days,
 including failed runs, so failures remain inspectable after the VM is removed.
 The runner remains Windows Server 2025; these checks do not claim a Windows 11

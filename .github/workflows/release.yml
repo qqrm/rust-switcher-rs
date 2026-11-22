@@ -199,6 +199,14 @@ jobs:
           cargo +nightly package --workspace --locked
           if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
           ./scripts/build-installer.ps1
+      - name: Verify the trusted WinGet source fixture
+        shell: pwsh
+        run: |
+          Get-Command python, openssl -ErrorAction Stop | Out-Null
+          python -m pip install --disable-pip-version-check -r scripts/e2e/winget-test-source-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet source fixture dependency installation failed' }
+          python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet source protocol and TLS tests failed' }
       - name: Verify real autostart and package-manager updates before publication
         shell: pwsh
         timeout-minutes: 18

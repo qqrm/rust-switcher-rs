@@ -104,6 +104,7 @@ jobs:
         run: |
           foreach ($path in @('scripts/windows-updater.ps1', 'scripts/build-installer.ps1',
               'scripts/e2e/autostart-live.ps1', 'scripts/e2e/winget-upgrade.ps1',
+              'scripts/e2e/winget-trusted-source.ps1',
               'scripts/e2e/installer-updater.ps1', 'scripts/e2e/run-browser.ps1',
               'scripts/e2e/browser-security-cases.ps1', 'scripts/e2e/run-security-mutation.ps1',
               'scripts/e2e/test-browser-cdp.ps1', 'scripts/e2e/test-browser-outcomes.ps1')) {
@@ -255,8 +256,18 @@ jobs:
         if: ${{ !cancelled() && steps.native_build.outcome == 'success' }}
         shell: pwsh
         run: ./scripts/build-installer.ps1 -Version 999.0.1 -OutputDirectory ./target/installer-fixture
-      - name: Exercise real WinGet migration, upgrades, failure recovery and uninstall
+      - name: Verify the trusted WinGet source fixture
+        id: source_fixture
         if: ${{ !cancelled() && steps.installer_build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          Get-Command python, openssl -ErrorAction Stop | Out-Null
+          python -m pip install --disable-pip-version-check -r scripts/e2e/winget-test-source-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet source fixture dependency installation failed' }
+          python -m unittest discover -s scripts/e2e -p test_winget_test_source.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet source protocol and TLS tests failed' }
+      - name: Exercise real WinGet migration, upgrades, failure recovery and uninstall
+        if: ${{ !cancelled() && steps.installer_build.outcome == 'success' && steps.source_fixture.outcome == 'success' }}
         timeout-minutes: 15
         shell: pwsh
         env:
