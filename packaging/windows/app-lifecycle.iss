@@ -1,3 +1,8 @@
+#if (VER < EncodeVer(6, 0, 0)) || (VER >= EncodeVer(7, 0, 0))
+  #error This native lifecycle requires the 32-bit Inno Setup 6 compiler
+#endif
+#pragma message "Compiling native lifecycle with Inno Setup " + DecodeVer(VER)
+
 ; Shared per-user application lifecycle. Include after [Code].
 ; Required defines: AppName, AppExeName, PackageIdentifier, RunValueName,
 ; AppId, RestartArguments, AutostartArguments, DefaultInstallDirectory.
@@ -5,6 +10,9 @@
 ; portable releases do not register with Windows Restart Manager.
 #ifndef AdditionalPayloadName
   #define AdditionalPayloadName ""
+#endif
+#ifndef QuitPidArgument
+  #define QuitPidArgument ""
 #endif
 
 const
@@ -47,6 +55,8 @@ function LifecycleProcessSession(Id: Cardinal; var Session: Cardinal): Boolean;
   external 'ProcessIdToSessionId@kernel32.dll stdcall';
 function LifecycleCurrentProcessId: Cardinal;
   external 'GetCurrentProcessId@kernel32.dll stdcall';
+function LifecycleGetProcessId(Process: THandle): Cardinal;
+  external 'GetProcessId@kernel32.dll stdcall';
 function LifecycleWait(Handle: THandle; Milliseconds: Cardinal): Cardinal;
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function LifecycleKill(Handle: THandle; ExitCode: Cardinal): Boolean;
@@ -254,14 +264,27 @@ end;
 procedure LifecycleStop(const Target: String; var Handles: TLifecycleHandles);
 var
   Index, ResultCode: Integer;
-  WaitResult: Cardinal;
+  WaitResult, ProcessId: Cardinal;
+  QuitArguments: String;
 begin
   if GetArrayLength(Handles) = 0 then Exit;
   { The command is the production graceful shutdown route, including old portable
     versions. Only captured exact-path/current-session handles can be forced. }
-  if not Exec(Target, '--quit-for-update', ExtractFileDir(Target), SW_HIDE, ewNoWait, ResultCode) then
-    Log('Graceful shutdown helper could not start: ' + SysErrorMessage(ResultCode));
   for Index := 0 to GetArrayLength(Handles) - 1 do begin
+    WaitResult := LifecycleWait(Handles[Index], 0);
+    if WaitResult = 0 then Continue;
+    if WaitResult <> LifecycleWaitTimeout then
+      RaiseException('Cannot inspect the captured application before shutdown.');
+    QuitArguments := '--quit-for-update';
+    if '{#QuitPidArgument}' <> '' then begin
+      ProcessId := LifecycleGetProcessId(Handles[Index]);
+      if ProcessId = 0 then RaiseException('Cannot identify the captured application process.');
+      { Old versions recognize the plain flag. New versions also read the
+        scoped argument and refuse to close a user-launched replacement. }
+      QuitArguments := QuitArguments + ' {#QuitPidArgument}' + IntToStr(ProcessId);
+    end;
+    if not Exec(Target, QuitArguments, ExtractFileDir(Target), SW_HIDE, ewNoWait, ResultCode) then
+      Log('Graceful shutdown helper could not start: ' + SysErrorMessage(ResultCode));
     WaitResult := LifecycleWait(Handles[Index], 10000);
     if WaitResult = LifecycleWaitTimeout then begin
       Log('Graceful shutdown timed out; stopping the captured application handle.');
@@ -378,18 +401,19 @@ begin
   if not FileExists(Target) then Exit;
   if LifecycleLaunchToken <> 0 then begin
     Result := LifecycleStartWithToken(Target);
-    Exit;
-  end;
-  { Use the original user's credentials, not an elevated installer child. }
-  if not ExecAsOriginalUser(Target, '{#RestartArguments}', ExtractFileDir(Target),
+    { A user may win a concurrent launch. The internal --skip-if-running
+      process then exits. Both launch routes must establish exactly one live
+      exact-path replacement below, regardless of the launcher child's state. }
+  end else if not ExecAsOriginalUser(Target, '{#RestartArguments}', ExtractFileDir(Target),
       SW_SHOWNORMAL, ewNoWait, ResultCode) then begin
     Log('Restart failed: ' + SysErrorMessage(ResultCode));
     Exit;
   end;
+  Result := False;
   for Attempt := 1 to 100 do begin
     LifecycleCapture(Target, Handles);
     try
-      if GetArrayLength(Handles) > 0 then begin
+      if GetArrayLength(Handles) = 1 then begin
         Result := LifecycleWait(Handles[0], 1000) = LifecycleWaitTimeout;
         Exit;
       end;
@@ -494,12 +518,13 @@ begin
       end;
       LifecycleCapture(LifecycleTarget, LifecycleHandles);
       LifecycleWasRunning := GetArrayLength(LifecycleHandles) > 0;
-      LifecyclePrepared := True;
       if LifecycleWasRunning then LifecycleRetainLaunchToken(LifecycleHandles[0]);
+      LifecyclePrepared := True;
     end;
     LifecycleStop(LifecycleTarget, LifecycleHandles);
     LifecycleReleaseHandles(LifecycleHandles);
   except
+    if not LifecyclePrepared then LifecycleReleaseHandles(LifecycleHandles);
     Result := GetExceptionMessage;
   end;
 end;

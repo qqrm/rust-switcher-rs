@@ -40,8 +40,8 @@ cargo install rust-switcher
 
 ### From GitHub Releases
 
-Download `rust-switcher-setup.exe` from Releases for a per-user installation,
-or `rust-switcher.exe` for a standalone executable.
+The standalone executable is `rust-switcher.exe`. The installer build adds
+`rust-switcher-setup.exe` for a per-user installation when its release is published.
 
 ### Via WinGet or UniGetUI
 
@@ -54,6 +54,11 @@ it was running before the update. It preserves the existing autostart setting
 and configuration. Existing per-user WinGet portable installations are migrated
 in their current directory, keeping their command alias. A fresh silent install
 does not launch the app or enable autostart. UniGetUI uses the same WinGet package.
+
+This behavior reaches UniGetUI after the installer release is published and its
+manifest is accepted in `microsoft/winget-pkgs`. The existing catalog release
+1.0.29 is still a portable EXE; merging the source change alone does not update
+that catalog entry.
 
 ### Updating
 

@@ -226,6 +226,14 @@ jobs:
           path: ${{ runner.temp }}/publication
           if-no-files-found: error
           retention-days: 1
+      - name: Preserve failed package-manager diagnostics
+        if: ${{ !cancelled() && failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-winget-upgrade-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/winget-upgrade-rust-switcher
+          if-no-files-found: ignore
+          retention-days: 7
 
   publish:
     needs: [version-pr, build]

@@ -18,7 +18,7 @@ must cause the application to replace and reselect it.
 Assertions fail on missing desktop capabilities or timeouts, never skip to green.
 Only unique temporary profiles and processes created by the scenario are used.
 No local Sandbox, shutdown, driver installation or paid runner is required.
-Results are printed in the job log without adding stored workflow artifacts.
+Desktop input results are printed in the job log without adding stored workflow artifacts.
 
 ### Coverage manifest
 
@@ -78,6 +78,8 @@ The existing standalone updater tests continue to exercise the raw EXE path.
 The package-manager scenarios exercise catalog installation and the installed
 registration, but candidate upgrades use local manifests. Publication to the
 community catalog and subsequent catalog indexing are separate operations.
+CI retains package-manager result JSON and installer logs for seven days,
+including failed runs, so failures remain inspectable after the VM is removed.
 The runner remains Windows Server 2025; these checks do not claim a Windows 11
 client reboot or a physical keyboard test.
 

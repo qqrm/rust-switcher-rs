@@ -44,6 +44,7 @@ public static class AutostartAcceptance {
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr parameter);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
@@ -80,6 +81,23 @@ public static class AutostartAcceptance {
     public static bool Responsive(IntPtr window) {
         UIntPtr result;
         return SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 2, 500, out result) != IntPtr.Zero;
+    }
+    public static string DescribeWindows(int processId) {
+        var windows = new List<string>();
+        EnumWindows((window, parameter) => {
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            if (owner == (uint)processId) {
+                var name = new StringBuilder(256);
+                var title = new StringBuilder(256);
+                GetClassName(window, name, name.Capacity);
+                GetWindowText(window, title, title.Capacity);
+                windows.Add("hwnd=" + window + ", class=" + name + ", title=" + title +
+                    ", visible=" + IsWindowVisible(window));
+            }
+            return true;
+        }, IntPtr.Zero);
+        return string.Join("; ", windows);
     }
     public static Process StartStoredCommand(string commandLine, string directory) {
         var startup = new STARTUPINFO();
@@ -158,6 +176,29 @@ function Get-Window($Process) {
     if ($Process.HasExited) { throw "Owned application exited early with $($Process.ExitCode)" }
     return [AutostartAcceptance]::MainWindow($Process.Id)
 }
+function Wait-StartupWindow($Process, [bool]$Visible, [string]$Description) {
+    try {
+        # CreateWindowEx publishes an initially hidden HWND before run() calls
+        # ShowWindow. Observe the completed production startup; do not show it
+        # from the harness or replace the visibility assertion with HWND existence.
+        Wait-Condition {
+            $handle = Get-Window $Process
+            $handle -ne [IntPtr]::Zero -and
+                [AutostartAcceptance]::IsWindowVisible($handle) -eq $Visible -and
+                [AutostartAcceptance]::Responsive($handle)
+        } "$Description (visible=$Visible and responsive)"
+    } catch {
+        $state = [ordered]@{
+            process = $Process.Id
+            exited = $Process.HasExited
+            expectedVisible = $Visible
+            windows = [AutostartAcceptance]::DescribeWindows($Process.Id)
+        }
+        if ($Process.HasExited) { $state['exitCode'] = $Process.ExitCode }
+        throw "$($_.Exception.Message); startup state: $($state | ConvertTo-Json -Compress)"
+    }
+    return Get-Window $Process
+}
 function Get-Control($Window, [string]$Name) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
     $condition = [System.Windows.Automation.PropertyCondition]::new(
@@ -191,9 +232,8 @@ try {
         $legacyMoved = $true
     }
     $process = Start-Release
-    Wait-Condition { (Get-Window $process) -ne [IntPtr]::Zero } 'normal release startup'
-    $window = Get-Window $process
-    if (-not [AutostartAcceptance]::IsWindowVisible($window)) { throw 'Normal launch must show the default window' }
+    $window = Wait-StartupWindow $process $true 'normal release startup'
+    Record-Pass 'normal release startup becomes visible and responsive'
     if ((Read-Registration).Exists) { throw 'A fresh manual launch enabled autostart unexpectedly' }
     Set-Toggle $window 'Start minimized' $false
     Set-Toggle $window 'Dark theme' $true
@@ -212,8 +252,7 @@ try {
     $stored = Read-Registration
     if (-not $stored.Exists -or $stored.Value -cne $expectedCommand) { throw 'Run registration did not survive exit' }
     $process = Start-Registration $stored.Value
-    Wait-Condition { (Get-Window $process) -ne [IntPtr]::Zero } 'stored Run command creates the real application window'
-    $window = Get-Window $process
+    $window = Wait-StartupWindow $process $false 'stored Run command starts the real application hidden'
     $hiddenUntil = [DateTime]::UtcNow.AddSeconds(1)
     do {
         if ($process.HasExited -or [AutostartAcceptance]::IsWindowVisible($window) -or
@@ -237,8 +276,7 @@ try {
     Wait-Condition { -not (Read-Registration).Exists } 'UI removes Run registration'
     Quit-Release $process $window
     $process = Start-Release
-    Wait-Condition { (Get-Window $process) -ne [IntPtr]::Zero } 'manual restart after disabling autostart'
-    $window = Get-Window $process
+    $window = Wait-StartupWindow $process $true 'manual restart after disabling autostart'
     if ((Read-Registration).Exists -or
         (Get-Toggle $window 'Start on startup').Current.ToggleState -ne [System.Windows.Automation.ToggleState]::Off -or
         -not [AutostartAcceptance]::IsWindowVisible($window)) {

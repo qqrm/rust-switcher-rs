@@ -18,6 +18,7 @@ $candidate = $null
 $backup = $null
 $quitRequested = $false
 $startedNew = $false
+$managedParent = $null
 
 function Write-UpdateLog([string]$message) {
     try {
@@ -46,20 +47,97 @@ function Assert-Hash([string]$file, [string]$expected) {
     }
 }
 
-function Test-InstallerManaged([string]$executable) {
+function Get-InstallerRegistration([string]$executable) {
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
         [Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
     try {
         $key = $base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Uninstall\QQRM.RustSwitcher_is1')
-        if ($null -eq $key) { return $false }
+        if ($null -eq $key) { return $null }
         try {
             $location = [string]$key.GetValue('InstallLocation', '')
             $kind = [string]$key.GetValue('WinGetInstallerType', '')
-            if ($kind -cne 'inno' -or -not [IO.Path]::IsPathRooted($location)) { return $false }
+            if ($kind -cne 'inno' -or -not [IO.Path]::IsPathRooted($location)) { return $null }
             $registered = [IO.Path]::GetFullPath((Join-Path $location 'rust-switcher.exe'))
-            return [string]::Equals($registered, [IO.Path]::GetFullPath($executable), [StringComparison]::OrdinalIgnoreCase)
+            if (-not [string]::Equals($registered, [IO.Path]::GetFullPath($executable), [StringComparison]::OrdinalIgnoreCase)) { return $null }
+            return [pscustomobject]@{ Version = [string]$key.GetValue('DisplayVersion', '') }
         } finally { $key.Dispose() }
     } finally { $base.Dispose() }
+}
+
+function Get-InstalledAssetMetadata($release, [string]$tag) {
+    $matchingAssets = @($release.assets | Where-Object { $_.name -ceq 'rust-switcher.exe' })
+    if ($matchingAssets.Count -ne 1) { throw 'Expected exactly one installed executable release asset' }
+    $asset = $matchingAssets[0]
+    $url = "https://github.com/qqrm/rust-switcher-rs/releases/download/$tag/rust-switcher.exe"
+    $digest = [string]$asset.digest
+    if ([string]$asset.browser_download_url -cne $url -or $digest -cnotmatch '^sha256:[0-9a-f]{64}$' -or
+        [long]$asset.size -lt 1024 -or [long]$asset.size -gt 104857600) {
+        throw 'Installed executable release metadata is invalid'
+    }
+    return [pscustomobject]@{ Hash = $digest.Substring(7); Size = [long]$asset.size }
+}
+
+function Initialize-InstalledReadiness {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class RustSwitcherInstalledReady {
+    private delegate bool EnumWindowCallback(IntPtr window, IntPtr parameter);
+    [StructLayout(LayoutKind.Sequential)] private struct IconIdentifier {
+        public uint size; public IntPtr window; public uint id; public Guid guid;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct Rectangle { public int left, top, right, bottom; }
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("shell32.dll")] private static extern int Shell_NotifyIconGetRect(ref IconIdentifier icon, out Rectangle rectangle);
+    public static bool HasReadyTray(int processId) {
+        bool ready = false;
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            if (owner != (uint)processId) return true;
+            var name = new StringBuilder(256);
+            GetClassName(window, name, name.Capacity);
+            if (name.ToString() != "RustSwitcherMainWindow") return true;
+            UIntPtr result;
+            if (SendMessageTimeout(window, 0, UIntPtr.Zero, IntPtr.Zero, 2, 500, out result) == IntPtr.Zero) return true;
+            var icon = new IconIdentifier();
+            icon.size = (uint)Marshal.SizeOf(typeof(IconIdentifier));
+            icon.window = window;
+            icon.id = 1;
+            Rectangle rectangle;
+            ready = Shell_NotifyIconGetRect(ref icon, out rectangle) == 0 &&
+                rectangle.right > rectangle.left && rectangle.bottom > rectangle.top;
+            return !ready;
+        }, IntPtr.Zero);
+        return ready;
+    }
+}
+'@
+}
+
+function Wait-InstalledTray {
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    $session = (Get-Process -Id $PID).SessionId
+    do {
+        $processes = @(Get-Process -Name rust-switcher -ErrorAction SilentlyContinue)
+        try {
+            $owned = @($processes | Where-Object {
+                try {
+                    -not $_.HasExited -and $_.SessionId -eq $session -and
+                        [string]::Equals($_.Path, $TargetPath, [StringComparison]::OrdinalIgnoreCase)
+                } catch { $false } # A process can exit while its path is inspected.
+            })
+            if ($owned.Count -eq 1 -and $owned[0].Id -ne $ParentPid -and
+                [RustSwitcherInstalledReady]::HasReadyTray($owned[0].Id)) { return }
+        } finally { foreach ($process in $processes) { $process.Dispose() } }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'The installed update did not leave exactly one responsive application with a usable tray icon'
 }
 
 try {
@@ -84,7 +162,7 @@ try {
         return
     }
 
-    $managed = Test-InstallerManaged $TargetPath
+    $managed = $null -ne (Get-InstallerRegistration $TargetPath)
     $assetName = if ($managed) { 'rust-switcher-setup.exe' } else { 'rust-switcher.exe' }
     $assets = @($release.assets | Where-Object { $_.name -ceq $assetName })
     if ($assets.Count -ne 1) {
@@ -114,11 +192,36 @@ try {
     Assert-Hash $staged $expectedHash
 
     if ($managed) {
+        $installedAsset = Get-InstalledAssetMetadata $release $tag
+        Initialize-InstalledReadiness
+        $managedParent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+        if ($null -eq $managedParent -or $managedParent.HasExited) {
+            Write-UpdateLog 'Update cancelled: the original application has exited'
+            return
+        }
+        if (-not [string]::Equals($managedParent.Path, $TargetPath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The original process does not own the installed executable'
+        }
         # Let the installer own shutdown, rollback, restart and ARP version updates.
         # Falling back to a raw replacement would leave WinGet's version stale.
         Write-UpdateLog "Installing verified package $tag"
-        $installation = Start-Process -FilePath $staged -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -PassThru -Wait -ErrorAction Stop
-        if ($installation.ExitCode -ne 0) { throw "Package installer failed with exit code $($installation.ExitCode)" }
+        $directory = Split-Path -Parent $TargetPath
+        $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+            ('/DIR="' + $directory + '"'), ('/LOG="' + $LogPath + '.installer.log"'))
+        $installation = Start-Process -FilePath $staged -ArgumentList $arguments -PassThru -Wait -ErrorAction Stop
+        try {
+            if ($installation.ExitCode -ne 0) { throw "Package installer failed with exit code $($installation.ExitCode)" }
+        } finally { $installation.Dispose() }
+        if ((Get-Item -LiteralPath $TargetPath).Length -ne $installedAsset.Size) {
+            throw 'The installer left an unexpected executable size'
+        }
+        Assert-Hash $TargetPath $installedAsset.Hash
+        $registration = Get-InstallerRegistration $TargetPath
+        if ($null -eq $registration -or $registration.Version -cne $latest.ToString()) {
+            throw 'The installer did not update the installed application version'
+        }
+        if (-not $managedParent.WaitForExit(10000)) { throw 'The installer left the original application running' }
+        Wait-InstalledTray
         Write-UpdateLog "Updated package to $tag"
         return
     }
@@ -179,6 +282,7 @@ try {
     }
     exit 1
 } finally {
+    if ($null -ne $managedParent) { $managedParent.Dispose() }
     Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
     if ($null -ne $candidate) {
         Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue

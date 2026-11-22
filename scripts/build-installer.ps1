@@ -1,7 +1,8 @@
 param(
     [string]$ExecutablePath = './target/release/rust-switcher.exe',
     [string]$Version = '',
-    [string]$OutputDirectory = './target/installer'
+    [string]$OutputDirectory = './target/installer',
+    [string]$CompilerPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,15 +18,21 @@ if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
-$compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-if ($null -eq $compiler) {
-    $compilerPath = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-    if (-not (Test-Path -LiteralPath $compilerPath)) { throw 'Inno Setup 6 is required to build the installer' }
-} else { $compilerPath = $compiler.Source }
-if ([System.Diagnostics.FileVersionInfo]::GetVersionInfo($compilerPath).FileMajorPart -ne 6) {
-    throw 'The native lifecycle declarations require the 32-bit Inno Setup 6 compiler'
+if (-not $CompilerPath) {
+    $installedCompiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+    if (Test-Path -LiteralPath $installedCompiler) { $CompilerPath = $installedCompiler }
+    else {
+        $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+        if ($null -eq $compiler) { throw 'Inno Setup 6 is required to build the installer' }
+        $CompilerPath = $compiler.Source
+    }
 }
-& $compilerPath '/Qp' "/DAppVersion=$Version" "/DApplicationBinary=$ExecutablePath" "/DInstallerOutputDirectory=$OutputDirectory" (Join-Path $repository 'packaging/windows/rust-switcher.iss')
+$CompilerPath = (Resolve-Path -LiteralPath $CompilerPath).Path
+$compilerMetadata = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($CompilerPath)
+Write-Output "Inno compiler: $CompilerPath; FileVersion=$($compilerMetadata.FileVersion); ProductVersion=$($compilerMetadata.ProductVersion)"
+# ISCC's executable metadata is independent of the compiler DLL version. The
+# script checks the actual compiler's VER with EncodeVer before compiling code.
+& $CompilerPath '/Qp' "/DAppVersion=$Version" "/DApplicationBinary=$ExecutablePath" "/DInstallerOutputDirectory=$OutputDirectory" (Join-Path $repository 'packaging/windows/rust-switcher.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed' }
 $installer = Join-Path $OutputDirectory 'rust-switcher-setup.exe'
 if (-not (Test-Path -LiteralPath $installer)) { throw 'The compiler did not produce the installer' }

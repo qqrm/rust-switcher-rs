@@ -383,8 +383,11 @@ function Start-Installed {
 function Stop-Installed {
     $processes = @(Get-InstalledProcesses)
     if (-not $processes.Count) { return }
-    $null = Invoke-Logged $installedExe @('--quit-for-update') 'application-quit' 15
     foreach ($process in $processes) {
+        if ($process.HasExited) { continue }
+        $quitArguments = @('--quit-for-update')
+        if ($Application -eq 'brightwheel') { $quitArguments += "--quit-for-update=$($process.Id)" }
+        $null = Invoke-Logged $installedExe $quitArguments "application-quit-$($process.Id)" 15
         if (-not $process.WaitForExit(10000)) { throw 'Installed application did not stop after its quit command.' }
     }
 }

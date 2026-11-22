@@ -41,7 +41,7 @@ function Get-InstalledVersion {
         if ($null -eq $key) { throw 'The managed-update test requires an installed Inno package.' }
         try {
             $registered = [IO.Path]::GetFullPath((Join-Path ([string]$key.GetValue('InstallLocation')) $exeName))
-            if ($registered -ine $InstalledExecutable) { throw 'The Inno registration does not own the test executable.' }
+            if ($registered -ne $InstalledExecutable) { throw 'The Inno registration does not own the test executable.' }
             return [string]$key.GetValue('DisplayVersion')
         } finally { $key.Dispose() }
     } finally { $base.Dispose() }
