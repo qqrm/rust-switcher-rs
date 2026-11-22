@@ -63,11 +63,11 @@ impl IsolatedHotkeyEnv {
     }
 
     fn tap(&mut self, chord: HotkeyChord, now_ms: u64) -> SequenceMatch {
-        if let Some(slot) =
+        if let Some(deferred) =
             take_deferred_sequence_disambiguated_by_chord(&mut self.state, chord, now_ms)
         {
             self.state.hotkey_sequence_progress = Default::default();
-            self.fired.push(slot);
+            self.fired.push(deferred.slot);
         }
 
         let result = try_match_any_sequence_slot(&mut self.state, chord, now_ms);
@@ -232,10 +232,7 @@ mod tests {
                 DEFERRED_SEQUENCE_DISAMBIGUATION_MS
             )
         );
-        assert_eq!(
-            env.fire_deferred_timeout(),
-            Some(HotkeySlot::LastSequence)
-        );
+        assert_eq!(env.fire_deferred_timeout(), Some(HotkeySlot::LastSequence));
 
         assert_eq!(
             env.fired(),

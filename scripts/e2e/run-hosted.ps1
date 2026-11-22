@@ -30,6 +30,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class HostedInput {
     [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public UNION data; }
     [StructLayout(LayoutKind.Explicit)] public struct UNION {
@@ -95,6 +96,7 @@ public static class HostedInput {
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint thread);
@@ -111,6 +113,16 @@ public static class HostedInput {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "SendInput did not inject one event");
     }
     public static int InputSize() { return Marshal.SizeOf<INPUT>(); }
+    private static INPUT InputKey(ushort key, bool up) {
+        var input = new INPUT(); input.type = 1; input.data.keyboard.key = key;
+        input.data.keyboard.flags = up ? 2u : 0u; return input;
+    }
+    public static void DoubleShiftThenTab() {
+        var input = new[] {InputKey(0xA0, false), InputKey(0xA0, true),
+            InputKey(0xA0, false), InputKey(0xA0, true), InputKey(9, false), InputKey(9, true)};
+        if (SendInput((uint)input.Length, input, Marshal.SizeOf<INPUT>()) != (uint)input.Length)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Shortcut/Tab batch was incomplete");
+    }
     private static void ReleaseAfterIncompleteBatch(ushort modifier, ushort firstKey) {
         try { Key(firstKey, true); } catch { }
         try { Key(modifier, true); } catch { }
@@ -166,6 +178,39 @@ public static class HostedInput {
         IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)] static extern IntPtr ReadSelection(
         IntPtr window, uint message, out uint start, out uint end, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr ReadText(IntPtr window, uint message, UIntPtr capacity, StringBuilder text, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr WriteText(IntPtr window, uint message, UIntPtr w, string text, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW", SetLastError=true)] static extern IntPtr WindowStyle(IntPtr window, int index);
+    public static string FixtureText(IntPtr window) {
+        var text = new StringBuilder(256); UIntPtr result;
+        if (ReadText(window, 0xD, new UIntPtr((uint)text.Capacity), text, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned fixture text read failed");
+        return text.ToString();
+    }
+    public static void SetFixtureText(IntPtr window, string text) {
+        UIntPtr result;
+        if (WriteText(window, 0xC, UIntPtr.Zero, text, 2, 1000, out result) == IntPtr.Zero || result == UIntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned fixture text setup failed");
+    }
+    public static void SetFixturePassword(IntPtr window, bool enabled) {
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0x8013, new UIntPtr(enabled ? 1u : 0u), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned password fixture setup failed");
+        if (result.ToUInt64() != 1) throw new InvalidOperationException("Owned password fixture did not acknowledge setup");
+        if (((WindowStyle(window, -16).ToInt64() & 0x20) != 0) != enabled)
+            throw new InvalidOperationException("Owned fixture did not change its ES_PASSWORD style");
+    }
+    public static bool PasswordFixtureTextMatches(IntPtr window, uint sample) {
+        if ((WindowStyle(window, -16).ToInt64() & 0x20) == 0)
+            throw new InvalidOperationException("Password assertion requires a real ES_PASSWORD Edit");
+        UIntPtr result;
+        if (SendMessageTimeout(window, 0x8014, new UIntPtr(sample), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Owned password fixture comparison failed");
+        if (result.ToUInt64() > 1) throw new InvalidOperationException("Unknown synthetic password sample");
+        return result.ToUInt64() == 1;
+    }
     public static void SelectFixtureText(IntPtr window, int length) {
         UIntPtr result;
         if (SendMessageTimeout(window, 0xB1, UIntPtr.Zero, new IntPtr(length), 2, 1000, out result) == IntPtr.Zero)
@@ -200,6 +245,8 @@ public static class HostedInput {
         UIntPtr result;
         if (SendMessageTimeout(window, 0x8011, new UIntPtr(mode), IntPtr.Zero, 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Fixture trap setup failed");
+        if (result.ToUInt64() != 1)
+            throw new InvalidOperationException("Fixture trap did not acknowledge setup");
     }
     public static int ResetJournalFixture(IntPtr window) {
         UIntPtr result;
@@ -284,6 +331,43 @@ function Focus-SettingsEditor($Window, $Editor) {
         [HostedInput]::GetForegroundWindow() -eq $appHandle -and
             [HostedInput]::WindowFocus($appHandle) -eq $editorHandle
     } 'settings hotkey editor native focus'
+}
+function Set-OwnedControlFocus($SourceWindow, $SourceEdit) {
+    $windowHandle = [IntPtr]$SourceWindow.Current.NativeWindowHandle
+    $editHandle = [IntPtr]$SourceEdit.Current.NativeWindowHandle
+    $deadline = [DateTime]::UtcNow.AddSeconds(4)
+    $stableSamples = 0
+    $requests = 0
+    $actualForeground = [IntPtr]::Zero
+    $actualFocus = [IntPtr]::Zero
+    $uiaFocused = $false
+    $lastError = $null
+    [HostedInput]::ShowWindow($windowHandle, 9) | Out-Null
+    do {
+        try {
+            $actualForeground = [HostedInput]::GetForegroundWindow()
+            $actualFocus = [HostedInput]::WindowFocus($windowHandle)
+            $uiaFocused = $SourceEdit.Current.HasKeyboardFocus
+            if ($actualForeground -eq $windowHandle -and $actualFocus -eq $editHandle -and $uiaFocused) {
+                $stableSamples++
+                if ($stableSamples -ge 3) { return $requests }
+            } else {
+                $stableSamples = 0
+                if ($actualForeground -ne $windowHandle) {
+                    [HostedInput]::SetForegroundWindow($windowHandle) | Out-Null
+                }
+                # Activation and UIA focus are asynchronous across processes.
+                # Reissue setup focus only; no tested key has been sent yet.
+                $SourceEdit.SetFocus()
+                $requests++
+            }
+        } catch {
+            $stableSamples = 0
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Modifier source focus setup failed: expectedWindow=$windowHandle expectedEdit=$editHandle actualForeground=$actualForeground actualFocus=$actualFocus uiaFocused=$uiaFocused requests=$requests lastError=$lastError"
 }
 function Find-Control($Window, [string]$Name) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
@@ -713,6 +797,158 @@ try {
         Assert-Value $editValue 'привет' "release conversion recovers after adversarial mode $mode"
         Wait-Condition { [HostedInput]::HasSelection($editHandle, 6) } 'adversarial recovery input completed'
     }
+
+    # Restart without changing the default Double Shift binding, then exercise
+    # a complete phrase with a fresh selection provider.
+    Quit-Owned $release $window
+    $release = Start-Switcher $ReleaseExe $releaseProfile $false
+    Wait-Condition { $null -ne (Find-AppWindow $release) } 'release Double Shift restart'
+    $window = Find-AppWindow $release
+
+    # Prepopulated two-word text cannot be recovered from the typing journal.
+    # Do not retry the hotkey or restore focus/selection after either gesture.
+    $phrase = 'ghbdtn vbh'
+    $editValue.SetValue($phrase)
+    $otherValue.SetValue('untouched')
+    $editorHandle = [IntPtr]$editorWindow.Current.NativeWindowHandle
+    Set-OwnedControlFocus $editorWindow $edit | Out-Null
+    [HostedInput]::SelectFixtureText($editHandle, $phrase.Length)
+    $selectionClipboard = [HostedInput]::GetClipboardSequenceNumber()
+    if ($selectionClipboard -eq 0) { throw 'Clipboard sequence is unavailable before Double Shift' }
+    foreach ($expected in @('привет мир', $phrase)) {
+        Tap-Shift 2
+        Wait-Condition { $editValue.Current.Value -ceq $expected } 'one Double Shift converts the complete selected phrase'
+        Wait-Condition { [HostedInput]::HasSelection($editHandle, $expected.Length) } 'Double Shift restores the complete selection'
+        # Catch a duplicate queued command reversing a briefly correct result.
+        Start-Sleep -Milliseconds 150
+        if ($editValue.Current.Value -cne $expected -or
+            -not [HostedInput]::HasSelection($editHandle, $expected.Length)) {
+            throw 'One Double Shift did not produce one stable phrase conversion and reselection'
+        }
+        if ([HostedInput]::GetForegroundWindow() -ne $editorHandle -or
+            [HostedInput]::WindowFocus($editorHandle) -ne $editHandle) {
+            throw 'Double Shift moved focus away from the selected phrase'
+        }
+        if ($otherValue.Current.Value -cne 'untouched') { throw 'Double Shift changed the other editor field' }
+        if ([HostedInput]::GetClipboardSequenceNumber() -ne $selectionClipboard) { throw 'Double Shift changed the clipboard' }
+        Record-Pass "release Double Shift converts exactly once with selection and focus preserved: $expected"
+    }
+    # Windows denies cross-process reads of a native password Edit. Exercise
+    # actual typed-journal conversion instead, with the existing debug-only
+    # injected-input opt-in restricted to this owned editor process. The release
+    # selection path has already been verified above without that opt-in.
+    Quit-Owned $release $window
+    $passwordProfile = Join-Path $runRoot 'native-password-profile'
+    $passwordOutputStart = $switcherOutputTasks.Count
+    $debug = Start-Switcher $DebugExe $passwordProfile $true -JournalFixturePid $editor.Id
+    Wait-Condition { $null -ne (Find-AppWindow $debug) } 'native password journal startup'
+    $passwordWindow = Find-AppWindow $debug
+    $passwordAppHandle = [IntPtr]$passwordWindow.Current.NativeWindowHandle
+    Set-OwnedControlFocus $editorWindow $edit | Out-Null
+    if ([HostedInput]::SecurityMetadata($passwordAppHandle, 0) -ne 0x52535031 -or
+        [HostedInput]::SecurityMetadata($passwordAppHandle, 4) -ne 0) {
+        throw 'Native password journal metadata or default AutoConvert state is invalid'
+    }
+    function Initialize-NativePassword([string]$Text, [uint]$Sample) {
+        [HostedInput]::SetFixtureText($editHandle, '')
+        [HostedInput]::SetFixtureText($otherHandle, 'untouched')
+        if (-not [HostedInput]::PostMessage($editorHandle, 0x50, [UIntPtr]::Zero, $english)) {
+            throw 'Native password English layout request was rejected'
+        }
+        Wait-Condition { [HostedInput]::WindowLayout($editorHandle) -eq $english } 'native password English layout'
+        Set-OwnedControlFocus $editorWindow $edit | Out-Null
+        Tap-Key 0x1B
+        $uiaPassword = $edit.Current.IsPassword
+        $fixtureEmpty = [HostedInput]::PasswordFixtureTextMatches($editHandle, 0)
+        $activeChars = [HostedInput]::SecurityMetadata($passwordAppHandle, 1)
+        Write-Output "Native password setup: IsPassword=$uiaPassword fixtureEmpty=$fixtureEmpty activeChars=$activeChars"
+        if (-not $uiaPassword) { throw 'Refreshed native password UIA element is not classified as IsPassword' }
+        if (-not $fixtureEmpty) { throw 'Native password fixture did not empty after explicit text reset' }
+        Wait-Condition { [HostedInput]::SecurityMetadata($passwordAppHandle, 1) -eq 0 } 'empty native password journal after Escape'
+        $capturedBefore = [HostedInput]::SecurityMetadata($passwordAppHandle, 3)
+        foreach ($character in $Text.ToCharArray()) {
+            if ($character -ne ' ' -and ($character -lt 'a' -or $character -gt 'z')) {
+                throw 'Unsupported native password fixture key'
+            }
+            Tap-Key ([ushort][char]::ToUpperInvariant($character))
+        }
+        Wait-Condition { [HostedInput]::PasswordFixtureTextMatches($editHandle, $Sample) } 'complete native password fixture input'
+        Wait-Condition { [HostedInput]::SecurityMetadata($passwordAppHandle, 3) -eq $capturedBefore + $Text.Length } 'complete native password journal capture'
+        if ([HostedInput]::SecurityMetadata($passwordAppHandle, 1) -ne $Text.Length -or
+            -not [HostedInput]::HasSelectionRange($editHandle, $Text.Length, $Text.Length)) {
+            throw 'Native password journal or caret does not match the complete typed input'
+        }
+    }
+    $passwordFailure = $null
+    [HostedInput]::SetFixturePassword($editHandle, $true)
+    # The native UIA Edit proxy caches its control type when it is created.
+    # Rebind after changing the style: the earlier plain Edit element can keep
+    # reporting IsPassword=false even through its Current property accessor.
+    $edit = [System.Windows.Automation.AutomationElement]::FromHandle($editHandle)
+    try {
+        Initialize-NativePassword 'ghbdtn' 1
+        $passwordClipboard = [HostedInput]::GetClipboardSequenceNumber()
+        if ($passwordClipboard -eq 0) { throw 'Password-test clipboard sequence is unavailable' }
+        foreach ($expected in @(@{ Sample = 2; Direction = 'EN to RU' }, @{ Sample = 1; Direction = 'RU to EN' })) {
+            Tap-Shift 2
+            Wait-Condition { [HostedInput]::PasswordFixtureTextMatches($editHandle, $expected.Sample) } 'native password journal converts exactly'
+            Wait-Condition { [HostedInput]::HasSelectionRange($editHandle, 6, 6) } 'native password caret after conversion'
+            Start-Sleep -Milliseconds 150
+            if (-not [HostedInput]::PasswordFixtureTextMatches($editHandle, $expected.Sample)) {
+                throw 'Native password conversion was not stable'
+            }
+            if ([HostedInput]::GetForegroundWindow() -ne $editorHandle -or
+                [HostedInput]::WindowFocus($editorHandle) -ne $editHandle -or
+                [HostedInput]::FixtureText($otherHandle) -cne 'untouched' -or
+                [HostedInput]::GetClipboardSequenceNumber() -ne $passwordClipboard) {
+                throw 'Native password conversion changed focus, another field or clipboard'
+            }
+            Record-Pass "native password journal converts exactly with default Double Shift: $($expected.Direction)"
+        }
+        Initialize-NativePassword 'ghbdtn ' 3
+        Set-Content -LiteralPath $signalPath -Value 'ready' -NoNewline
+        [HostedInput]::DoubleShiftThenTab()
+        Wait-Condition { (Get-Content -LiteralPath $signalPath -Raw) -ceq 'tab' -and
+            [HostedInput]::WindowFocus($editorHandle) -eq $otherHandle } 'actual native Tab reaches the neighboring editor'
+        Start-Sleep -Milliseconds 1600
+        if ([HostedInput]::FixtureText($otherHandle) -cne 'untouched') {
+            throw 'WRONG_TARGET_WRITE: native password conversion reached the field selected by Tab'
+        }
+        if (-not [HostedInput]::PasswordFixtureTextMatches($editHandle, 3) -and
+            -not [HostedInput]::PasswordFixtureTextMatches($editHandle, 4)) {
+            throw 'PARTIAL_SOURCE_WRITE: native shortcut/Tab partially changed the password source'
+        }
+        if ([HostedInput]::GetClipboardSequenceNumber() -ne $passwordClipboard) {
+            throw 'Native password shortcut/Tab changed the clipboard'
+        }
+        Record-Pass 'native password Double Shift followed immediately by Tab preserves source ownership'
+    } catch {
+        $passwordFailure = $_
+        throw
+    } finally {
+        try { [HostedInput]::SetFixturePassword($editHandle, $false) }
+        catch {
+            if ($null -eq $passwordFailure) { throw }
+            Write-Warning "Native password fixture cleanup also failed: $($_.Exception.Message)"
+        }
+    }
+    Quit-Owned $debug $passwordWindow
+    $passwordDiagnostics = ''
+    foreach ($outputTask in $switcherOutputTasks.ToArray()[$passwordOutputStart..($passwordOutputStart + 1)]) {
+        if (-not $outputTask.Wait(1000)) { throw 'Native password diagnostics did not drain after exit' }
+        $passwordDiagnostics += $outputTask.Result
+    }
+    if ([string]::IsNullOrWhiteSpace($passwordDiagnostics)) { throw 'Native password redaction check requires actual diagnostics' }
+    $passwordConfig = Get-Content -LiteralPath (Join-Path $passwordProfile 'RustSwitcherDebug/config.json') -Raw
+    foreach ($sample in @('ghbdtn', 'привет')) {
+        if ($passwordDiagnostics.Contains($sample) -or $passwordConfig.Contains($sample)) {
+            throw 'INPUT_LOG_VIOLATION: native password diagnostics or saved profile contain synthetic input'
+        }
+    }
+    Record-Pass 'native password diagnostics and saved profile exclude synthetic input'
+    $release = Start-Switcher $ReleaseExe $releaseProfile $false
+    Wait-Condition { $null -ne (Find-AppWindow $release) } 'release restart after native password checks'
+    $window = Find-AppWindow $release
     # Closing our fixture through its real window message loop leaves no input target behind.
     [HostedInput]::PostMessage([IntPtr]$editorWindow.Current.NativeWindowHandle, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     if (-not $editor.WaitForExit(5000)) { throw 'Isolated editor did not close' }

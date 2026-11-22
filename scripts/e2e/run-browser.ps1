@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$DebugExe,
+    [string]$ReleaseExe,
     [switch]$SecurityOnly
 )
 
@@ -14,6 +15,7 @@ if (-not [Environment]::UserInteractive -or (Get-Process -Id $PID).SessionId -eq
     throw 'An interactive Windows session is required.'
 }
 $DebugExe = (Resolve-Path -LiteralPath $DebugExe).Path
+if ($ReleaseExe -and -not $SecurityOnly) { $ReleaseExe = (Resolve-Path -LiteralPath $ReleaseExe).Path }
 $runRoot = Join-Path $env:RUNNER_TEMP ('switcher-browser-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 $results = [System.Collections.Generic.List[object]]::new()
@@ -96,7 +98,9 @@ public static class BrowserInput {
     [DllImport("user32.dll", SetLastError=true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint thread);
     [DllImport("user32.dll", SetLastError=true)] private static extern bool GetGUIThreadInfo(uint thread, ref GUI_THREAD_INFO info);
@@ -191,6 +195,21 @@ public static class BrowserInput {
         result.afterRest = Snapshot(window);
         return result;
     }
+    public static double DoubleShiftThenTab(IntPtr window, int delayMs) {
+        if (GetForegroundWindow() != window || delayMs < 0)
+            throw new InvalidOperationException("Invalid shortcut/Tab destination");
+        var shortcut = new[] {Event(0xA0, false), Event(0xA0, true), Event(0xA0, false), Event(0xA0, true)};
+        if (delayMs == 0) {
+            Send(new[] {shortcut[0], shortcut[1], shortcut[2], shortcut[3], Event(0x09, false), Event(0x09, true)});
+            return 0;
+        }
+        Send(shortcut);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        Thread.Sleep(delayMs);
+        double elapsed = clock.Elapsed.TotalMilliseconds;
+        Send(new[] {Event(0x09, false), Event(0x09, true)});
+        return elapsed;
+    }
     public static void Click(IntPtr window, int x, int y) {
         RECT bounds;
         if (GetForegroundWindow() != window || !GetWindowRect(window, out bounds) ||
@@ -258,6 +277,20 @@ function Focus-Browser($Session) {
 function Tap-BrowserKey([ushort]$Key) {
     [BrowserInput]::Key($Key, $false)
     try { Start-Sleep -Milliseconds 20 } finally { [BrowserInput]::Key($Key, $true) }
+}
+function Tap-BrowserDoubleShift {
+    Tap-BrowserKey 0xA0
+    Start-Sleep -Milliseconds 100
+    Tap-BrowserKey 0xA0
+}
+
+function Assert-DiagnosticRedaction([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { throw 'Debug redaction check requires actual diagnostic output' }
+    foreach ($secret in @('ghbdtnvbh', 'приветмир')) {
+        if ($Text.Contains($secret, [StringComparison]::Ordinal)) {
+            throw 'INPUT_LOG_VIOLATION: diagnostics contain the synthetic password or its conversion'
+        }
+    }
 }
 function Set-BrowserEnglish($Session) {
     if (-not [BrowserInput]::PostMessage($Session.Handle, 0x50, [UIntPtr]::Zero, $english)) { throw 'Browser layout request failed' }
@@ -356,9 +389,7 @@ function Invoke-BrowserClickRecovery($Session, [string]$Field, [hashtable]$Case,
     if (-not (Read-Browser $Session "fixture.select('$Field', true)")) {
         throw 'Refused click target lost focus before selection recovery'
     }
-    Tap-BrowserKey 0xA0
-    Start-Sleep -Milliseconds 100
-    Tap-BrowserKey 0xA0
+    Tap-BrowserDoubleShift
     Wait-Browser { (Read-Browser $Session 'fixture.values()').$Field -ceq $Case.Expected } 'same-control selection recovery'
     $Recovery.selectionResult = (Read-Browser $Session 'fixture.values()').$Field
     if ($Recovery.selectionResult -cne $Case.Expected) { throw 'Selection recovery did not preserve the exact converted text' }
@@ -651,8 +682,166 @@ try {
     $securityStart = $results.Count
     & (Join-Path $PSScriptRoot 'browser-security-cases.ps1') -Sessions $sessions `
         -SwitcherProcess $switcher -Results $results -Failures $failures
-    if ($results.Count - $securityStart -ne 7) {
-        throw "Expected 7 browser password cases, found $($results.Count - $securityStart)"
+    if ($results.Count - $securityStart -ne 6) {
+        throw "Expected 5 mandatory password cases and 1 provider-capability result, found $($results.Count - $securityStart)"
+    }
+    # End the debug phase cleanly before inspecting its actual diagnostics/profile.
+    if (-not [BrowserInput]::PostMessage($switcher.MainWindowHandle, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
+        -not $switcher.WaitForExit(8000) -or $switcher.ExitCode -ne 0) {
+        throw 'Debug Switcher did not exit after password checks'
+    }
+    $switcherOutput.Wait()
+    $switcherErrors.Wait()
+    Assert-DiagnosticRedaction ($switcherOutput.Result + "`n" + $switcherErrors.Result)
+    foreach ($file in Get-ChildItem -LiteralPath $switcherProfile -File -Recurse) {
+        $contents = [System.IO.File]::ReadAllText($file.FullName)
+        if ($contents.Contains('ghbdtnvbh') -or $contents.Contains('приветмир')) {
+            throw 'INPUT_PERSISTENCE_VIOLATION: profile contains the synthetic password'
+        }
+    }
+    Write-Output 'PASS: actual debug diagnostics and saved profile exclude synthetic password text'
+    if ($ReleaseExe -and -not $SecurityOnly) {
+        $releaseProfile = Join-Path $runRoot 'release-double-shift-profile'
+        New-Item -ItemType Directory -Path $releaseProfile | Out-Null
+        # Let the application create its complete default configuration,
+        # including the shared Double Shift selection and last-word binding.
+        $releaseInfo = [System.Diagnostics.ProcessStartInfo]::new($ReleaseExe)
+        $releaseInfo.UseShellExecute = $false
+        $releaseInfo.CreateNoWindow = $true
+        $releaseInfo.Environment['APPDATA'] = $releaseProfile
+        foreach ($variable in @('RUST_SWITCHER_E2E_PLAYGROUND', 'RUST_SWITCHER_E2E_ALLOW_INJECTED', 'RUST_SWITCHER_E2E_TARGET_PID')) {
+            $releaseInfo.Environment.Remove($variable) | Out-Null
+        }
+        $release = [System.Diagnostics.Process]::Start($releaseInfo)
+        $ownedProcesses.Add($release)
+        Wait-Browser {
+            if ($release.HasExited) { throw "Release Switcher exited during startup: $($release.ExitCode)" }
+            $release.Refresh()
+            $release.MainWindowHandle -ne [IntPtr]::Zero
+        } 'release Switcher window for Double Shift'
+        $releaseWindow = $release.MainWindowHandle
+        if ([BrowserInput]::ProcessOf($releaseWindow) -ne $release.Id) {
+            throw 'Release Switcher window is not owned by the launched process'
+        }
+        # Queue the normal close-to-tray command after startup shows Settings.
+        # Observe its completion before transferring focus to the browser.
+        if (-not [BrowserInput]::PostMessage($releaseWindow, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero)) {
+            throw 'Release Switcher Settings close-to-tray command failed'
+        }
+        Wait-Browser {
+            if ($release.HasExited) { throw "Release Switcher exited while hiding Settings: $($release.ExitCode)" }
+            -not [BrowserInput]::IsWindowVisible($releaseWindow)
+        } 'release Switcher Settings hidden to tray'
+        # Read only the selected range; never repair it or focus after Double Shift.
+        $selectionProbe = @'
+(() => {
+  const element = document.getElementById('a');
+  if (!element.isContentEditable) return {
+    complete: element.selectionStart === 0 && element.selectionEnd === element.value.length,
+    text: element.value.slice(element.selectionStart, element.selectionEnd)
+  };
+  const selection = document.getSelection();
+  return {
+    complete: selection.rangeCount === 1 && element.contains(selection.anchorNode) &&
+      element.contains(selection.focusNode) && selection.toString() === element.textContent,
+    text: selection.toString()
+  };
+})()
+'@
+        $stateProbe = "({value: fixture.values().a, selection: $selectionProbe, dom: fixture.diagnostics()})"
+        foreach ($kind in @('input', 'editable')) {
+            $record = [ordered]@{name = "release-double-shift-$kind"; kind = $kind; mode = 'release-double-shift';
+                attempted = @(); conversions = @(); focusBefore = $null; actualBefore = $null;
+                selectionBefore = $null; actualAfter = $null; selectionAfter = $null; finalFocus = $null;
+                otherFieldsUnchanged = $null; clipboardBefore = $null; clipboardAfter = $null;
+                clipboardUnchanged = $null; diagnosticErrors = @(); error = $null}
+            $session = $sessions.a
+            $expectedOtherReady = $false
+            try {
+                $expectedOther = @{}
+                foreach ($sessionId in @('a', 'b')) {
+                    Read-Browser $sessions[$sessionId] "fixture.reset('$kind')" | Out-Null
+                    Set-BrowserEnglish $sessions[$sessionId]
+                    $values = Read-Browser $sessions[$sessionId] 'fixture.values()'
+                    foreach ($field in @('a', 'b', 'guard')) {
+                        if ($sessionId -ne 'a' -or $field -ne 'a') { $expectedOther["$sessionId/$field"] = $values.$field }
+                    }
+                }
+                $expectedOtherReady = $true
+                Read-Browser $session "fixture.set('a', 'ghbdtn vbh')" | Out-Null
+                Focus-BrowserEditor $session 'a'
+                if (-not (Read-Browser $session "fixture.select('a', true)")) { throw 'Initial Double Shift selection lost focus' }
+                $nativeBefore = [BrowserInput]::Snapshot($session.Handle)
+                $record.focusBefore = @{native = $nativeBefore; dom = $null}
+                try {
+                    $initial = Read-Browser $session $stateProbe
+                    $record.focusBefore.dom = $initial.dom
+                    $record.actualBefore = $initial.value
+                    $record.selectionBefore = $initial.selection
+                } catch { $record.diagnosticErrors += "initial browser state: $($_.Exception.Message)" }
+                if ([BrowserInput]::ClassOf([IntPtr]$nativeBefore.focus) -match '^(Edit|RichEdit.*|RICHEDIT.*)$') {
+                    throw 'Release browser Double Shift must exercise UIA rather than the native Edit fallback'
+                }
+                $clipboardBefore = [BrowserInput]::GetClipboardSequenceNumber()
+                $record.clipboardBefore = $clipboardBefore
+                if ($clipboardBefore -eq 0) { throw 'Clipboard sequence is unavailable before browser Double Shift' }
+                foreach ($expected in @('привет мир', 'ghbdtn vbh')) {
+                    $record.attempted += $expected
+                    Tap-BrowserDoubleShift
+                    Wait-Browser { (Read-Browser $session 'fixture.values()').a -ceq $expected } 'one Double Shift converts the complete browser phrase'
+                    Wait-Browser {
+                        $selection = Read-Browser $session $selectionProbe
+                        $selection.complete -eq $true -and $selection.text -ceq $expected
+                    } 'release Double Shift restores the full browser selection'
+                    Start-Sleep -Milliseconds 150
+                    $selection = Read-Browser $session $selectionProbe
+                    if ((Read-Browser $session 'fixture.values()').a -cne $expected -or
+                        $selection.complete -ne $true -or $selection.text -cne $expected) {
+                        throw 'One Double Shift did not produce one stable browser phrase conversion and reselection'
+                    }
+                    $record.finalFocus = Get-BrowserFocusSnapshot $session
+                    Assert-BrowserTargetFocus $nativeBefore $record.finalFocus 'a' ($session.Handle.ToInt64())
+                    Assert-BrowserOtherFields $sessions $expectedOther
+                    if ([BrowserInput]::GetClipboardSequenceNumber() -ne $clipboardBefore) { throw 'Browser Double Shift changed the clipboard' }
+                    $record.conversions += $expected
+                }
+            } catch {
+                $record.error = $_.Exception.Message
+                $failures.Add("$($record.name): $($record.error)")
+            } finally {
+                # Keep the original failure and observe the unrepaired target,
+                # including a timeout before the first successful conversion.
+                $record.finalFocus = @{native = $null; dom = $null}
+                try { $record.finalFocus.native = [BrowserInput]::Snapshot($session.Handle) }
+                catch { $record.diagnosticErrors += "final native focus: $($_.Exception.Message)" }
+                try {
+                    $final = Read-Browser $session $stateProbe
+                    $record.actualAfter = $final.value
+                    $record.selectionAfter = $final.selection
+                    $record.finalFocus.dom = $final.dom
+                } catch { $record.diagnosticErrors += "final browser state: $($_.Exception.Message)" }
+                if ($expectedOtherReady) {
+                    $record.otherFieldsUnchanged = $false
+                    try {
+                        Assert-BrowserOtherFields $sessions $expectedOther
+                        $record.otherFieldsUnchanged = $true
+                    } catch { $record.diagnosticErrors += "other fields: $($_.Exception.Message)" }
+                }
+                try {
+                    $record.clipboardAfter = [BrowserInput]::GetClipboardSequenceNumber()
+                    if ($null -ne $record.clipboardBefore) {
+                        $record.clipboardUnchanged = $record.clipboardAfter -eq $record.clipboardBefore
+                    }
+                } catch { $record.diagnosticErrors += "final clipboard sequence: $($_.Exception.Message)" }
+            }
+            $results.Add([pscustomobject]$record)
+            $record | ConvertTo-Json -Depth 6 -Compress | Write-Output
+            if ($null -eq $record.error) { Write-Output "PASS: $($record.name)" } else { Write-Output "FAIL: $($record.name)" }
+        }
+        if (-not [BrowserInput]::PostMessage($releaseWindow, 0x111, [UIntPtr]1103, [IntPtr]::Zero) -or
+            -not $release.WaitForExit(8000) -or $release.ExitCode -ne 0) {
+            throw 'Release Switcher did not exit after browser Double Shift checks'
+        }
     }
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
 } catch {
@@ -678,7 +867,10 @@ try {
             if ($null -ne $outputTask -and $outputTask.Wait(1000)) { Write-Output $outputTask.Result }
         }
     }
-    $report = [ordered]@{passed = @($results | Where-Object { $null -eq $_.error }).Count;
+    $report = [ordered]@{passed = @($results | Where-Object {
+            $null -eq $_.error -and -not ($_.PSObject.Properties['uncovered'] -and $_.uncovered)
+        }).Count;
+        uncovered = @($results | Where-Object { $_.PSObject.Properties['uncovered'] -and $_.uncovered }).Count;
         total = $results.Count; ordinaryOutcomes = $ordinaryOutcomes; cases = $results.ToArray(); failures = $failures.ToArray(); failure = $failure;
         cleanupErrors = $cleanupErrors.ToArray(); commit = $env:GITHUB_SHA; run = $env:GITHUB_RUN_ID}
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runRoot 'result.json')

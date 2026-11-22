@@ -107,6 +107,8 @@ jobs:
               'scripts/e2e/winget-trusted-source.ps1', 'scripts/e2e/inno-array-probe.ps1',
               'scripts/e2e/installer-updater.ps1', 'scripts/e2e/run-browser.ps1',
               'scripts/e2e/browser-security-cases.ps1', 'scripts/e2e/run-security-mutation.ps1',
+              'scripts/e2e/run-target-regression.ps1', 'scripts/e2e/run-hosted.ps1',
+              'scripts/e2e/editor-fixture.ps1',
               'scripts/e2e/test-browser-cdp.ps1', 'scripts/e2e/test-browser-outcomes.ps1')) {
             $tokens = $null
             $parseErrors = $null
@@ -189,15 +191,15 @@ jobs:
           RUST_SWITCHER_HOSTED_E2E: '1'
         run: ./scripts/e2e/autostart-live.ps1 -ReleaseExe ./target/release/rust-switcher.exe
 
-      - name: Verify Double Alt in real browser fields
+      - name: Verify browser password conversion and release Double Shift
         if: ${{ !cancelled() && steps.desktop_build.outcome == 'success' }}
         timeout-minutes: 8
         shell: pwsh
         env:
           RUST_SWITCHER_HOSTED_E2E: '1'
-        run: ./scripts/e2e/run-browser.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe
+        run: ./scripts/e2e/run-browser.ps1 -DebugExe ./target/debug/rust-switcher-debug.exe -ReleaseExe ./target/release/rust-switcher.exe
 
-      - name: Reject a build with UIA password protection removed
+      - name: Reject a build that writes conversion into the wrong target
         if: ${{ !cancelled() && steps.desktop_build.outcome == 'success' }}
         timeout-minutes: 8
         shell: pwsh

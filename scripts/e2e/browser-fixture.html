@@ -18,6 +18,8 @@
   const events = [];
   let delayedFocus = null;
   let stopDelayedFocus = null;
+  let shortcutTab = null;
+  let stopShortcutTab = null;
 
   function observe(doc) {
     for (const type of ['keydown', 'keyup', 'focusin', 'focusout']) {
@@ -59,7 +61,10 @@
   window.fixture = {
     async reset(kind) {
       if (stopDelayedFocus) stopDelayedFocus();
+      if (stopShortcutTab) stopShortcutTab();
       stopDelayedFocus = null;
+      stopShortcutTab = null;
+      shortcutTab = null;
       delayedFocus = null;
       const root = document.getElementById('editors');
       root.replaceChildren();
@@ -183,6 +188,29 @@
       return true;
     },
     delayedFocusState() { return delayedFocus; },
+    armShortcutTabProbe() {
+      if (deepActive() !== fields.a || !document.hasFocus()) {
+        throw new Error('Shortcut/Tab probe requires source focus');
+      }
+      if (stopShortcutTab) stopShortcutTab();
+      const state = {sourceBefore: read(fields.a), destinationBefore: read(fields.b),
+        sourceOwner: 'a', finalOwner: 'a', complete: false, events: []};
+      shortcutTab = state;
+      const controller = new AbortController();
+      stopShortcutTab = () => controller.abort();
+      for (const type of ['keydown', 'keyup', 'input', 'focusin']) {
+        document.addEventListener(type, event => {
+          if (state.events.length >= 256) throw new Error('Shortcut/Tab event proof overflow');
+          state.events.push({type, target: event.target.id ?? '', key: event.key ?? '',
+            data: event.data ?? '', trusted: event.isTrusted,
+            eventAt: event.timeStamp, at: performance.now()});
+          state.finalOwner = deepActive()?.id ?? '';
+          if (type === 'focusin' && event.target === fields.b) state.complete = true;
+        }, {capture: true, passive: true, signal: controller.signal});
+      }
+      return true;
+    },
+    shortcutTabState() { return shortcutTab; },
     diagnostics() {
       const active = deepActive();
       return {documentFocused: document.hasFocus(), activeId: active?.id ?? '',
