@@ -13,7 +13,7 @@ use std::{
     marker::PhantomData,
     rc::Rc,
     sync::{
-        Arc, LazyLock, Mutex, MutexGuard, OnceLock,
+        Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLock, TryLockError,
         atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -223,14 +223,22 @@ fn active_command_is_current() -> bool {
 /// COM interfaces remain owned by the provider worker.
 struct IdentityPublications {
     frontier: AtomicU64,
-    targets: Mutex<HashMap<Target, u64>>,
+    targets: RwLock<HashMap<Target, u64>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityUnavailable {
+    Busy,
+    Poisoned,
+    Missing,
+    NewerThanEntry,
 }
 
 impl IdentityPublications {
     fn new() -> Self {
         Self {
             frontier: AtomicU64::new(0),
-            targets: Mutex::new(HashMap::new()),
+            targets: RwLock::new(HashMap::new()),
         }
     }
 
@@ -238,25 +246,63 @@ impl IdentityPublications {
         self.frontier.load(Ordering::Acquire)
     }
 
-    fn at_admission(&self, target: Target, entry_frontier: u64) -> Option<u64> {
+    fn admission(&self, target: Target, entry_frontier: u64) -> Result<u64, IdentityUnavailable> {
         // Never wait behind a provider publication on the keyboard hook. A
         // revision established during target lookup cannot label an older key.
-        let targets = self.targets.try_lock().ok()?;
-        targets
+        let targets = self.targets.try_read().map_err(|error| match error {
+            TryLockError::WouldBlock => IdentityUnavailable::Busy,
+            TryLockError::Poisoned(_) => IdentityUnavailable::Poisoned,
+        })?;
+        let revision = targets
             .get(&target)
             .copied()
-            .filter(|revision| *revision <= entry_frontier)
+            .ok_or(IdentityUnavailable::Missing)?;
+        if revision > entry_frontier {
+            Err(IdentityUnavailable::NewerThanEntry)
+        } else {
+            Ok(revision)
+        }
+    }
+
+    #[cfg(test)]
+    fn at_admission(&self, target: Target, entry_frontier: u64) -> Option<u64> {
+        self.admission(target, entry_frontier).ok()
     }
 
     fn publish(&self, target: Target, changed: bool, forget: bool) -> u64 {
+        self.publish_with_reuse(target, changed, forget, || {})
+    }
+
+    fn publish_with_reuse(
+        &self,
+        target: Target,
+        changed: bool,
+        forget: bool,
+        reused: impl FnOnce(),
+    ) -> u64 {
+        if !changed && !forget {
+            let targets = self
+                .targets
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(revision) = targets.get(&target) {
+                // Revalidating an unchanged element must not make a concurrent
+                // text key lose its already-observed identity. This shared
+                // lookup grants no authorization; every key still needs its
+                // own fresh verified verdict after admission.
+                reused();
+                return *revision;
+            }
+        }
         let mut targets = self
             .targets
-            .lock()
+            .write()
             .unwrap_or_else(|poison| poison.into_inner());
         if forget || (targets.len() >= IDENTITY_CACHE_CAPACITY && !targets.contains_key(&target)) {
             targets.clear();
         }
         if !changed && let Some(revision) = targets.get(&target) {
+            reused();
             return *revision;
         }
         let revision = self.frontier.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
@@ -267,7 +313,7 @@ impl IdentityPublications {
     fn retire(&self, target: Target, revision: u64) {
         let mut targets = self
             .targets
-            .lock()
+            .write()
             .unwrap_or_else(|poison| poison.into_inner());
         if targets.get(&target) == Some(&revision) {
             targets.remove(&target);
@@ -319,6 +365,7 @@ struct Capture {
     target: Target,
     generation: u64,
     identity_revision: Option<u64>,
+    identity_unavailable: Option<IdentityUnavailable>,
     captured: Instant,
     _pending: PendingCapture,
 }
@@ -1051,6 +1098,7 @@ fn process_command(
                 tracing::debug!(status = ?result.status, element_changed = result.element_changed,
                     identity_matches = identity_matches(capture.identity_revision, result.identity),
                     captured_revision = ?capture.identity_revision, observed_identity = ?result.identity,
+                    admission_unavailable = ?capture.identity_unavailable,
                     "secure input: capture metadata rejected");
                 reject_probe(Probe {
                     target: capture.target,
@@ -1247,7 +1295,7 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         reject_capture(capture_generation());
         return;
     };
-    let identity_revision = PUBLISHED_IDENTITIES.at_admission(target, identity_frontier);
+    let identity = PUBLISHED_IDENTITIES.admission(target, identity_frontier);
     let Some(key) = ring_buffer::capture_keydown(kb, vk) else {
         return;
     };
@@ -1264,7 +1312,8 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         key,
         target,
         generation: expected,
-        identity_revision,
+        identity_revision: identity.ok(),
+        identity_unavailable: identity.err(),
         captured: Instant::now(),
         _pending: PendingCapture::new(expected),
     };
@@ -1878,7 +1927,7 @@ mod tests {
                                 Status::Unknown
                             } else {
                                 // Each later key still receives its own fresh
-                                // ordinary verdict for the unchanged element.
+                                // verified verdict for the unchanged element.
                                 let fresh = probe_observed_identity(
                                     false,
                                     (|| validate_capture_generation(generation), || true),
@@ -2820,12 +2869,63 @@ mod tests {
         // Publication can occur while native target lookup is still running,
         // or after its raw snapshot. Neither path may inherit the new identity.
         assert_eq!(publications.at_admission(target, entry), None);
+        assert_eq!(
+            publications.admission(target, entry),
+            Err(IdentityUnavailable::NewerThanEntry)
+        );
         let fresh = published_test_verdict(changed, false);
         assert!(!capture_metadata_allows(None, fresh));
         assert!(!capture_metadata_allows(snapshot, fresh));
         let later = publications.at_admission(target, publications.frontier());
         assert!(capture_metadata_allows(later, fresh));
         assert_eq!(publications.publish(target, false, false), changed);
+    }
+
+    #[test]
+    fn unchanged_provider_observation_keeps_the_next_burst_key_admissible() {
+        use std::{sync::mpsc, thread};
+
+        let publications = Arc::new(IdentityPublications::new());
+        let target = pointer_test_probe(0).target;
+        let revision = publications.publish(target, true, false);
+        let entry = publications.frontier();
+        let first_key = publications.at_admission(target, entry);
+        assert!(capture_metadata_allows(
+            first_key,
+            published_test_verdict(revision, false)
+        ));
+
+        let provider_publications = Arc::clone(&publications);
+        let (observed, observation_started) = mpsc::channel();
+        let (release, resume_observation) = mpsc::channel();
+        let provider = thread::spawn(move || {
+            provider_publications.publish_with_reuse(target, false, false, || {
+                // Pause inside the production reuse critical section while
+                // validating the preceding key's unchanged focused element.
+                observed.send(()).unwrap();
+                resume_observation
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            })
+        });
+        observation_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let start = Instant::now();
+        let next_key = publications.at_admission(target, entry);
+        let admission_time = start.elapsed();
+        release.send(()).unwrap();
+        let observed_revision = provider.join().unwrap();
+
+        assert!(admission_time < Duration::from_millis(100));
+        assert_eq!(observed_revision, revision);
+        assert_eq!(next_key, Some(revision));
+        // Reuse is identity evidence only. The following key must still have
+        // its own fresh verified verdict matching its event-time identity.
+        assert!(capture_metadata_allows(
+            next_key,
+            published_test_verdict(observed_revision, false)
+        ));
     }
 
     #[test]
@@ -2836,10 +2936,18 @@ mod tests {
             publications.at_admission(target, publications.frontier()),
             None
         );
+        assert_eq!(
+            publications.admission(target, publications.frontier()),
+            Err(IdentityUnavailable::Missing)
+        );
         let revision = publications.publish(target, true, false);
-        let locked = publications.targets.lock().unwrap();
+        let locked = publications.targets.write().unwrap();
         let start = Instant::now();
         let missing = publications.at_admission(target, publications.frontier());
+        assert_eq!(
+            publications.admission(target, publications.frontier()),
+            Err(IdentityUnavailable::Busy)
+        );
         assert!(start.elapsed() < Duration::from_millis(100));
         assert_eq!(missing, None);
         drop(locked);
@@ -2872,7 +2980,7 @@ mod tests {
                 false,
             );
         }
-        assert!(publications.targets.lock().unwrap().len() <= IDENTITY_CACHE_CAPACITY);
+        assert!(publications.targets.read().unwrap().len() <= IDENTITY_CACHE_CAPACITY);
         assert_eq!(
             publications.at_admission(target, publications.frontier()),
             None

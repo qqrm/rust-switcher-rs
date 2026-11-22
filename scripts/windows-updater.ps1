@@ -18,6 +18,9 @@ $candidate = $null
 $backup = $null
 $quitRequested = $false
 $startedNew = $false
+$originalProcess = $null
+$launchGate = $null
+$launchGateHeld = $false
 
 function Write-UpdateLog([string]$message) {
     try {
@@ -52,6 +55,17 @@ try {
     }
     if ($ParentPid -le 0) {
         throw "Invalid running process ID"
+    }
+    $originalProcess = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    if ($null -eq $originalProcess) {
+        Write-UpdateLog 'Original application already exited; cancelling this update'
+        return
+    }
+    # Pin the original process handle; a reused PID must not target a later launch.
+    $null = $originalProcess.Handle
+    if (-not [string]::Equals($originalProcess.Path, [IO.Path]::GetFullPath($TargetPath),
+        [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The updater parent does not match the installed executable'
     }
 
     $current = Read-Version $CurrentVersion
@@ -95,6 +109,17 @@ try {
     }
     Assert-Hash $staged $expectedHash
 
+    # A user relaunch and an update must not replace each other's running process.
+    # The quit helper bypasses this gate; newly started applications wait for finally.
+    $launchGate = [Threading.Mutex]::new($false, 'Local\RustSwitcher_SingleInstance.Restart')
+    try { $launchGateHeld = $launchGate.WaitOne(15000) }
+    catch [Threading.AbandonedMutexException] { $launchGateHeld = $true }
+    if (-not $launchGateHeld) { throw 'Another application launch is still in progress' }
+    if ($originalProcess.HasExited) {
+        Write-UpdateLog 'Original application was restarted; cancelling this stale update'
+        return
+    }
+
     # Preflight write access and make the replacement a same-directory rename.
     $directory = Split-Path -Parent $TargetPath
     $suffix = [guid]::NewGuid().ToString('N')
@@ -104,11 +129,11 @@ try {
     Assert-Hash $candidate $expectedHash
 
     Write-UpdateLog "Verified $tag; requesting graceful application exit"
+    $quit = Start-Process -FilePath $TargetPath -ArgumentList @('--quit-for-update', '--parent-pid', "$ParentPid") -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+    if ($quit.ExitCode -ne 0) { throw 'Original application no longer accepts this update' }
     $quitRequested = $true
-    Start-Process -FilePath $TargetPath -ArgumentList '--quit-for-update' -WindowStyle Hidden -Wait -ErrorAction Stop
-    $running = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
-    if ($null -ne $running -and -not $running.WaitForExit(90000)) {
-        throw "Rust Switcher did not exit within 90 seconds; the original file is unchanged"
+    if (-not $originalProcess.WaitForExit(5000)) {
+        throw "Rust Switcher did not exit within 5 seconds; the original file is unchanged"
     }
 
     # Both moves occur within the destination directory. Preserve the old binary
@@ -117,7 +142,7 @@ try {
     try {
         Assert-Hash $candidate $expectedHash
         [System.IO.File]::Move($candidate, $TargetPath)
-        Start-Process -FilePath $TargetPath -WorkingDirectory $directory -ErrorAction Stop
+        Start-Process -FilePath $TargetPath -ArgumentList '--ensure-running' -WorkingDirectory $directory -ErrorAction Stop
         $startedNew = $true
         Write-UpdateLog "Updated to $tag"
     } catch {
@@ -144,13 +169,16 @@ try {
     if ($quitRequested -and -not $startedNew -and
         (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
         try {
-            Start-Process -FilePath $TargetPath -ErrorAction Stop
+            Start-Process -FilePath $TargetPath -ArgumentList '--ensure-running' -ErrorAction Stop
         } catch {
             Write-UpdateLog ("Restart failed: " + $_.Exception.Message)
         }
     }
     exit 1
 } finally {
+    if ($launchGateHeld) { $launchGate.ReleaseMutex() }
+    if ($null -ne $launchGate) { $launchGate.Dispose() }
+    if ($null -ne $originalProcess) { $originalProcess.Dispose() }
     Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
     if ($null -ne $candidate) {
         Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue

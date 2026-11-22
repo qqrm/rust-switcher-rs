@@ -13,9 +13,10 @@ It lets word and sequence conversion work without reading the application's
 text back. This includes password input. Journal contents are ordinary process
 memory, not encrypted storage or securely erased memory.
 
-Explicit selections use native Edit/RichEdit messages or UI Automation. Native
-password selections can be read through the same native interface. Some browser
-password providers withhold the text or expose mask characters. When a provider
+Explicit selections use native Edit/RichEdit messages or UI Automation. Windows
+denies cross-process `WM_GETTEXT` reads of native `ES_PASSWORD` Edit controls;
+these fields use recently typed journal input instead. Some browser password
+providers also withhold the text or expose mask characters. When a provider
 identifies such a field, the shared selection/last-word shortcut checks selection
 endpoints without reading the mask. A collapsed selection can use the typed
 journal. A noncollapsed selection without readable source text cancels rather

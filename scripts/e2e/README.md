@@ -29,18 +29,21 @@ Results are printed in the job log without adding stored workflow artifacts.
 | First character after focus/modifiers | Debug journal matrix switches between two unowned external windows and two controls, releases Ctrl/Alt in the destination, and asserts exact before/after strings | Synthetic input and native Edit controls do not reproduce every Telegram/Qt or physical-keyboard interaction |
 | Browser fields and first-character timing | Debug Double Alt in a real Chrome/Edge process, two windows, input/textarea/contenteditable/shadow DOM/iframe fields, first-key timing and Tab/click navigation | Synthetic input and a local fixture do not prove behavior in the user's exact browser, extensions or web application |
 | Browser selected text with Double Shift | Release EXE with its default Double Shift binding converts prepopulated two-word input/contenteditable selections both ways through UIA, once per gesture, preserving exact text, selection, focus, other fields and clipboard | Chrome/Edge local fixture only; Firefox and the user's actual web applications remain unverified |
-| Browser password fields | Five debug cases require a real UIA `IsPassword` signal without an Edit/RichEdit HWND, complete journal capture, exact default Double Shift/Double Alt conversion both ways, a dynamic type change, and Double Shift immediately followed by Tab | Release physical password typing remains unverified; debug uses the existing hosted-only injection opt-in |
-| Native password selection | The release executable converts a real `ES_PASSWORD` Edit selection with default Double Shift both ways, preserves clipboard and the neighboring field, and cancels or completes in the source when Tab immediately follows | Native message-based selection only; no claim that UIA or clipboard can extract arbitrary password fields |
+| Browser password fields | Six debug cases require a real UIA `IsPassword` signal without an Edit/RichEdit HWND, complete journal capture, exact default Double Shift/Double Alt conversion both ways, a dynamic type change, a known partial selection, and Double Shift immediately followed by Tab | Release physical password typing remains unverified; debug uses the existing hosted-only injection opt-in |
+| Native password journal | Debug captures typed input in a real `ES_PASSWORD` Edit and converts it exactly both ways with default Double Shift; checks the neighboring field, clipboard, immediate Tab ownership, and diagnostic/profile redaction | Windows denies cross-process password text reads; setup and exact boolean comparisons run inside the owned fixture. Physical password typing in release remains unverified |
 | Wrong-target test sensitivity | An unmodified executable must cancel a verified source-read/focus race; a temporary combined target-guard mutation must write into the actual destination and fail the specific assertion | Proves that the race assertion catches the combined fault, not that each overlapping guard is independently necessary |
 | Journal capacity | Native Edit checks 99/100/101 characters; browser checks 101 with a letter and a leading dot; journal unit tests cover 4096 and overflow | Overflow refuses any conversion that reaches the discarded prefix; a complete last word after a retained boundary can still convert |
 | Automatic last-word conversion | Debug runtime toggle followed by a word and space | Other delimiters are not exercised by this GUI scenario |
 | Selected text | Release default Double Shift in a separate native Edit, including after restart; converts a prepopulated two-word phrase once per gesture in both directions, preserving selection, focus, the other field and clipboard | Other applications, rich editors and elevated targets are not exercised |
 | Clipboard isolation | Clipboard sequence unchanged during selection conversion | Does not audit unrelated applications on the desktop |
 | Unicode boundary | A 510-character selection containing emoji must remain complete, followed by a short conversion | Does not prove every UI Automation provider's truncation behavior |
-| Startup and single instance | Release launch and duplicate-instance rejection | Focus activation by a second launch and a published release download are not exercised |
+| Startup and relaunch | A second release launch stops the old PID and starts a usable replacement; three rapid launches converge to one new process | Instances without a discoverable window and other Windows sessions are rejected rather than force-killed |
+| Tray lifecycle | Delete the real owned tray registration, broadcast TaskbarCreated/resume/display-change messages, and verify Shell_NotifyIconGetRect succeeds again while the main window is hidden | Real Explorer termination, actual sleep/hibernate, and Windows 11 display-driver timing are not exercised |
+| Unresponsive predecessor | Suspend the owned release UI thread, launch again, and require old-process termination plus a usable replacement | A process running at a higher integrity level may not grant termination rights |
+| Stale updater | A PID-bound shutdown rejects the previous PID; updater recovery does not replace an already running app | Network/download overlap is not injected by the desktop harness |
 | Settings and theme | Release dark-theme save, restart and reload | Visual rendering, all settings and hotkey customization are not exercised |
 | Autostart | Release registration of the exact executable and removal | Actual logon/reboot is not exercised on the disposable job VM |
-| Exit and cleanup | Release and debug Exit, bounded owned-process cleanup | Forced termination and crash recovery are not exercised |
+| Exit and cleanup | Release and debug Exit, forced predecessor termination, bounded owned-process cleanup | Unexpected crash recovery is not exercised |
 | CapsLock layout switching | Two ordinary browser click cases switch layouts twice before journal conversion | Pause and tray menu actions are not exercised by these scenarios |
 | Focus and selection changes | Release conversion cancels after the external fixture changes focus or selection, then recovers | Does not make programmatic OS focus changes atomic with input delivery |
 | Unresponsive editors | External Edit blocks for three seconds; release UI stays responsive, does not type later and recovers | A permanently hung UIA provider consumes the one bounded probe worker until restart |
@@ -233,15 +236,25 @@ the original race is already fully observed. The clipboard must also remain unch
 observe the command long enough for the deferred shortcut to execute or cancel;
 they do not claim all possible operating-system scheduling interleavings.
 
-The release native suite separately enables `ES_PASSWORD` on the external
-Windows Edit control and verifies exact selected-password conversion in both
-directions using default Double Shift, with full reselection and unchanged focus,
-neighbor and clipboard. It then submits Double Shift and Tab in one input batch;
-the fixture handles the actual Tab message to move focus to its second native
-Edit. Source and destination are checked after the deferred-command lifetime.
-No debug injection override is enabled in this release process. These are
-selection-path tests: the production release journal continues to reject
-injected typing, so this harness does not claim release physical-password capture.
+The native password suite enables `ES_PASSWORD` on the external Windows Edit
+and runs the debug application with injected typing allowed only for that owned
+fixture process. Exact journal append counts and a collapsed caret establish
+that the application received all typed input. Default Double Shift must then
+convert the full password in both directions, with unchanged focus, neighbor
+and clipboard. It also submits Double Shift and Tab in one input batch; the
+fixture handles the actual Tab message to move focus to its second native Edit.
+Source and destination are checked after the deferred-command lifetime, and the
+application's real diagnostic output and saved profile must exclude input text.
+
+Windows prevents another process from reading an `ES_PASSWORD` Edit with
+`WM_GETTEXT` or removing its password style with `EM_SETPASSWORDCHAR`.
+The fixture therefore handles password-mode setup and exact value comparisons
+inside its own process. Its test protocol returns only a boolean match against
+fixed synthetic samples, never the control's text. Every password assertion
+requires the native password style to remain set; the app cannot use this
+fixture protocol. The unmodified release still runs the ordinary selected-text
+checks above and rejects injected journal input. Neither test path claims
+physical-password capture in release.
 
 The hosted debug inspection message (`0x83F0`) reports a version marker,
 active/cache character counts, and a cumulative journal append count. It exposes

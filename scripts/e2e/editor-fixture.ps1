@@ -11,6 +11,7 @@ $form.Height = 310
 Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 public static class EditorFixture {
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
@@ -24,6 +25,8 @@ public sealed class ProbeTrap : NativeWindow {
     private readonly string signal;
     private readonly Timer timer = new Timer();
     [DllImport("user32.dll", EntryPoint="SendMessageW")] private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", EntryPoint="GetWindowTextW", ExactSpelling=true, CharSet=CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
     [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr window);
     public ProbeTrap(IntPtr editor, IntPtr otherEditor, string signalPath) {
         AssignHandle(editor); other = otherEditor; signal = signalPath;
@@ -38,6 +41,33 @@ public sealed class ProbeTrap : NativeWindow {
         };
     }
     protected override void WndProc(ref Message message) {
+        // Password setup and the oracle run inside the owning fixture process.
+        // Windows denies cross-process EM_SETPASSWORDCHAR/WM_GETTEXT once the
+        // native Edit has ES_PASSWORD. This protocol is not used by the app.
+        if (message.Msg == 0x8013) {
+            SendMessage(Handle, 0xCC, message.WParam == IntPtr.Zero ? IntPtr.Zero : new IntPtr(42), IntPtr.Zero);
+            message.Result = new IntPtr(1);
+            return;
+        }
+        if (message.Msg == 0x8014) {
+            string expected;
+            switch (message.WParam.ToInt32()) {
+                case 0: expected = ""; break;
+                case 1: expected = "ghbdtn"; break;
+                case 2: expected = "\u043f\u0440\u0438\u0432\u0435\u0442"; break;
+                case 3: expected = "ghbdtn "; break;
+                case 4: expected = "\u043f\u0440\u0438\u0432\u0435\u0442 "; break;
+                default: message.Result = new IntPtr(-1); return;
+            }
+            // Every allowed sample is shorter than this buffer. A truncated
+            // value cannot equal a sample. Only an exact boolean match leaves
+            // the fixture; password text is never returned through the protocol.
+            var actual = new StringBuilder(16);
+            int length = GetWindowText(Handle, actual, actual.Capacity);
+            message.Result = new IntPtr(length == expected.Length &&
+                String.Equals(actual.ToString(), expected, StringComparison.Ordinal) ? 1 : 0);
+            return;
+        }
         if (message.Msg == 0x87) {
             base.WndProc(ref message);
             // Receive an actual Tab key so this native-only fixture implements

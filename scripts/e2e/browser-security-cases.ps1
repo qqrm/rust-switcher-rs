@@ -215,8 +215,8 @@ Invoke-PasswordCase 'known partial selection does not replace the whole journal'
         $ranges = @(([System.Windows.Automation.TextPattern]$pattern).GetSelection())
         $details.rangeCount = $ranges.Count
         foreach ($range in $ranges) {
-            if ($range.CompareEndpoints([System.Windows.Automation.TextPatternRangeEndpoint]::Start,
-                    $range, [System.Windows.Automation.TextPatternRangeEndpoint]::End) -ne 0) {
+            if ($range.CompareEndpoints([System.Windows.Automation.Text.TextPatternRangeEndpoint]::Start,
+                    $range, [System.Windows.Automation.Text.TextPatternRangeEndpoint]::End) -ne 0) {
                 $noncollapsed = $true
             }
         }
