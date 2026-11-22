@@ -12,13 +12,13 @@ pub(crate) mod mods;
 pub(crate) mod sequence;
 pub(crate) mod vk;
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 #[cfg(debug_assertions)]
 use windows::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetForegroundWindow, GetWindow, IsChild};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    System::SystemInformation::GetTickCount64,
+    System::{SystemInformation::GetTickCount64, Threading::GetCurrentThreadId},
     UI::WindowsAndMessaging::{
         CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
         SetWindowsHookExW, WH_KEYBOARD_LL,
@@ -30,6 +30,12 @@ use crate::platform::win::keyboard::{keydown::handle_keydown, keyup::handle_keyu
 
 static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn is_hook_thread() -> bool {
+    HOOK_HANDLE.load(Ordering::Relaxed) != 0
+        && HOOK_THREAD.load(Ordering::Relaxed) == unsafe { GetCurrentThreadId() }
+}
 
 /// Marks input emitted by Switcher so it cannot capture its own replacements or
 /// advance a shortcut while releasing modifiers. Fits both 32-bit and 64-bit Windows.
@@ -140,6 +146,13 @@ extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     };
 
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    if let Some(allow) = crate::conversion::input_delivery::allow_hook_event(kb, msg) {
+        return if allow {
+            unsafe { CallNextHookEx(hook, code, wparam, lparam) }
+        } else {
+            LRESULT(1)
+        };
+    }
     // This must precede shortcut handling, not just the journal's injected-input
     // filter. Debug E2E deliberately admits other injected input as test typing.
     if is_own_input(kb) {
@@ -214,6 +227,7 @@ pub fn install(hwnd: HWND, state: &mut crate::app::AppState) {
 
     match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(proc), None, 0) } {
         Ok(h) => {
+            HOOK_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
             HOOK_HANDLE.store(h.0 as isize, Ordering::Relaxed);
             #[cfg(debug_assertions)]
             tracing::info!("WH_KEYBOARD_LL installed");

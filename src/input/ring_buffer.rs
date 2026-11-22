@@ -1505,7 +1505,8 @@ pub fn validate_secure_context_generation(generation: u64) -> bool {
 enum ResetReason {
     /// Start an empty active segment while retaining other editors' histories.
     Navigation,
-    /// Purge potentially sensitive text from every retained context.
+    /// Reset every retained context for isolated tests.
+    #[cfg(test)]
     SensitiveInput,
     /// A missing or unverified key makes the remaining segment incomplete.
     CaptureRejected,
@@ -1534,7 +1535,7 @@ fn clear_secure_journal(journal: &mut InputJournal, reason: ResetReason) {
 
 /// Discard every retained context and private decoder composition atomically
 /// with the security epoch used by deferred capture and conversion guards.
-#[cfg(any(test, windows))]
+#[cfg(test)]
 pub fn clear_secure_input_data() {
     with_journal_mut(|journal| clear_secure_journal(journal, ResetReason::SensitiveInput));
 }
@@ -1912,8 +1913,8 @@ fn reject_secure_capture_with_current_focus(
     });
 }
 
-/// Reject a delayed selection/property result only for the conversion context
-/// it actually inspected, including a UIA descendant sharing the same HWND.
+/// Reject incomplete input delivery only for the conversion context it actually
+/// modified, including a UIA descendant sharing the same HWND.
 #[cfg(any(test, windows))]
 pub fn reject_secure_context(generation: u64) {
     with_journal_mut(|journal| {
@@ -3155,12 +3156,10 @@ mod tests {
         // No activation flag: decoding uses this explicit layout without requiring foreground focus.
         let layout = unsafe { LoadKeyboardLayoutW(name, Default::default()) }
             .expect("the native test keyboard layout must load");
-        // Match startup preparation before the hook is installed. No keystroke
-        // is consumed here: the following assertion still checks the first one.
-        assert!(
-            layout_decode::prepare_layout(layout.0 as usize),
-            "the native test layout must be prepared before input capture"
-        );
+        // Await real fixture readiness before testing capture. The production
+        // startup deadline separately bounds responsiveness; cold OS signature
+        // verification can finish later. No keystroke is consumed here.
+        layout_decode::prepare_fixture_layout(layout.0 as usize);
         layout
     }
 
