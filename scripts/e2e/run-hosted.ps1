@@ -843,9 +843,13 @@ try {
         Wait-Condition { [HostedInput]::WindowLayout($editorHandle) -eq $english } 'native password English layout'
         Set-OwnedControlFocus $editorWindow $edit | Out-Null
         Tap-Key 0x1B
-        Wait-Condition { $edit.Current.IsPassword -and
-            [HostedInput]::PasswordFixtureTextMatches($editHandle, 0) -and
-            [HostedInput]::SecurityMetadata($passwordAppHandle, 1) -eq 0 } 'empty native password input context'
+        $uiaPassword = $edit.Current.IsPassword
+        $fixtureEmpty = [HostedInput]::PasswordFixtureTextMatches($editHandle, 0)
+        $activeChars = [HostedInput]::SecurityMetadata($passwordAppHandle, 1)
+        Write-Output "Native password setup: IsPassword=$uiaPassword fixtureEmpty=$fixtureEmpty activeChars=$activeChars"
+        if (-not $uiaPassword) { throw 'Refreshed native password UIA element is not classified as IsPassword' }
+        if (-not $fixtureEmpty) { throw 'Native password fixture did not empty after explicit text reset' }
+        Wait-Condition { [HostedInput]::SecurityMetadata($passwordAppHandle, 1) -eq 0 } 'empty native password journal after Escape'
         $capturedBefore = [HostedInput]::SecurityMetadata($passwordAppHandle, 3)
         foreach ($character in $Text.ToCharArray()) {
             if ($character -ne ' ' -and ($character -lt 'a' -or $character -gt 'z')) {
@@ -862,6 +866,10 @@ try {
     }
     $passwordFailure = $null
     [HostedInput]::SetFixturePassword($editHandle, $true)
+    # The native UIA Edit proxy caches its control type when it is created.
+    # Rebind after changing the style: the earlier plain Edit element can keep
+    # reporting IsPassword=false even through its Current property accessor.
+    $edit = [System.Windows.Automation.AutomationElement]::FromHandle($editHandle)
     try {
         Initialize-NativePassword 'ghbdtn' 1
         $passwordClipboard = [HostedInput]::GetClipboardSequenceNumber()
