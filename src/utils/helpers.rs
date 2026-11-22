@@ -5,10 +5,7 @@
 
 use windows::{
     Win32::{
-        Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM,
-        },
-        System::Threading::CreateMutexW,
+        Foundation::{GetLastError, HWND, LPARAM, WPARAM},
         UI::{
             Controls::{BST_CHECKED, BST_UNCHECKED},
             Shell::SetCurrentProcessExplicitAppUserModelID,
@@ -17,7 +14,7 @@ use windows::{
             },
         },
     },
-    core::{Error, HRESULT, PCWSTR, Result},
+    core::{Error, HRESULT, PCWSTR},
 };
 
 use crate::app_identity;
@@ -40,41 +37,6 @@ pub const fn ws_i32(base: WINDOW_STYLE, extra: i32) -> WINDOW_STYLE {
 /// leaf functions up the call chain.
 pub fn last_error() -> Error {
     Error::from_hresult(HRESULT::from_win32(unsafe { GetLastError() }.0))
-}
-
-/// RAII guard which ensures that only a single instance of the
-/// application is running at a time.
-///
-/// On creation the guard attempts to create a named mutex.  If
-/// another process already owns the mutex the current process will
-/// immediately terminate.  When the guard is dropped the mutex
-/// handle is released.
-pub struct SingleInstanceGuard(pub HANDLE);
-
-impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {
-        unsafe {
-            // Ignoring the return value is fine – if closing the handle
-            // fails there isn't anything sensible we can do anyway.
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
-pub fn single_instance_guard() -> Result<Option<SingleInstanceGuard>> {
-    unsafe {
-        let name: Vec<u16> = app_identity::SINGLE_INSTANCE_MUTEX
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let h = CreateMutexW(None, false, PCWSTR(name.as_ptr()))?;
-
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            return Ok(None);
-        }
-
-        Ok(Some(SingleInstanceGuard(h)))
-    }
 }
 
 /// Extract the low 16 bits from a 32‑bit packed parameter.
