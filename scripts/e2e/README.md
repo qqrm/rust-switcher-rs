@@ -196,6 +196,16 @@ and verifies that the native HWND is not Edit/RichEdit. Password classification
 is a fixture prerequisite, not a reason for the application to refuse input.
 All values are synthetic and belong to the launched local fixture.
 
+Stable password setup then sends one Escape reset, observes its delivered key-up
+in the source field, and waits for the application's own completed refresh for
+that raw/context epoch. Read-only debug selectors 7/8
+report the acknowledged foreground/focus handles only while its epochs and
+accepted identity remain current; the harness compares them with its independent
+native focus snapshot and requires an empty, available journal. Reading this
+acknowledgment cannot query a provider, enqueue or drain work, or change input
+state. This wait precedes typing; immediate-click cases and the next key after
+the dynamic text-to-password transition retain their original timing.
+
 The first two cases type through native input delivery, require a complete
 journal append, and use the default Double Shift or Double Alt gesture to produce
 an exact conversion and then the exact original text. They check native/DOM
@@ -257,7 +267,8 @@ checks above and rejects injected journal input. Neither test path claims
 physical-password capture in release.
 
 The hosted debug inspection message (`0x83F0`) reports a version marker,
-active/cache character counts, and a cumulative journal append count. It exposes
+active/cache character counts, a cumulative journal append count, and completed
+refresh acknowledgments. It exposes
 no input text and cannot clear state. The browser checks require exact append
 deltas and actual conversions, so a disabled capture path or unbound shortcut
 cannot satisfy them by doing nothing. The 53 ordinary browser cases remain part

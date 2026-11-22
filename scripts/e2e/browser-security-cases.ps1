@@ -50,8 +50,6 @@ function Reset-PasswordFixture {
         }
     }
     Focus-BrowserEditor $session 'a'
-    # This is setup for a stable-field test, not an immediate-click timing test.
-    Tap-BrowserKey 0x1B
     Wait-Browser {
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
         $null -ne $focused -and $focused.Current.Name -eq 'a' -and
@@ -60,6 +58,21 @@ function Reset-PasswordFixture {
     if ([BrowserInput]::ClassOf([IntPtr]([BrowserInput]::Snapshot($session.Handle)).focus) -match '^(Edit|RichEdit.*|RICHEDIT.*)$') {
         throw 'Browser password fixture unexpectedly uses a native Edit control'
     }
+    # Stable-field setup requires the app's completed refresh, not only a
+    # separate UIA client's view. Escape creates the reset epoch to acknowledge.
+    # Inspection only reads cached evidence; it cannot classify or clear input.
+    Tap-BrowserKey 0x1B
+    Wait-Browser {
+        Read-Browser $session "fixture.diagnostics().events.some(e => e.type === 'keyup' && e.key === 'Escape' && e.target === 'a')"
+    } 'Escape reset delivered to the password field'
+    Wait-Browser {
+        $native = [BrowserInput]::Snapshot($session.Handle)
+        $native.foreground -eq $session.Handle.ToInt64() -and $native.focus -ne 0 -and
+            [BrowserInput]::SecurityMetadata($switcherHandle, 7) -eq $native.foreground -and
+            [BrowserInput]::SecurityMetadata($switcherHandle, 8) -eq $native.focus -and
+            [BrowserInput]::SecurityMetadata($switcherHandle, 1) -eq 0 -and
+            [BrowserInput]::SecurityMetadata($switcherHandle, 6) -eq 0
+    } 'completed application refresh for empty available password input'
     return $expectedOther
 }
 

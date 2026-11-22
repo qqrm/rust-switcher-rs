@@ -49,6 +49,10 @@ use crate::{
     utils::bounded_worker::BoundedWorker,
 };
 
+#[cfg(debug_assertions)]
+#[path = "secure_input_readiness.rs"]
+pub(super) mod fixture_readiness;
+
 // A burst must fit the existing 101-character browser acceptance cases without
 // blocking SendInput. Both memory and residence time remain strictly bounded.
 const CAPTURE_QUEUE_CAPACITY: usize = 512;
@@ -231,7 +235,10 @@ impl DeliveryContext {
     pub(crate) fn capture() -> Option<Self> {
         let generation = generation();
         let command = ACTIVE_COMMAND.get().or_else(CommandContext::capture)?;
-        Some(Self { command, generation })
+        Some(Self {
+            command,
+            generation,
+        })
     }
 
     pub(crate) fn generation(self) -> u64 {
@@ -1214,7 +1221,10 @@ fn refresh_context(
     source: ProbeSource,
 ) -> Status {
     let result = verdict(provider, request, source);
-    complete_refresh(request, result, || request.target.is_current())
+    let status = complete_refresh(request, result, || request.target.is_current());
+    #[cfg(debug_assertions)]
+    fixture_readiness::record_completion(request, result, status);
+    status
 }
 
 fn complete_refresh(
@@ -1315,6 +1325,17 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
     if ring_buffer::is_modifier_vk(virtual_key) {
         return;
     }
+    // Navigation has no text snapshot or pending capture lease to order with
+    // UIA. Always start its clean epoch and queue its fresh observation, even
+    // while a focus callback owns dispatch. Treating this as a dropped text
+    // key would poison the next burst and leave only the callback's stale probe.
+    if matches!(
+        vk,
+        0x09 | 0x1B | 0x2D | 0x2E | 0x21 | 0x22 | 0x24 | 0x26 | 0x28
+    ) {
+        invalidate_context();
+        return;
+    }
     // Sample before native lookup or the raw snapshot. The target-specific
     // lookup below refuses any revision published after this hook entry.
     let identity_frontier = PUBLISHED_IDENTITIES.frontier();
@@ -1323,15 +1344,6 @@ pub(crate) fn record_keydown(kb: &KBDLLHOOKSTRUCT, vk: u32) {
         return;
     };
     if !validate_capture_generation(observed) {
-        return;
-    }
-    // These actions can move focus inside one browser HWND or replace unknown
-    // content. A queued observation from the preceding editor cannot survive.
-    if matches!(
-        vk,
-        0x09 | 0x1B | 0x2D | 0x2E | 0x21 | 0x22 | 0x24 | 0x26 | 0x28
-    ) {
-        invalidate_context();
         return;
     }
     let Some(target) = Target::capture() else {
@@ -1570,6 +1582,68 @@ mod tests {
             assert!(!validate_generation(context_before));
             assert!(ring_buffer::runs_snapshot().is_empty());
         });
+        ring_buffer::clear_secure_input_data();
+    }
+
+    #[test]
+    fn navigation_begins_a_clean_epoch_while_focus_dispatch_is_held() {
+        let _guard = ring_buffer::test_guard();
+        for vk in [0x09, 0x1B, 0x2D, 0x2E, 0x21, 0x22, 0x24, 0x26, 0x28] {
+            ring_buffer::clear_secure_input_data();
+            ring_buffer::push_text("departing-field");
+            let old_capture = capture_generation();
+            let old_context = generation();
+            with_uia_focus_dispatch(|refresh_generation| {
+                assert_eq!(refresh_generation, old_capture);
+                let key = KBDLLHOOKSTRUCT {
+                    vkCode: vk,
+                    ..Default::default()
+                };
+                // Exercise the real hook entry while dispatch is held, without
+                // a scheduler race, a provider, or a timing-based retry.
+                record_keydown(&key, vk);
+                assert!(
+                    !validate_capture_generation(old_capture),
+                    "navigation {vk:#x}"
+                );
+                assert!(!validate_generation(old_context), "navigation {vk:#x}");
+                assert!(ring_buffer::runs_snapshot().is_empty());
+                let fresh_capture = capture_generation();
+                let fresh_context = generation();
+                ring_buffer::push_text("fresh-input");
+                let fresh = ring_buffer::runs_snapshot();
+                assert!(
+                    !fresh.is_empty(),
+                    "navigation {vk:#x} must not mark a missing text key"
+                );
+
+                // The callback that held dispatch still carries the departing
+                // epoch. Its later successful observation cannot rewrite the
+                // fresh journal or revive captures stamped before navigation.
+                assert_eq!(
+                    complete_refresh(
+                        pointer_test_probe(refresh_generation),
+                        published_test_verdict(1, true),
+                        || true,
+                    ),
+                    Status::Unknown
+                );
+                assert!(validate_capture_generation(fresh_capture));
+                assert!(validate_generation(fresh_context));
+                assert_eq!(ring_buffer::runs_snapshot(), fresh);
+
+                // A genuinely lost printable key still poisons its complete
+                // prefix. Bypassing dispatch for every key fails this control.
+                let printable = KBDLLHOOKSTRUCT {
+                    vkCode: 0xBE,
+                    ..Default::default()
+                };
+                record_keydown(&printable, 0xBE);
+                assert!(!validate_capture_generation(fresh_capture));
+                ring_buffer::push_text("suffix-after-lost-key");
+                assert!(ring_buffer::runs_snapshot().is_empty());
+            });
+        }
         ring_buffer::clear_secure_input_data();
     }
 
