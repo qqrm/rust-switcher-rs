@@ -215,6 +215,38 @@ def recover_pushed_branch(branch, source, version, proposed):
     return head
 
 
+def checked_version_pr(repo, number, branch):
+    """Only reuse PRs authored by this release token in the expected repository."""
+    if type(number) is not int or number <= 0:
+        raise ValueError("Invalid version PR number")
+    owner, name = repo.split("/", 1)
+    # viewerDidAuthor uses the authenticated writer, not the git commit author or
+    # workflow actor. It also avoids gh's different JSON login format for bots.
+    query = """query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        id
+        pullRequest(number: $number) {
+          number state headRefOid headRefName baseRefName
+          isCrossRepository viewerDidAuthor headRepository { id }
+        }
+      }
+    }"""
+    data = gh("api", "graphql", "-f", "query=" + query,
+              "-f", "owner=" + owner, "-f", "name=" + name, "-F", f"number={number}")
+    repository = (data.get("data") or {}).get("repository") or {}
+    pr = repository.get("pullRequest") or {}
+    repository_id = repository.get("id")
+    if (not isinstance(repository_id, str) or not repository_id
+            or pr.get("number") != number or pr.get("viewerDidAuthor") is not True
+            or pr.get("isCrossRepository") is not False
+            or (pr.get("headRepository") or {}).get("id") != repository_id
+            or pr.get("baseRefName") != "dev" or pr.get("headRefName") != branch):
+        raise ValueError("Version PR identity changed; merge refused")
+    if pr.get("state") not in ("OPEN", "MERGED"):
+        raise ValueError("Version PR is not open or merged; publication refused")
+    return pr
+
+
 def version_pr(args):
     plan = validate_plan(args.directory, args.source)
     if plan["merged"]:
@@ -232,13 +264,11 @@ def version_pr(args):
     branch = "automation/release-" + plan["source"]
     repo = os.environ["GITHUB_REPOSITORY"]
     prs = gh("pr", "list", "--repo", repo, "--base", "dev", "--head", branch,
-             "--state", "all", "--json", "number,headRefOid,state")
+             "--state", "all", "--json", "number")
     if len(prs) > 1:
         raise ValueError("Multiple version PRs for one source")
     if prs:
-        pr = prs[0]
-        if pr["state"] == "CLOSED":
-            raise ValueError("Version PR was closed; publication refused")
+        pr = checked_version_pr(repo, prs[0]["number"], branch)
         head = checked_sha(pr["headRefOid"])
         git("fetch", "origin", head)
         git("diff", "--exit-code", proposed, head)
@@ -255,7 +285,8 @@ def version_pr(args):
                             'Native CI and security gates must pass before publication.', encoding="utf-8")
             command("gh", "pr", "create", "--repo", repo, "--base", "dev", "--head", branch,
                     "--title", f'chore: release {plan["version"]}', "--body-file", str(body))
-        pr = gh("pr", "view", branch, "--repo", repo, "--json", "number,headRefOid,state")
+        created = gh("pr", "view", branch, "--repo", repo, "--json", "number")
+        pr = checked_version_pr(repo, created["number"], branch)
         head = checked_sha(pr["headRefOid"])
         if head != proposed:
             raise ValueError("Version PR head changed")
