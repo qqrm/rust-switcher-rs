@@ -39,6 +39,17 @@ def write_plan(directory):
         path.write_text(text, encoding="utf-8")
 
 
+def version_pr_response(head=COMMIT, state="OPEN", **changes):
+    pr = {
+        "number": 7, "headRefOid": head, "state": state,
+        "headRefName": "automation/release-" + SOURCE, "baseRefName": "dev",
+        "isCrossRepository": False, "viewerDidAuthor": True,
+        "headRepository": {"id": "repository-id"},
+    }
+    pr.update(changes)
+    return {"data": {"repository": {"id": "repository-id", "pullRequest": pr}}}
+
+
 def write_bundle(directory, crate_commit=COMMIT, unsafe=False):
     for filename in release.expected_files(VERSION):
         (directory / filename).write_bytes(b"verified artifact")
@@ -152,7 +163,7 @@ class VersionPlanTests(unittest.TestCase):
                     patch.object(release, "validate_plan", return_value=plan), \
                     patch.object(release, "git", side_effect=fake_git) as git, \
                     patch.object(release, "gh", side_effect=[
-                        [], {"number": 7, "headRefOid": remote, "state": "OPEN"}]), \
+                        [], {"number": 7}, version_pr_response(head=remote)]), \
                     patch.object(release, "command") as command, \
                     patch.object(release, "output") as output, \
                     patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo"}):
@@ -186,6 +197,131 @@ class VersionPlanTests(unittest.TestCase):
                     with self.assertRaises((ValueError, RuntimeError)):
                         release.recover_pushed_branch(branch, SOURCE, VERSION, proposed)
                     self.assertFalse(any("push" in call.args for call in git.call_args_list))
+
+
+class VersionPrIdentityTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        directory = root / "plan"
+        directory.mkdir()
+        for name in release.VERSION_FILES:
+            target = directory / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("version data")
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+        self.args = argparse.Namespace(directory=str(directory), source=SOURCE)
+        self.branch = "automation/release-" + SOURCE
+        self.proposed = "c" * 40
+        self.head_reads = 0
+        self.changed_tree = False
+
+        def fake_git(*args):
+            if args == ("rev-parse", "HEAD"):
+                self.head_reads += 1
+                return SOURCE if self.head_reads == 1 else self.proposed
+            if args[0] == "diff" and self.changed_tree:
+                raise RuntimeError("different tree")
+            return ""
+
+        patches = {
+            "ROOT": patch.object(release, "ROOT", root),
+            "plan": patch.object(release, "validate_plan", return_value={
+                "source": SOURCE, "version": VERSION, "merged": ""}),
+            "git": patch.object(release, "git", side_effect=fake_git),
+            "gh": patch.object(release, "gh"),
+            "command": patch.object(release, "command"),
+            "output": patch.object(release, "output"),
+            "environment": patch.dict(os.environ, {"GITHUB_REPOSITORY": "qqrm/rust-switcher-rs"}),
+        }
+        for name, patcher in patches.items():
+            setattr(self, name, patcher.start())
+            self.addCleanup(patcher.stop)
+
+    def test_existing_writer_pr_keeps_exact_tree_and_head_checks(self):
+        # viewerDidAuthor is evaluated by GitHub for the current RELEASE_TOKEN;
+        # recent production version PRs use qqrm's PAT, not the git bot author.
+        self.gh.side_effect = [[{"number": 7}], version_pr_response()]
+        release.version_pr(self.args)
+        self.git.assert_any_call("fetch", "origin", COMMIT)
+        self.git.assert_any_call("diff", "--exit-code", self.proposed, COMMIT)
+        self.command.assert_called_once_with(
+            "gh", "pr", "merge", "7", "--repo", "qqrm/rust-switcher-rs", "--auto", "--squash",
+            "--match-head-commit", COMMIT, "--subject", f"chore: release {VERSION}",
+            "--body", f"release-source: {SOURCE}")
+        query = self.gh.call_args_list[1].args
+        self.assertEqual(query[:2], ("api", "graphql"))
+        self.assertIn("owner=qqrm", query)
+        self.assertIn("name=rust-switcher-rs", query)
+        self.assertIn("number=7", query)
+
+    def test_merged_writer_pr_can_resume_without_another_merge(self):
+        self.gh.side_effect = [[{"number": 7}], version_pr_response(state="MERGED")]
+        release.version_pr(self.args)
+        self.git.assert_any_call("diff", "--exit-code", self.proposed, COMMIT)
+        self.command.assert_not_called()
+        self.output.assert_called_once_with(merged="", pr=7, head=COMMIT, version=VERSION)
+
+    def test_untrusted_or_incomplete_identity_never_fetches_or_merges(self):
+        invalid = [
+            {"viewerDidAuthor": False}, {"viewerDidAuthor": None},
+            {"isCrossRepository": True}, {"isCrossRepository": None},
+            {"headRepository": {"id": "fork-id"}}, {"headRepository": None},
+            {"baseRefName": "main"}, {"headRefName": "another-branch"},
+            {"number": 8}, {"state": "CLOSED"}, {"state": None},
+        ]
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                self.head_reads = 0
+                self.git.reset_mock()
+                self.gh.side_effect = [[{"number": 7}], version_pr_response(**changes)]
+                with self.assertRaises(ValueError):
+                    release.version_pr(self.args)
+                self.assertFalse(any(call.args[0] == "fetch" for call in self.git.call_args_list))
+                self.command.assert_not_called()
+                self.output.assert_not_called()
+
+    def test_missing_repository_or_pr_fails_closed(self):
+        for data in ({}, {"data": {}}, {"data": {"repository": None}},
+                     {"data": {"repository": {"id": "repository-id", "pullRequest": None}}},
+                     {"data": {"repository": {"pullRequest": version_pr_response()["data"]["repository"]["pullRequest"]}}}):
+            with self.subTest(data=data), patch.object(release, "gh", return_value=data):
+                with self.assertRaises(ValueError):
+                    release.checked_version_pr("qqrm/rust-switcher-rs", 7, self.branch)
+
+    def test_authenticated_writer_with_wrong_tree_is_still_refused(self):
+        self.changed_tree = True
+        self.gh.side_effect = [[{"number": 7}], version_pr_response()]
+        with self.assertRaises(RuntimeError):
+            release.version_pr(self.args)
+        self.command.assert_not_called()
+        self.output.assert_not_called()
+
+    def test_new_version_pr_is_validated_before_merge(self):
+        self.gh.side_effect = [[], {"number": 7}, version_pr_response(head=self.proposed)]
+        release.version_pr(self.args)
+        self.git.assert_any_call(
+            "-c", "credential.helper=!gh auth git-credential", "push", "origin",
+            "HEAD:refs/heads/" + self.branch)
+        self.assertEqual([call.args[:3] for call in self.command.call_args_list],
+                         [("gh", "pr", "create"), ("gh", "pr", "merge")])
+        self.output.assert_called_once_with(merged="", pr=7, head=self.proposed, version=VERSION)
+
+    def test_new_version_pr_with_wrong_identity_or_head_is_not_merged(self):
+        for changes in ({"viewerDidAuthor": False}, {"headRepository": {"id": "fork-id"}},
+                        {"headRefOid": COMMIT}):
+            with self.subTest(changes=changes):
+                self.head_reads = 0
+                self.command.reset_mock()
+                response = version_pr_response(head=self.proposed)
+                response["data"]["repository"]["pullRequest"].update(changes)
+                self.gh.side_effect = [[], {"number": 7}, response]
+                with self.assertRaises(ValueError):
+                    release.version_pr(self.args)
+                self.assertEqual([call.args[:3] for call in self.command.call_args_list],
+                                 [("gh", "pr", "create")])
+                self.output.assert_not_called()
 
 
 class PublicationBoundaryTests(unittest.TestCase):

@@ -11,7 +11,10 @@ follow the workflow and its version PR.
    Only the two workspace versions, their internal dependency, and corresponding
    lock entries may change. No dependency resolution or repository hooks run.
 2. **Version PR:** a fresh runner checks the plan against the exact source before
-   a step-scoped `RELEASE_TOKEN` creates/reuses its version PR. Native auto-merge
+   a step-scoped `RELEASE_TOKEN` creates/reuses its version PR. Before reuse or
+   merge, GitHub must confirm that the token's authenticated account authored the
+   PR, its head repository is this repository, and its base/head branches match
+   the release plan. The complete version tree must still match. Native auto-merge
    and both required gates must succeed for the exact PR head. The writer runs no
    Cargo build, test, package, or dependency code and stores no Git credentials.
 3. **Build (read-only):** a fresh Windows runner checks out the resulting merge,
@@ -43,6 +46,8 @@ Retries reuse the same version PR or matching source tag. If branch push succeed
 before PR creation failed, its parent, release identity and tree must match before
 the branch is reused; retries never force-replace it. Multiple mappings,
 a closed version PR, altered artifact data, or conflicting tags fail closed.
+Keep the same authenticated release account when rotating `RELEASE_TOKEN` if
+an existing version PR must be resumed; a different account cannot adopt it.
 
 A release tag never moves. Same-tag asset upload retains the existing
 `--clobber` retry behavior. Crates publish core first, then app; index propagation
